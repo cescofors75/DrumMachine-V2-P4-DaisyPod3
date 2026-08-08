@@ -1,0 +1,8 @@
+P4/.pio/
+P4/.vscode/
+DaisyPod3/build/
+DaisyPod3/build_*/
+*.bin
+*.elf
+*.hex
+*.map
