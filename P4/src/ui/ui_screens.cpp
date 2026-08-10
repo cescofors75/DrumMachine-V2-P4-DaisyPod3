@@ -5493,10 +5493,8 @@ static void seq_fill_cb(lv_event_t* /*e*/) {
         ui_show_toast("FILL necesita PLAY", RED808_WARNING);
         return;
     }
-    if (control_send_fill())
-        ui_show_toast("FILL: 1 compas + retorno", RED808_ACCENT);
-    else
-        ui_show_toast("FILL no disponible en modo SONG", RED808_WARNING);
+    control_send_fill();
+    ui_show_toast("FILL: 1 compas + retorno", RED808_ACCENT);
 }
 
 struct SequencerVariationOption {
@@ -5677,10 +5675,8 @@ static void seq_build4_cb(lv_event_t* /*e*/) {
         ui_show_toast("BUILD 4 necesita PLAY", RED808_WARNING);
         return;
     }
-    if (control_send_build4())
-        ui_show_toast("BUILD: 4 compases + retorno", RED808_WARNING);
-    else
-        ui_show_toast("BUILD no disponible en modo SONG", RED808_WARNING);
+    control_send_build4();
+    ui_show_toast("BUILD: 4 compases", RED808_WARNING);
 }
 
 static void seq_drop_cb(lv_event_t* /*e*/) {
@@ -5892,28 +5888,11 @@ static void seq_mute_cb(lv_event_t* e) {
 
         bool next = !p4.track_muted[track];
         p4.track_muted[track] = next;
-        // MUTE and SOLO are exclusive: the engine silences a track that carries
-        // both, so leaving SOLO lit here would describe a state the mix is not
-        // in. Mirror it locally for instant feedback; control_send_* enforces
-        // the same rule when the queue drains.
-        bool soloCleared = false;
-        if (next && p4.track_solo[track]) {
-            p4.track_solo[track] = false;
-            soloCleared = true;
-        }
         char tb[48];
         snprintf(tb, sizeof(tb), "MUTE T%d %s",
                  track + 1, next ? "ON" : "OFF");
         ui_show_toast(tb, next ? RED808_ERROR : RED808_SUCCESS);
-        if (ui_control_available()) {
-            enqueue_mute_control((uint8_t)track, next);
-            if (soloCleared) {
-                uint16_t soloMask = 0;
-                for (int t = 0; t < 16; ++t)
-                    if (p4.track_solo[t]) soloMask |= (uint16_t)(1u << t);
-                enqueue_solo_mask_control(soloMask);
-            }
-        }
+        if (ui_control_available()) enqueue_mute_control((uint8_t)track, next);
     }
 }
 
@@ -5941,18 +5920,12 @@ static void seq_solo_cb(lv_event_t* e) {
              track + 1, wasSolo ? "OFF" : "ON");
     ui_show_toast(toastBuf, wasSolo ? RED808_BORDER : RED808_ACCENT);
 
-    // Daisy applies solo on top of mute, so a track that is both is silent.
-    // Soloing a muted track therefore has to lift its mute — otherwise the one
-    // track the user asked to hear is the only one that stays quiet.
+    // Solo is an independent mixer layer. It must never rewrite the user's
+    // mute selection: Daisy already applies trackSolo after trackMute.
     const uint16_t soloMask = wasSolo ? 0u : (uint16_t)(1u << track);
     for (int t = 0; t < 16; ++t)
         p4.track_solo[t] = (soloMask & (1u << t)) != 0;
-    const bool muteCleared = !wasSolo && p4.track_muted[track];
-    if (muteCleared) p4.track_muted[track] = false;
-    if (ui_control_available()) {
-        enqueue_solo_mask_control(soloMask);
-        if (muteCleared) enqueue_mute_control((uint8_t)track, false);
-    }
+    if (ui_control_available()) enqueue_solo_mask_control(soloMask);
 }
 
 // ── Pagination helpers ─────────────────────────────────────────────────────
@@ -8747,12 +8720,9 @@ static bool sd_factory_autoload_tick(void) {
         s_sd_upload_state.store(0, std::memory_order_release);
         if (result.result == SD_UP_OK) {
             ++s_factory_kit_loaded;
-            // Daisy switched this track to the sampler when the WAV landed.
-            // That is right for a track the pattern plays with samples and
-            // wrong for one it plays with a synth engine, so restore whatever
-            // the pattern actually asks for instead of only re-sending the
-            // sampler case (which was already true and changed nothing).
-            control_restore_track_engine(s_factory_kit_cursor);
+            if (control_pattern_track_uses_sampler(p4.current_pattern,
+                                                   s_factory_kit_cursor))
+                control_send_set_track_engine(s_factory_kit_cursor, -1);
         } else {
             ++s_factory_kit_failures;
         }

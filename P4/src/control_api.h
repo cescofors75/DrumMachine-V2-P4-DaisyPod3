@@ -18,11 +18,7 @@ void control_send_tempo(float bpm);
 void control_send_select_pattern(int index);
 void control_send_queue_pattern(int index);
 void control_send_cancel_pattern_queue();
-// FILL and BUILD render a variant of the current pattern into a scratch Daisy
-// slot and let the engine return on its own after 1 / 4 bars. They never modify
-// the P4 bank. Return false when there is no engine, or when SONG mode owns
-// every resident slot.
-bool control_send_fill();
+void control_send_fill();
 void control_send_variation();
 // Each variation transforms the pattern that is loaded rather than stamping a
 // fixed beat over it, so the result depends on — and preserves — whatever the
@@ -49,7 +45,7 @@ bool control_sync_current_pattern();
 bool control_patterns_ready();
 uint8_t control_factory_patterns_found();
 uint8_t control_factory_patterns_expected();
-bool control_send_build4();
+void control_send_build4();
 void control_send_drop();   // toggles: mutes tracks 2..15, then restores
 bool control_drop_active();
 void control_send_launch_demo_set();
@@ -97,9 +93,6 @@ void control_send_solo_mask(uint16_t mask);
 void control_mark_fx_screen_dirty();
 bool control_consume_fx_screen_dirty();
 bool control_pattern_track_uses_sampler(int pattern, int track);
-// Re-assert the engine the current pattern assigns to a track. Needed after a
-// sample upload, because Daisy switches the pad to the sampler on every load.
-void control_restore_track_engine(int track);
 
 void control_send_synth_note_on_ex(uint8_t engine, uint8_t note,
                                    uint8_t velocity, bool accent, bool slide);
