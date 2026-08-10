@@ -57,6 +57,10 @@ static std::atomic<uint16_t> s_ctrl_mute_mask{0};
 static std::atomic<bool>     s_ctrl_solo_mask_pending{false};
 static std::atomic<uint16_t> s_ctrl_solo_mask{0};
 static std::atomic<bool>     s_ctrl_pattern_sync_pending{false};
+// Engaging SONG re-uploads every resident scene over USB. That is a long,
+// multi-packet transfer with vTaskDelay() inside it, so it must run from
+// ui_process_control_queue() on core 1 and never from an LVGL callback.
+static std::atomic<int8_t>   s_ctrl_song_engage_pending{-1};
 
 // Touch debounce tuned for GT911 + multi-indev setup.
 static const uint32_t MUTE_DEBOUNCE_TRACK_MS = 180;
@@ -832,19 +836,32 @@ static int8_t s_xtra_wave_max[4][96] = {};
 static int8_t s_xtra_wave_min[4][96] = {};
 static uint8_t s_xtra_wave_count[4] = {};
 
-static const uint8_t XTRA_SYNTH_ENGINE_CODES[7] = {0, 1, 2, 3, 4, 5, 6};
-static const char* XTRA_SYNTH_ENGINE_NAMES[7] = {"808", "909", "505", "303", "WT", "SH101", "FM2"};
-static const char* XTRA_PRESET_LABELS[3] = {"A", "B", "C"};
-static const uint8_t XTRA_DRUM_INSTRUMENTS[3][3][4] = {
-    { {0, 1, 2, 5}, {0, 3, 6, 7}, {0, 4, 8, 9} },
-    { {0, 1, 2, 5}, {0, 3, 4, 6}, {1, 4, 7, 8} },
-    { {0, 1, 2, 3}, {1, 3, 4, 6}, {0, 2, 5, 7} }
+// The physical-model engine is available to the pads for the same reason it is
+// now available to the keyboard: Daisy has always accepted it.
+static constexpr int XTRA_ENGINE_COUNT = 8;
+static const uint8_t XTRA_SYNTH_ENGINE_CODES[XTRA_ENGINE_COUNT] = {0, 1, 2, 3, 4, 5, 6, 7};
+static const char* XTRA_SYNTH_ENGINE_NAMES[XTRA_ENGINE_COUNT] =
+    {"808", "909", "505", "303", "WT", "SH101", "FM2", "PHYS"};
+
+// Every synth engine ships four presets. The pads used to expose three and
+// wrap the index with `% 3`, so choosing the fourth preset from PIANO PARAMS
+// stored a 3 that was then *sent* to Daisy as preset 0 while the pad's own
+// parameter snapshot was loaded from preset 3 — the pad sounded like neither.
+static constexpr int XTRA_PRESET_COUNT = 4;
+static const char* XTRA_PRESET_LABELS[XTRA_PRESET_COUNT] = {"A", "B", "C", "D"};
+static const uint8_t XTRA_DRUM_INSTRUMENTS[3][XTRA_PRESET_COUNT][4] = {
+    { {0, 1, 2, 5}, {0, 3, 6, 7}, {0, 4, 8, 9}, {1, 2, 6, 9} },
+    { {0, 1, 2, 5}, {0, 3, 4, 6}, {1, 4, 7, 8}, {0, 2, 5, 9} },
+    { {0, 1, 2, 3}, {1, 3, 4, 6}, {0, 2, 5, 7}, {2, 4, 6, 8} }
 };
-static const uint8_t XTRA_MELODIC_BASE_NOTES[3][4] = {
+static const uint8_t XTRA_MELODIC_BASE_NOTES[XTRA_PRESET_COUNT][4] = {
     {48, 52, 55, 60},
     {36, 43, 48, 55},
-    {60, 64, 67, 72}
+    {60, 64, 67, 72},
+    {41, 48, 53, 60}
 };
+
+static inline uint8_t xtra_preset_index(int slot);
 
 static inline lv_color_t xtra_slot_color(int slot) {
     return lv_color_hex(theme_presets[currentTheme].track_colors[slot & 0x0F]);
@@ -961,7 +978,7 @@ static void xtra_send_slot_param_snapshot(int slot) {
     if (eng_idx < 0 || eng_idx >= SP_ENGINE_COUNT) return;
     if (!s_xtra_param_valid[slot]) xtra_reset_slot_params(slot);
     const SynthEngineDef* eng = &SP_ENGINES[eng_idx];
-    control_send_synth_preset(eng->engine, s_xtra_slots[slot].preset_idx % 3);
+    control_send_synth_preset(eng->engine, xtra_preset_index(slot));
     for (uint8_t i = 0; i < eng->param_count && i < XTRA_PARAM_MAX; i++) {
         control_send_synth_param(eng->engine, 0, eng->params[i].param_id, s_xtra_param_values[slot][i]);
     }
@@ -1066,7 +1083,8 @@ static void xtra_apply_default_slots(void) {
 }
 
 static uint8_t xtra_slot_engine_code(int slot) {
-    return XTRA_SYNTH_ENGINE_CODES[constrain((int)s_xtra_slots[slot].synth_engine_idx, 0, 6)];
+    return XTRA_SYNTH_ENGINE_CODES[
+        constrain((int)s_xtra_slots[slot].synth_engine_idx, 0, XTRA_ENGINE_COUNT - 1)];
 }
 
 static bool xtra_slot_is_drum(int slot) {
@@ -1083,14 +1101,23 @@ static void xtra_slot_refresh_name(int slot) {
         return;
     }
     snprintf(s_xtra_slots[slot].name, sizeof(s_xtra_slots[slot].name), "%s %s",
-             XTRA_SYNTH_ENGINE_NAMES[constrain((int)s_xtra_slots[slot].synth_engine_idx, 0, 6)],
-             XTRA_PRESET_LABELS[s_xtra_slots[slot].preset_idx % 3]);
+             XTRA_SYNTH_ENGINE_NAMES[
+                 constrain((int)s_xtra_slots[slot].synth_engine_idx, 0, XTRA_ENGINE_COUNT - 1)],
+             XTRA_PRESET_LABELS[xtra_preset_index(slot)]);
+}
+
+// One definition of "which preset is this pad on", clamped to the range the
+// engine tables actually have, so the label, the parameter snapshot and the
+// preset sent over USB can never disagree again.
+static inline uint8_t xtra_preset_index(int slot) {
+    if (slot < 0 || slot >= 4) return 0;
+    return (uint8_t)constrain((int)s_xtra_slots[slot].preset_idx, 0, XTRA_PRESET_COUNT - 1);
 }
 
 static void xtra_apply_preset(int slot) {
     if (slot < 0 || slot >= 4 || !ui_control_available() || !s_xtra_slots[slot].synth_mode) return;
     uint8_t engine = xtra_slot_engine_code(slot);
-    control_send_synth_preset(engine, s_xtra_slots[slot].preset_idx % 3);
+    control_send_synth_preset(engine, xtra_preset_index(slot));
 }
 
 static void xtra_send_note_on(int slot, int note, uint8_t velocity) {
@@ -1218,12 +1245,13 @@ static void xtra_trigger_slot(int slot, int lx, int ly, bool initialPress) {
     if (xtra_slot_is_drum(slot)) {
         if (!initialPress) return;
         uint8_t engineIdx = s_xtra_slots[slot].synth_engine_idx;
-        uint8_t instrument = XTRA_DRUM_INSTRUMENTS[engineIdx][s_xtra_slots[slot].preset_idx % 3][slot];
+        uint8_t instrument = XTRA_DRUM_INSTRUMENTS[engineIdx][xtra_preset_index(slot)][slot];
         control_send_synth_trigger(xtra_slot_engine_code(slot), instrument, velocity);
         return;
     }
 
-    int note = XTRA_MELODIC_BASE_NOTES[s_xtra_slots[slot].preset_idx % 3][slot] + (int)((xNorm - 0.5f) * 12.0f + (xNorm >= 0.5f ? 0.5f : -0.5f));
+    int note = XTRA_MELODIC_BASE_NOTES[xtra_preset_index(slot)][slot]
+             + (int)((xNorm - 0.5f) * 12.0f + (xNorm >= 0.5f ? 0.5f : -0.5f));
     if (initialPress) {
         xtra_send_note_on(slot, note, velocity);
     } else if (note != s_xtra_last_note[slot]) {
@@ -1370,8 +1398,10 @@ static void xtra_load_state(void) {
             // antiguas para que no reaparezca un slot en modo synth.
             (void)synth_mode;
             s_xtra_slots[idx].synth_mode = false;
-            s_xtra_slots[idx].synth_engine_idx = (uint8_t)constrain((int)synth_engine_idx, 0, 6);
-            s_xtra_slots[idx].preset_idx = (uint8_t)constrain((int)preset_idx, 0, 2);
+            s_xtra_slots[idx].synth_engine_idx =
+                (uint8_t)constrain((int)synth_engine_idx, 0, XTRA_ENGINE_COUNT - 1);
+            s_xtra_slots[idx].preset_idx =
+                (uint8_t)constrain((int)preset_idx, 0, XTRA_PRESET_COUNT - 1);
             s_xtra_slots[idx].trim_start_pct = (uint8_t)constrain((int)trim_start, 0, 95);
             s_xtra_slots[idx].trim_end_pct = (uint8_t)constrain((int)trim_end, 5, 100);
             if (s_xtra_slots[idx].trim_end_pct <= s_xtra_slots[idx].trim_start_pct)
@@ -1407,7 +1437,7 @@ static void xtra_refresh_panel(void) {
             if (grid_xtra_meta_lbls[i]) {
                 if (s_xtra_slots[i].synth_mode) {
                     lv_label_set_text_fmt(grid_xtra_meta_lbls[i], "PRESET %s  ·  XY %s",
-                                          XTRA_PRESET_LABELS[s_xtra_slots[i].preset_idx % 3],
+                                          XTRA_PRESET_LABELS[xtra_preset_index(i)],
                                           xtra_slot_is_drum(i) ? "TRIG" : "NOTE");
                 } else {
                     const char* mode = s_xtra_slots[i].play_mode == 1 ? "SYNC REPEAT" : "ONE SHOT";
@@ -4086,6 +4116,15 @@ static bool fx_card_has_onoff(int cell) {
     return cell >= 0 && cell < FX_CARD_COUNT;
 }
 
+// The three EQ models take their gain from the RESO control because the master
+// filter payload carries no gain field. Everything that presents RESO to the
+// user has to agree on which of the two meanings is currently live.
+static bool fx_reso_is_eq_gain(void) {
+    return p4.filter_type == FTYPE_PEAKING
+        || p4.filter_type == FTYPE_LOWSHELF
+        || p4.filter_type == FTYPE_HIGHSHELF;
+}
+
 static int fx_card_current_value_u7(int cell) {
     switch (cell) {
         case FX_CARD_FLANGE: return p4.enc_value[0];
@@ -4134,7 +4173,12 @@ static bool fx_card_is_muted(int cell) {
         case FX_CARD_CRUSH:  return p4.pot_value[1] == 0;
         case FX_CARD_PHASER: return p4.pot_muted[2];
         case FX_CARD_CUTOFF: return p4.cutoff_hz >= 19950;
-        case FX_CARD_RESO:   return p4.resonance_x10 <= 8;
+        // "Off" for RESO means "not colouring the sound". With an EQ model
+        // selected that is a flat 0 dB in the middle of the sweep, not the
+        // bottom of it — the bottom is a full 18 dB cut.
+        case FX_CARD_RESO:   return fx_reso_is_eq_gain()
+                                    ? (p4.resonance_x10 >= 100 && p4.resonance_x10 <= 108)
+                                    : p4.resonance_x10 <= 8;
         case FX_CARD_DRIVE:  return p4.distortion_pct <= 0;
         case FX_CARD_BITS:   return p4.bitcrush_bits >= 16;
         case FX_CARD_SRATE:  return p4.sample_rate_hz <= 0;
@@ -4152,7 +4196,9 @@ static int fx_card_neutral_u7(int cell) {
     switch (cell) {
         case FX_CARD_CRUSH:  return 0;
         case FX_CARD_CUTOFF: return 127;
-        case FX_CARD_RESO:   return 0;
+        // Mid-scale is 0 dB when RESO is acting as the EQ gain; sending 0 there
+        // would turn the card "off" by applying a full 18 dB cut.
+        case FX_CARD_RESO:   return fx_reso_is_eq_gain() ? 64 : 0;
         case FX_CARD_DRIVE:  return 0;
         case FX_CARD_BITS:   return 0;
         case FX_CARD_SRATE:  return 0;
@@ -4214,7 +4260,9 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
             int bits = constrain((int)(16.0f
                 - ((float)u7 / 127.0f) * 12.0f + 0.5f), 4, 16);
             p4.bitcrush_bits = bits;
-            p4.pot_value[1] = (uint8_t)u7;
+            // Do NOT mirror into p4.pot_value[1]: that slot belongs to the
+            // CRUSH macro card, and writing it here made the CRUSH arc jump
+            // every time BITS moved even though CRUSH itself had not changed.
             if (transmit && control_available()) control_send_set_bitcrush(bits);
             break;
         }
@@ -4698,8 +4746,17 @@ static void fx_format_display_value(int cell, int u7, bool muted,
             break;
         }
         case FX_CARD_RESO:
-            snprintf(value, valueSize, "%.1f", 0.7f + normalized * 19.3f);
-            snprintf(unit, unitSize, "Q");
+            // PEAK / LOW SHELF / HIGH SHELF have no gain field on the wire, so
+            // the engine drives their gain from this control instead. Reading
+            // out a "Q" there would describe a parameter the model ignores.
+            if (fx_reso_is_eq_gain()) {
+                const float db = (normalized - 0.5f) * 36.0f;
+                snprintf(value, valueSize, "%+.1f", db);
+                snprintf(unit, unitSize, "dB");
+            } else {
+                snprintf(value, valueSize, "%.1f", 0.7f + normalized * 19.3f);
+                snprintf(unit, unitSize, "Q");
+            }
             break;
         case FX_CARD_BITS:
             snprintf(value, valueSize, "%d",
@@ -4746,6 +4803,25 @@ static void update_fx_screen(void) {
     }
 
     uint32_t now = millis();
+
+    // RESO changes meaning with the selected filter model, so its caption has
+    // to track it rather than always claiming to be a Q control.
+    {
+        // Reset on theme reload: the labels are recreated carrying the static
+        // caption from fx_src[], so a cached mode would leave it stale.
+        static int prev_reso_mode = -1;
+        static uint32_t prev_reso_gen = 0;
+        if (prev_reso_gen != s_ui_refresh_gen) {
+            prev_reso_gen = s_ui_refresh_gen;
+            prev_reso_mode = -1;
+        }
+        const int reso_mode = fx_reso_is_eq_gain() ? 1 : 0;
+        if (reso_mode != prev_reso_mode && fx_src_labels[FX_CARD_RESO]) {
+            prev_reso_mode = reso_mode;
+            lv_label_set_text(fx_src_labels[FX_CARD_RESO],
+                              reso_mode ? "EQ GAIN" : "Q / RESONANCE");
+        }
+    }
 
     static int prev_fx_pattern = -1;
     static lv_obj_t* prev_fx_pattern_lbl = NULL;
@@ -5091,13 +5167,13 @@ static lv_obj_t*  seq_hdr_queue_btn     = NULL;
 static lv_obj_t*  seq_hdr_queue_lbl     = NULL;
 static lv_obj_t*  seq_hdr_var_btn       = NULL;
 static lv_obj_t*  seq_variation_modal   = NULL;
-static lv_obj_t*  seq_hdr_mix_btn       = NULL;
-static lv_obj_t*  seq_hdr_mix_lbl       = NULL;
+static lv_obj_t*  seq_hdr_song_btn      = NULL;
+static lv_obj_t*  seq_hdr_song_lbl      = NULL;
+static char       seq_hdr_song_text[24]  = "";
 static lv_obj_t*  seq_hdr_save_btn      = NULL;
 static lv_obj_t*  seq_hdr_save_lbl      = NULL;
 static lv_obj_t*  seq_hdr_group_btns[4] = {};
 static uint8_t    seq_hdr_group_state[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-static bool       seq_club_warm         = false;
 static lv_obj_t*  seq_pattern_list_modal = NULL;
 static bool       seq_pattern_list_save_mode = false;
 static lv_obj_t*  seq_save_confirm_modal = NULL;
@@ -5427,18 +5503,22 @@ struct SequencerVariationOption {
     const char* detail;
 };
 
+// All of these transform the pattern that is loaded; none of them stamps a
+// preset beat over it. The description says what happens to *your* pattern.
 static const SequencerVariationOption SEQ_VARIATION_OPTIONS[] = {
-    {SEQ_VAR_NEON_BREAK,    "NEON BREAK",    "Corte sincopado y remate final"},
-    {SEQ_VAR_RATCHET_STORM, "RATCHET STORM", "Hi-hats en rafagas 2x / 4x"},
-    {SEQ_VAR_GHOST_GROOVE,  "GHOST GROOVE",  "Golpes fantasma con probabilidad"},
-    {SEQ_VAR_POLYRHYTHM,    "POLYRHYTHM 3x5", "Capas cruzadas 3, 5 y 7"},
-    {SEQ_VAR_HALF_TIME,     "HALF-TIME DROP", "Peso en mitad de tiempo"},
-    {SEQ_VAR_MIRROR,        "MIRROR BEAT",    "Invierte el pulso del compas"},
-    {SEQ_VAR_TOM_CASCADE,   "TOM CASCADE",    "Descenso de toms al cierre"},
-    {SEQ_VAR_ACID_SWITCH,   "ACID SWITCH",    "Secuencia acida en pistas synth"},
-    {SEQ_VAR_HAT_LIFT,      "HAT LIFT",       "Subida de hats con ratchets"},
-    {SEQ_VAR_SPARSE_SPACE,  "SPARSE SPACE",   "Abre huecos sin perder el kick"},
-    {SEQ_VAR_UNDO,          "UNDO LAST VAR",  "Restaura el estado anterior"},
+    {SEQ_VAR_GHOST_GROOVE,     "GHOST GROOVE",   "Fantasmas antes de cada golpe"},
+    {SEQ_VAR_ACCENT_GROOVE,    "ACCENT GROOVE",  "Redibuja dinamicas, no mueve notas"},
+    {SEQ_VAR_ROTATE,           "ROTATE 3/16",    "Gira la percusion, ancla bombo y caja"},
+    {SEQ_VAR_SWAP_HALVES,      "SWAP HALVES",    "Intercambia tiempos 1-2 con 3-4"},
+    {SEQ_VAR_HALF_TIME,        "HALF TIME",      "Estira el primer medio compas"},
+    {SEQ_VAR_DOUBLE_TIME,      "DOUBLE TIME",    "Pliega el compas y lo repite"},
+    {SEQ_VAR_EUCLID,           "EUCLID SPREAD",  "Reparte los mismos golpes"},
+    {SEQ_VAR_SIXTEENTH_LIFT,   "16TH LIFT",      "Rellena contratiempos"},
+    {SEQ_VAR_RATCHET_STORM,    "RATCHET STORM",  "Redobles en el ultimo tiempo"},
+    {SEQ_VAR_THIN_OUT,         "THIN OUT",       "Abre huecos sin perder el pulso"},
+    {SEQ_VAR_DICE_PROBABILITY, "DICE",           "Contratiempos con probabilidad"},
+    {SEQ_VAR_BREAK,            "BREAK",          "Corte sincopado con respuesta"},
+    {SEQ_VAR_UNDO,             "UNDO LAST VAR",  "Restaura el estado anterior"},
 };
 
 static void seq_variation_modal_hide(lv_event_t* e = NULL) {
@@ -5455,7 +5535,7 @@ static void seq_variation_select_cb(lv_event_t* e) {
 
     const uint8_t selected = static_cast<uint8_t>(
         reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
-    if (selected < SEQ_VAR_NEON_BREAK || selected > SEQ_VAR_UNDO) return;
+    if (selected < SEQ_VAR_FIRST || selected > SEQ_VAR_UNDO) return;
     if (selected == SEQ_VAR_UNDO && !control_variation_can_undo()) {
         ui_show_toast("No hay una variacion anterior para restaurar",
                       RED808_WARNING);
@@ -5518,7 +5598,9 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
     lv_obj_set_pos(title, 24, 18);
 
     lv_obj_t* hint = lv_label_create(card);
-    lv_label_set_text(hint, "Aplica sobre el patron actual. UNDO recupera la ultima version.");
+    lv_label_set_text(hint,
+        "Transforman el patron cargado: el resultado depende de lo que ya suena. "
+        "UNDO recupera la ultima version.");
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(hint, 24, 50);
@@ -5534,8 +5616,10 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
     lv_obj_set_style_text_font(closeLabel, &lv_font_montserrat_12, 0);
     lv_obj_center(closeLabel);
 
-    constexpr int columns = 4;
-    constexpr int buttonWidth = 216;
+    // 13 options in 5 columns keeps the grid at three rows, which is what the
+    // 540 px card can show without scrolling.
+    constexpr int columns = 5;
+    constexpr int buttonWidth = 172;
     constexpr int buttonHeight = 116;
     constexpr int gapX = 10;
     constexpr int gapY = 12;
@@ -5601,16 +5685,67 @@ static void seq_drop_cb(lv_event_t* /*e*/) {
         return;
     }
     control_send_drop();
-    ui_show_toast("DROP armado para el proximo compas", RED808_ACCENT);
+    ui_show_toast(control_drop_active() ? "DROP: solo bombo y caja"
+                                        : "DROP fuera: mezcla restaurada",
+                  RED808_ACCENT);
 }
 
-static void seq_mix_preset_cb(lv_event_t* /*e*/) {
-    seq_club_warm = !seq_club_warm;
-    control_send_mix_preset(seq_club_warm);
-    if (seq_hdr_mix_lbl) lv_label_set_text(seq_hdr_mix_lbl, seq_club_warm ? "CLUB WARM" : "DRY");
-    if (seq_hdr_mix_btn) lv_obj_set_style_bg_color(seq_hdr_mix_btn,
-        seq_club_warm ? RED808_WARNING : RED808_SURFACE, 0);
-    ui_show_toast(seq_club_warm ? "Mix CLUB WARM" : "Mix DRY", RED808_ACCENT);
+// SONG mode. Cycles OFF -> SONG (chain plays once) -> SONG LOOP -> OFF, so the
+// three states an arrangement can be in are reachable from a single header
+// button without stealing another slot from the row.
+static void seq_song_refresh(void);
+
+static void seq_song_mode_cb(lv_event_t* /*e*/) {
+    if (!control_song_available()) {
+        ui_show_toast("No hay cancion MIDI cargada. Importa un .mid con FULL SONG",
+                      RED808_WARNING);
+        return;
+    }
+    if (s_ctrl_song_engage_pending.load(std::memory_order_acquire) >= 0) return;
+
+    if (!control_song_engaged()) {
+        control_song_set_loop(false);
+        s_ctrl_song_engage_pending.store(1, std::memory_order_release);
+        ui_show_toast("SONG: encadenando patrones", RED808_CYAN);
+    } else if (!control_song_loop()) {
+        control_song_set_loop(true);
+        ui_show_toast("SONG LOOP: la cancion se repite", RED808_CYAN);
+    } else {
+        s_ctrl_song_engage_pending.store(0, std::memory_order_release);
+        ui_show_toast("SONG OFF: patron unico", RED808_ACCENT);
+    }
+    seq_force_refresh_cells = true;
+}
+
+// Header state for SONG. Rebuilt on demand and once per sequencer refresh so
+// the chain position tracks whatever bar Daisy is actually playing.
+static void seq_song_refresh(void) {
+    if (!seq_hdr_song_btn || !seq_hdr_song_lbl) return;
+
+    const bool available = control_song_available();
+    const bool engaged = available && control_song_engaged();
+
+    char text[24];
+    lv_color_t bg = RED808_SURFACE;
+    if (!available) {
+        snprintf(text, sizeof(text), "SONG --");
+    } else if (!engaged) {
+        snprintf(text, sizeof(text), "SONG OFF");
+    } else {
+        uint8_t index = 0, count = 0, pattern = 0;
+        control_song_status(&index, &count, &pattern);
+        snprintf(text, sizeof(text), "%s %u/%u",
+                 control_song_loop() ? "LOOP" : "SONG",
+                 (unsigned)(index + 1), (unsigned)count);
+        bg = control_song_loop() ? RED808_ACCENT2 : RED808_CYAN;
+    }
+
+    if (strcmp(seq_hdr_song_text, text) == 0) return;
+    snprintf(seq_hdr_song_text, sizeof(seq_hdr_song_text), "%s", text);
+    lv_label_set_text(seq_hdr_song_lbl, text);
+    lv_obj_set_style_bg_color(seq_hdr_song_btn, bg, 0);
+    if (available) lv_obj_clear_state(seq_hdr_song_btn, LV_STATE_DISABLED);
+    else lv_obj_add_state(seq_hdr_song_btn, LV_STATE_DISABLED);
 }
 
 // Last-loaded MIDI info — kept so the info button in the sequencer header
@@ -6000,9 +6135,11 @@ static void create_sequencer_screen(void) {
                                 LV_EVENT_CLICKED, (void*)(intptr_t)g);
         }
 
-        seq_hdr_mix_btn = makeHeaderButton(88, seq_club_warm ? "CLUB WARM" : "DRY",
-                                           RED808_WARNING, seq_mix_preset_cb);
-        seq_hdr_mix_lbl = lv_obj_get_child(seq_hdr_mix_btn, 0);
+        seq_hdr_song_btn = makeHeaderButton(88, "SONG --", RED808_CYAN,
+                                            seq_song_mode_cb);
+        seq_hdr_song_lbl = lv_obj_get_child(seq_hdr_song_btn, 0);
+        seq_hdr_song_text[0] = '\0';   // the cache must not outlive the label
+        seq_song_refresh();
         makeHeaderButton(52, "LIST", RED808_ACCENT,
             [](lv_event_t*) { seq_pattern_list_show(); });
         makeHeaderButton(56, LV_SYMBOL_DOWNLOAD " MIDI", RED808_CYAN,
@@ -6254,6 +6391,9 @@ static void update_sequencer_screen(void) {
     int step = p4.current_step;
     bool playing = p4.is_playing;
     unsigned long now = millis();
+
+    // Cheap: only touches LVGL when the rendered text actually changes.
+    seq_song_refresh();
 
     // Pattern loading modal lifecycle. P4 owns the bank, so completion is the
     // actual selected local slot. Daisy sync is an outbound upload and has no
@@ -7845,7 +7985,9 @@ static void show_midi_song_summary(const char* title,
         "Hits / tracks:    %lu / %u\n"
         "Dynamics:         MIDI velocity preserved\n"
         "Tempo events:     %u%s\n"
-        "Storage:          %s",
+        "Storage:          %s\n"
+        "SONG mode:        armado - el boton SONG del sequencer\n"
+        "                  encadena y repite las secciones",
         tempo_text,
         (unsigned)song.imported_bars, (unsigned)song.total_bars,
         (unsigned)song.pattern_count, mem_midi::MIDI_SONG_MAX_PATTERNS,
@@ -9522,10 +9664,12 @@ static std::atomic<uint8_t> s_piano_gate_percent{55};
 static uint32_t s_piano_rec_last_ms = 0;
 static int s_piano_rec_last_col = -1;
 
-// The piano deliberately exposes the four musical engines only.
-static constexpr int PIANO_ENGINE_COUNT = 4;
-static const uint8_t PIANO_ENGINES[PIANO_ENGINE_COUNT]      = {3, 4, 5, 6};
-static const char*   PIANO_ENGINE_LABELS[PIANO_ENGINE_COUNT] = {"303", "WT", "SH101", "FM2"};
+// The five melodic engines Daisy accepts from the keyboard. PHYS (7) was
+// implemented on the engine side and had a full parameter and preset table in
+// shared/synth_params.h, but the keyboard never listed it.
+static constexpr int PIANO_ENGINE_COUNT = SP_ENGINE_COUNT;
+static const uint8_t PIANO_ENGINES[PIANO_ENGINE_COUNT]      = {3, 4, 5, 6, 7};
+static const char*   PIANO_ENGINE_LABELS[PIANO_ENGINE_COUNT] = {"303", "WT", "SH101", "FM2", "PHYS"};
 // Signature color per engine — used by the selector chips and the pressed-key
 // glow, so the active synth is readable at a glance from across the room.
 static const uint32_t PIANO_ENGINE_COLORS[PIANO_ENGINE_COUNT] = {
@@ -9533,9 +9677,10 @@ static const uint32_t PIANO_ENGINE_COLORS[PIANO_ENGINE_COUNT] = {
     0x00E5FF,   // WT — cyan
     0xB07CFF,   // SH101 — violet
     0xFF8C42,   // FM2 — orange
+    0x6BFF9E,   // PHYS — mint
 };
 
-static lv_obj_t* s_piano_engine_btns[PIANO_ENGINE_COUNT]   = {NULL, NULL, NULL, NULL};
+static lv_obj_t* s_piano_engine_btns[PIANO_ENGINE_COUNT]   = {};
 static lv_obj_t* s_piano_octave_lbl       = NULL;
 static lv_obj_t* s_piano_keys24_btn       = NULL;
 static lv_obj_t* s_piano_keys24_lbl       = NULL;
@@ -9554,7 +9699,7 @@ static lv_obj_t* s_piano_gate_lbl         = NULL;
 // Per-engine sound-preset chips, shown on the piano page and relabeled when
 // the engine is selected. Selection tracked per piano engine.
 static lv_obj_t* s_piano_eng_preset_btns[4] = {NULL, NULL, NULL, NULL};
-static int       s_piano_preset_sel[PIANO_ENGINE_COUNT] = {0, 0, 0, 0};
+static int       s_piano_preset_sel[PIANO_ENGINE_COUNT] = {};
 static void piano_refresh_engine_presets(void);
 
 // Piano gesture state (v3.0): hold+drag for glide and pitch bend.
@@ -10870,7 +11015,9 @@ static void create_piano_screen(void) {
 #define PP_MAX_PARAMS_P4  21
 
 static int       s_pp_engine_idx = 0;
-static int       s_pp_preset_idx[SP_ENGINE_COUNT] = { -1 };
+// A `{ -1 }` initialiser only sets element 0; the remaining engines silently
+// started at preset index 0 while their chip row showed nothing selected.
+static int       s_pp_preset_idx[SP_ENGINE_COUNT] = { -1, -1, -1, -1, -1 };
 static float     s_pp_values[SP_ENGINE_COUNT][PP_MAX_PARAMS_P4] = {};
 static lv_obj_t* s_pp_engine_btns[SP_ENGINE_COUNT] = {};
 static lv_obj_t* s_pp_preset_btns[4] = {};
@@ -11002,7 +11149,7 @@ static uint8_t xtra_engine_idx_from_pp_engine(int pp_idx) {
 
 static lv_color_t pp_engine_color(int idx) {
     static const uint32_t colors[SP_ENGINE_COUNT] = {
-        0x00E5FF, 0xFF1493, 0xFFE066, 0x7CFF6B
+        0x00E5FF, 0xFF1493, 0xFFE066, 0x7CFF6B, 0xFF8C42
     };
     if (idx < 0 || idx >= SP_ENGINE_COUNT) return RED808_CYAN;
     return lv_color_hex(colors[idx]);
@@ -11581,7 +11728,7 @@ static void xtra_edit_cb(lv_event_t* e) {
     s_pp_from_xtra = true;
     s_pp_xtra_slot = slot;
     s_pp_engine_idx = pp_idx;
-    int preset_idx = constrain((int)s_xtra_slots[slot].preset_idx, 0, 2);
+    int preset_idx = constrain((int)s_xtra_slots[slot].preset_idx, 0, XTRA_PRESET_COUNT - 1);
     xtra_load_editor_state(slot);
     s_pp_preset_idx[pp_idx] = preset_idx;
     ui_navigate_to(11);
@@ -12017,8 +12164,9 @@ static void ui_reload_themed_screens(void) {
     seq_hdr_queue_lbl = NULL;
     seq_hdr_var_btn = NULL;
     seq_variation_modal = NULL;
-    seq_hdr_mix_btn = NULL;
-    seq_hdr_mix_lbl = NULL;
+    seq_hdr_song_btn = NULL;
+    seq_hdr_song_lbl = NULL;
+    seq_hdr_song_text[0] = '\0';
     seq_hdr_save_btn = NULL;
     seq_hdr_save_lbl = NULL;
     seq_pattern_list_modal = NULL;
@@ -12204,6 +12352,11 @@ static int8_t   s_pad_noteoff_engine[16] = {-1, -1, -1, -1, -1, -1, -1, -1,
 void ui_process_control_queue(void) {
     if (s_ctrl_pattern_sync_pending.exchange(false, std::memory_order_acquire)) {
         control_sync_current_pattern();
+    }
+
+    const int8_t songEngage = s_ctrl_song_engage_pending.exchange(-1, std::memory_order_acquire);
+    if (songEngage >= 0) {
+        control_song_set_engaged(songEngage != 0);
     }
 
     if (s_ctrl_mute_mask_pending.exchange(false, std::memory_order_acquire)) {

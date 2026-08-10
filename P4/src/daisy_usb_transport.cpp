@@ -257,10 +257,11 @@ bool DaisyUsbTransport::uploadSong(const SongEntry* entries, uint8_t count)
     return send(CMD_SONG_UPLOAD, payload, static_cast<uint16_t>(1 + count * 2));
 }
 
-bool DaisyUsbTransport::controlSong(uint8_t action)
+bool DaisyUsbTransport::controlSong(uint8_t action, bool loop)
 {
     if(action > 2u) return false;
-    return sendU8(CMD_SONG_CONTROL, action);
+    const uint8_t payload[2] = {action, static_cast<uint8_t>(loop ? 1u : 0u)};
+    return send(CMD_SONG_CONTROL, payload, sizeof(payload));
 }
 
 void DaisyUsbTransport::parseByte(uint8_t byte)
@@ -447,9 +448,17 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
     }
     else if((header->cmd == CMD_POD_GET_STATE
              || header->cmd == CMD_POD_SET_CONFIG)
-            && header->length >= sizeof(PodStatePayload))
+            && header->length >= (uint16_t)kPodStateMinLength)
     {
-        memcpy(&state_.pod, payload, sizeof(PodStatePayload));
+        // The song-mode fields were appended to the end of PodStatePayload.
+        // Accept a short packet from a Daisy that predates them and leave the
+        // tail zeroed, so the two firmwares can be flashed one at a time
+        // without the link going dark. A longer packet is truncated for the
+        // mirror case.
+        const size_t copied = header->length < sizeof(PodStatePayload)
+            ? header->length : sizeof(PodStatePayload);
+        memset(&state_.pod, 0, sizeof(PodStatePayload));
+        memcpy(&state_.pod, payload, copied);
         state_.pod_revision++;
     }
 }

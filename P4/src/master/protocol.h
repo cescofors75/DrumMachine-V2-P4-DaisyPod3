@@ -8,6 +8,7 @@
 #define PROTOCOL_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "../../../shared/red808_protocol_codes.h"
 
 // ═══════════════════════════════════════════════════════
@@ -607,10 +608,22 @@ typedef struct __attribute__((packed)) {
     uint8_t sdPresent;
     uint16_t sampleMask;
     uint32_t revision;
+    // Song mode, appended at the end on purpose. The receiver accepts any
+    // packet at least as long as this struct, so the two firmwares can be
+    // flashed one at a time without the link failing to enumerate.
+    uint8_t songIndex;       // position in the chain
+    uint8_t songLength;      // 0 = no arrangement resident in Daisy
+    uint8_t songRepeat;      // bars already played of the current entry
+    uint8_t songFlags;       // bit0 = playing, bit1 = looping
 } PodStatePayload;
 
-static_assert(sizeof(PodStatePayload) == 66,
+static_assert(sizeof(PodStatePayload) == 70,
               "P4/Daisy PodStatePayload wire layout changed");
+
+// Shortest pod-state packet still worth parsing: the layout without the four
+// song-mode bytes appended at the end. Anything from that point on is copied
+// as a prefix with the missing tail left zeroed.
+static const size_t kPodStateMinLength = sizeof(PodStatePayload) - 4;
 
 // --- Triggers ---
 typedef struct __attribute__((packed)) {

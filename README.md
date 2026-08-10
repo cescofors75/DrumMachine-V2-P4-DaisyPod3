@@ -106,6 +106,21 @@ distintos o más de 128 secciones, el resumen indica claramente la parte
 importada. Si existen varios eventos de tempo, se conserva el primero como BPM
 original de referencia.
 
+## Modo SONG
+
+Una canción importada queda residente hasta que se cancela explícitamente. El
+botón `SONG` de la cabecera del `SEQUENCER` cicla entre tres estados:
+
+- `SONG OFF` — la cadena está cargada pero el transporte toca un patrón suelto.
+- `SONG n/N` — Daisy encadena las secciones y para al final de la última.
+- `LOOP n/N` — igual, pero al llegar al final vuelve a la primera sección.
+
+Mientras suena, el botón muestra la posición real de la cadena y la rejilla
+sigue al compás que se está oyendo. Seleccionar un patrón concreto sale del
+modo song sin destruir el arrangement: `SONG` vuelve a engancharlo y resube las
+escenas residentes a Daisy. `SONG --` significa que no hay ninguna canción
+cargada; hay que importar un `.mid` con `FULL SONG` primero.
+
 HOME y SEQUENCER comparan ese BPM original —también el recomendado por los
 patrones normales— con el tempo efectivo. Cuando un knob físico o control
 digital lo cambia, aparece una flecha, la diferencia con signo y el valor
