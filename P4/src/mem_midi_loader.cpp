@@ -14,6 +14,7 @@
 #include <SPIFFS.h>
 #include <FS.h>
 #include <cstring>
+#include <cstdlib>
 #include <esp_heap_caps.h>
 
 // ---------------------------------------------------------------------------
@@ -71,7 +72,9 @@ static File          s_f;
 static bool          s_err = false;
 static unsigned long s_parse_start_ms = 0;
 static uint32_t      s_read_limit = 0;
-static constexpr unsigned long MIDI_PARSE_TIMEOUT_MS = 5000;
+// Full arrangements on SD can legitimately contain tens of thousands of
+// events. Keep a malformed-file escape hatch without rejecting dense songs.
+static constexpr unsigned long MIDI_PARSE_TIMEOUT_MS = 15000;
 
 static inline bool parse_timed_out() {
     return (millis() - s_parse_start_ms) > MIDI_PARSE_TIMEOUT_MS;
@@ -111,12 +114,13 @@ static void skipN(uint32_t n) {
 // Event buffer in PSRAM
 // ---------------------------------------------------------------------------
 static constexpr int MIDI_EVENT_BUF_INITIAL = 4096;
-static constexpr int MIDI_EVENT_BUF_MAX = 32768;
-struct RawEvt { uint32_t tick; uint8_t trk; };
+static constexpr int MIDI_EVENT_BUF_MAX = 131072;
+struct RawEvt { uint32_t tick; uint8_t trk; uint8_t velocity; };
 static RawEvt* s_evbuf = nullptr;
 static int     s_evcount = 0;
 static int     s_evcap = 0;
 static bool    s_evbuf_overflow = false;
+static uint16_t s_tempo_event_count = 0;
 
 static RawEvt* alloc_event_buffer(int capacity) {
     RawEvt* p = (RawEvt*)heap_caps_malloc(sizeof(RawEvt) * capacity,
@@ -143,14 +147,14 @@ static bool ensure_evbuf_capacity(int needed = MIDI_EVENT_BUF_INITIAL) {
     return true;
 }
 
-static bool append_event(uint32_t tick, uint8_t track) {
+static bool append_event(uint32_t tick, uint8_t track, uint8_t velocity) {
     if (s_evcount >= s_evcap && !ensure_evbuf_capacity(s_evcount + 1)) {
         s_evbuf_overflow = true;
         s_err = true;
         log_e("[MEM-MIDI] event limit reached (%d)", MIDI_EVENT_BUF_MAX);
         return false;
     }
-    s_evbuf[s_evcount++] = {tick, track};
+    s_evbuf[s_evcount++] = {tick, track, velocity};
     return true;
 }
 
@@ -183,11 +187,14 @@ static void parseTrack(uint32_t len, int tpq, uint32_t* tempo_us_out, int midi_c
             if (meta_type == 0x2F) {
                 skipN(ml);
                 break;
-            } else if (meta_type == 0x51 && ml == 3 && tempo_us_out && *tempo_us_out == 0) {
+            } else if (meta_type == 0x51 && ml == 3) {
                 uint32_t t = (uint32_t)readU8() << 16;
                 t |= (uint32_t)readU8() << 8;
                 t |= (uint32_t)readU8();
-                if (t > 0) *tempo_us_out = t;
+                if (t > 0) {
+                    if (s_tempo_event_count < UINT16_MAX) s_tempo_event_count++;
+                    if (tempo_us_out && *tempo_us_out == 0) *tempo_us_out = t;
+                }
             } else {
                 skipN(ml);
             }
@@ -221,7 +228,7 @@ static void parseTrack(uint32_t len, int tpq, uint32_t* tempo_us_out, int midi_c
                         trk = channel_to_track(ch);
                 }
             }
-            if (trk != 0xFF) append_event(tick, trk);
+            if (trk != 0xFF) append_event(tick, trk, vel);
         } else if (ev == 0xA0 || ev == 0xB0 || ev == 0xE0) {
             readU8();
         }
@@ -310,6 +317,136 @@ static int expandEventsTo64(int tpq, bool raw[16][64]) {
     return raw_len;
 }
 
+static int compareEventsByTick(const void* lhs, const void* rhs) {
+    const RawEvt& a = *static_cast<const RawEvt*>(lhs);
+    const RawEvt& b = *static_cast<const RawEvt*>(rhs);
+    if (a.tick < b.tick) return -1;
+    if (a.tick > b.tick) return 1;
+    if (a.trk < b.trk) return -1;
+    if (a.trk > b.trk) return 1;
+    return 0;
+}
+
+static bool sameSongPattern(const mem_midi::MidiSongPattern& a,
+                            const mem_midi::MidiSongPattern& b) {
+    if (memcmp(a.steps, b.steps, sizeof(a.steps)) != 0) return false;
+    // Ignore tiny velocity jitter when deciding whether two bars can share a
+    // resident scene. Accents remain distinct, but normal humanization does
+    // not consume all 20 Daisy slots after only a few bars.
+    for (int track = 0; track < 16; ++track) {
+        for (int step = 0; step < 16; ++step) {
+            if (!a.steps[track][step]) continue;
+            const int delta = (int)a.velocity[track][step]
+                            - (int)b.velocity[track][step];
+            if (delta < -5 || delta > 5) return false;
+        }
+    }
+    return true;
+}
+
+// Convert the complete event list into deduplicated 4/4 bars. Quantization is
+// nearest-16th rather than floor-to-16th, which keeps slightly humanized MIDI
+// notes on their intended step instead of consistently pulling them early.
+static bool buildSongFromEvents(int tpq, mem_midi::MidiSongData* song) {
+    if (!song || tpq <= 0 || s_evcount <= 0) return false;
+    memset(song->patterns, 0, sizeof(song->patterns));
+    memset(song->chain, 0, sizeof(song->chain));
+
+    qsort(s_evbuf, (size_t)s_evcount, sizeof(RawEvt), compareEventsByTick);
+    const uint32_t bar_ticks = (uint32_t)tpq * 4u;
+    const uint32_t first_tick = s_evbuf[0].tick;
+    const uint32_t bar_start = (first_tick / bar_ticks) * bar_ticks;
+
+    uint32_t max_quantized_step = 0;
+    for (int i = 0; i < s_evcount; ++i) {
+        if (s_evbuf[i].tick < bar_start) continue;
+        const uint32_t rel = s_evbuf[i].tick - bar_start;
+        const uint32_t qstep = (uint32_t)(((uint64_t)rel * 4u
+                                         + (uint32_t)tpq / 2u) / (uint32_t)tpq);
+        if (qstep > max_quantized_step) max_quantized_step = qstep;
+    }
+
+    const uint32_t source_total_bars = max_quantized_step / 16u + 1u;
+    // Each encoded chain entry can repeat its scene up to 255 times.
+    const uint32_t representable_bar_limit
+        = (uint32_t)mem_midi::MIDI_SONG_MAX_CHAIN * 255u;
+    const uint32_t bars_to_scan = source_total_bars > representable_bar_limit
+        ? representable_bar_limit : source_total_bars;
+    song->total_bars = (uint16_t)(source_total_bars > UINT16_MAX
+        ? UINT16_MAX : source_total_bars);
+    if (source_total_bars > bars_to_scan) song->truncated = true;
+
+    int event_index = 0;
+    uint16_t tracks_mask = 0;
+    for (uint32_t bar = 0; bar < bars_to_scan; ++bar) {
+        mem_midi::MidiSongPattern current{};
+
+        while (event_index < s_evcount) {
+            const RawEvt& event = s_evbuf[event_index];
+            if (event.tick < bar_start) {
+                event_index++;
+                continue;
+            }
+            const uint32_t rel = event.tick - bar_start;
+            const uint32_t qstep = (uint32_t)(((uint64_t)rel * 4u
+                                             + (uint32_t)tpq / 2u) / (uint32_t)tpq);
+            const uint32_t event_bar = qstep / 16u;
+            if (event_bar > bar) break;
+            event_index++;
+            if (event_bar < bar || event.trk >= 16) continue;
+
+            const uint8_t step = (uint8_t)(qstep & 0x0Fu);
+            current.steps[event.trk][step] = true;
+            if (event.velocity > current.velocity[event.trk][step])
+                current.velocity[event.trk][step] = event.velocity;
+        }
+
+        int pattern_index = -1;
+        for (int i = 0; i < song->pattern_count; ++i) {
+            if (sameSongPattern(song->patterns[i], current)) {
+                pattern_index = i;
+                break;
+            }
+        }
+        if (pattern_index < 0) {
+            if (song->pattern_count >= mem_midi::MIDI_SONG_MAX_PATTERNS) {
+                song->truncated = true;
+                break;
+            }
+            pattern_index = song->pattern_count++;
+            song->patterns[pattern_index] = current;
+        }
+
+        if (song->chain_count > 0
+            && song->chain[song->chain_count - 1].pattern == pattern_index
+            && song->chain[song->chain_count - 1].repeats < 255u) {
+            song->chain[song->chain_count - 1].repeats++;
+        } else {
+            if (song->chain_count >= mem_midi::MIDI_SONG_MAX_CHAIN) {
+                song->truncated = true;
+                break;
+            }
+            mem_midi::MidiSongChainEntry& entry = song->chain[song->chain_count++];
+            entry.pattern = (uint8_t)pattern_index;
+            entry.repeats = 1;
+        }
+
+        for (int track = 0; track < 16; ++track) {
+            for (int step = 0; step < 16; ++step) {
+                if (!current.steps[track][step]) continue;
+                song->hits++;
+                tracks_mask |= (uint16_t)(1u << track);
+            }
+        }
+        song->imported_bars++;
+    }
+
+    if (song->imported_bars < song->total_bars) song->truncated = true;
+    for (int track = 0; track < 16; ++track)
+        if (tracks_mask & (1u << track)) song->tracks_used++;
+    return song->pattern_count > 0 && song->chain_count > 0;
+}
+
 // ---------------------------------------------------------------------------
 // parseFile — open the SMF and feed all tracks through parseTrack.
 // Returns tpq (>0) on success, 0 on error. Fills tempo_us if found.
@@ -380,7 +517,6 @@ bool load_pattern(const char* path,
         name_out[name_max - 1] = '\0';
         char* dot = strrchr(name_out, '.');
         if (dot) *dot = '\0';
-        if ((int)strlen(name_out) > 8) name_out[8] = '\0';
     }
 
     uint32_t tempo_us = 0;
@@ -445,7 +581,6 @@ bool load_pattern_raw(const char* path,
         name_out[name_max - 1] = '\0';
         char* dot = strrchr(name_out, '.');
         if (dot) *dot = '\0';
-        if ((int)strlen(name_out) > 8) name_out[8] = '\0';
     }
 
     uint32_t tempo_us = 0;
@@ -510,7 +645,6 @@ bool load_pattern_raw_from_fs(fs::FS& storage,
         name_out[name_max - 1] = '\0';
         char* dot = strrchr(name_out, '.');
         if (dot) *dot = '\0';
-        if ((int)strlen(name_out) > 8) name_out[8] = '\0';
     }
 
     uint32_t tempo_us = 0;
@@ -545,6 +679,57 @@ bool load_pattern_raw_from_fs(fs::FS& storage,
 
     log_i("[MEM-MIDI-RAW-FS] %s: rawLen=%d total=%d", path, raw_len, total);
     return total > 0;
+}
+
+static void setSongName(const char* path, MidiSongData* song) {
+    const char* base = path ? strrchr(path, '/') : nullptr;
+    base = base ? base + 1 : (path ? path : "MIDI");
+    strncpy(song->name, base, sizeof(song->name) - 1);
+    song->name[sizeof(song->name) - 1] = '\0';
+    char* dot = strrchr(song->name, '.');
+    if (dot) *dot = '\0';
+}
+
+bool load_song_from_fs(fs::FS& storage, const char* path,
+                       MidiSongData* song, int mode) {
+    if (!song || !path || path[0] == '\0') return false;
+    memset(song, 0, sizeof(*song));
+    setSongName(path, song);
+
+    uint32_t tempo_us = 0;
+    s_evcount = 0;
+    s_evbuf_overflow = false;
+    s_tempo_event_count = 0;
+    if (!ensure_evbuf_capacity()) {
+        log_e("[MEM-MIDI-SONG] cannot allocate event buffer");
+        return false;
+    }
+
+    const int primary_filter = (mode == 1) ? 9 : -2;
+    uint16_t tpq = parseFile(storage, path, primary_filter, &tempo_us);
+    if (tpq == 0) return false;
+    if (s_evcount == 0) {
+        tempo_us = 0;
+        s_tempo_event_count = 0;
+        s_evbuf_overflow = false;
+        tpq = parseFile(storage, path, -1, &tempo_us);
+        if (tpq == 0 || s_evcount == 0) return false;
+    }
+
+    song->bpm = tempo_us > 0 ? 60000000.0f / (float)tempo_us : 0.0f;
+    song->tempo_events = (uint8_t)(s_tempo_event_count > 255u
+        ? 255u : s_tempo_event_count);
+    const bool ok = buildSongFromEvents((int)tpq, song);
+    log_i("[MEM-MIDI-SONG] %s: bars=%u/%u patterns=%u chain=%u hits=%lu bpm=%.1f tempos=%u truncated=%d",
+          path, (unsigned)song->imported_bars, (unsigned)song->total_bars,
+          (unsigned)song->pattern_count, (unsigned)song->chain_count,
+          (unsigned long)song->hits, song->bpm,
+          (unsigned)song->tempo_events, song->truncated ? 1 : 0);
+    return ok;
+}
+
+bool load_song(const char* path, MidiSongData* song, int mode) {
+    return load_song_from_fs(SPIFFS, path, song, mode);
 }
 
 int list_midi_files_from_fs(fs::FS& storage, const char* dir, char names[][48], int cap) {

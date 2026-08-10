@@ -12,6 +12,10 @@ struct BuiltinPatternSoundProfile {
 };
 
 void initializeProfessionalPatternBank(Sequencer& sequencer);
+// Exact factory bank used by RedMaster_ESP32S3 after loading
+// /patterns/20_patrones_factory_daisy.json, including its historical pad-8
+// refinement. Embedded here so a normal P4 firmware flash is sufficient.
+void initializeEsp32S3FactoryPatternBank(Sequencer& sequencer);
 bool getBuiltinPatternSoundProfile(int pattern, BuiltinPatternSoundProfile& out);
 void resetPatternSoundProfiles(void);
 void setPatternSoundProfile(int pattern, const BuiltinPatternSoundProfile& profile);

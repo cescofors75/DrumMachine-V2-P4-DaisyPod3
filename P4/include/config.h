@@ -100,6 +100,16 @@
 #ifndef TOUCH_I2C_ADDR
 #define TOUCH_I2C_ADDR  0x5D
 #endif
+
+// External controls use the second ESP32-P4 I2C controller. GPIO7/8 remain
+// reserved for GT911; a faulty external transaction therefore cannot stall
+// touch/rendering or destabilize the complete instrument.
+#ifndef ROTARY_I2C_SDA
+#define ROTARY_I2C_SDA  3
+#endif
+#ifndef ROTARY_I2C_SCL
+#define ROTARY_I2C_SCL  4
+#endif
 #ifndef TOUCH_RST_GPIO
 #define TOUCH_RST_GPIO  22
 #endif

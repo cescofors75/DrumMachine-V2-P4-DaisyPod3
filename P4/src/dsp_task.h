@@ -22,4 +22,5 @@ void dsp_notify_pad(uint8_t pad, uint8_t velocity);
 void dsp_set_bpm(float bpm);
 
 // Start the DSP task (call once from setup)
-void dsp_task_init();
+// True when the spectrum worker task was created.
+bool dsp_task_init();

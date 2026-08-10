@@ -12,6 +12,7 @@ struct P4State
 {
     int bpm_int;
     int bpm_frac;
+    int original_bpm_x10;     // source pattern/song tempo, 0 when undefined
     int current_pattern;
     int current_step;
     bool is_playing;
@@ -49,6 +50,29 @@ struct P4State
 };
 
 extern P4State p4;
+
+// Results captured from the real setup() calls and shown by the boot POST.
+// These are deliberately separate from P4State: they describe whether each
+// local subsystem actually initialized, not the current musical state.
+struct P4BootState
+{
+    bool display_ready;
+    bool lvgl_ready;
+    bool spiffs_mounted;
+    bool ui_ready;
+    bool usb_host_ready;
+    bool patterns_ready;
+    bool dsp_ready;
+    bool setup_complete;
+    uint8_t factory_patterns_found;
+    uint8_t factory_patterns_expected;
+    uint32_t psram_total_bytes;
+    uint32_t psram_free_bytes;
+    uint32_t spiffs_used_bytes;
+    uint32_t spiffs_total_bytes;
+};
+
+extern P4BootState p4boot;
 
 #define P4_SD_MAX_ENTRIES 64
 

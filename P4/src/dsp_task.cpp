@@ -93,7 +93,7 @@ static void dsp_task_func(void* /*arg*/) {
 // =============================================================================
 // INIT
 // =============================================================================
-void dsp_task_init() {
+bool dsp_task_init() {
     BaseType_t ok = xTaskCreatePinnedToCore(
         dsp_task_func,
         "dsp",
@@ -105,7 +105,9 @@ void dsp_task_init() {
     );
     if (ok == pdPASS) {
         P4_LOG_PRINTLN("[DSP] Task started on Core 0");
+        return true;
     } else {
         P4_LOG_PRINTLN("[DSP] Failed to create task");
+        return false;
     }
 }

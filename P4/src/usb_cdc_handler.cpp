@@ -193,7 +193,7 @@ static void usb_host_lib_task(void *arg) {
 // =============================================================================
 // INIT
 // =============================================================================
-void usb_cdc_init(void) {
+bool usb_cdc_init(void) {
     P4_LOG_PRINTLN("[USB-CDC] === Initializing USB Host ===");
 
     // Create TX mutex (guards s_cdc_dev access between write and disconnect)
@@ -206,7 +206,7 @@ void usb_cdc_init(void) {
         s_tx_queue = xQueueCreate(CDC_TX_QUEUE_DEPTH, sizeof(CdcTxPkt));
         if (!s_tx_queue) {
             P4_LOG_PRINTLN("[USB-CDC] Failed to create TX queue!");
-            return;
+            return false;
         }
     }
 
@@ -218,7 +218,7 @@ void usb_cdc_init(void) {
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
         P4_LOG_PRINTF("[USB-CDC] usb_host_install FAILED: 0x%x (%s)\n", err, esp_err_to_name(err));
-        return;
+        return false;
     }
     P4_LOG_PRINTLN("[USB-CDC] usb_host_install OK");
 
@@ -227,7 +227,7 @@ void usb_cdc_init(void) {
         usb_host_lib_task, "usb_host", 4096, NULL, 5, NULL, 0);
     if (ok != pdPASS) {
         P4_LOG_PRINTLN("[USB-CDC] Failed to create usb_host task!");
-        return;
+        return false;
     }
     P4_LOG_PRINTLN("[USB-CDC] Daemon task created");
 
@@ -237,6 +237,7 @@ void usb_cdc_init(void) {
         usb_cdc_tx_task, "usb_tx", 4096, NULL, 3, NULL, 0);
     if (ok != pdPASS) {
         P4_LOG_PRINTLN("[USB-CDC] Failed to create usb_tx task!");
+        return false;
     } else {
         P4_LOG_PRINTLN("[USB-CDC] TX task created (Core0, pri3)");
     }
@@ -251,12 +252,13 @@ void usb_cdc_init(void) {
     err = cdc_acm_host_install(&drv_cfg);
     if (err != ESP_OK) {
         P4_LOG_PRINTF("[USB-CDC] cdc_acm_host_install FAILED: 0x%x (%s)\n", err, esp_err_to_name(err));
-        return;
+        return false;
     }
     P4_LOG_PRINTLN("[USB-CDC] CDC-ACM driver installed");
 
     s_usb_init_ok = true;
     P4_LOG_PRINTLN("[USB-CDC] === Host ready — plug DaisyPod3 into USB-C host ===");
+    return true;
 }
 
 // Helper: finalize connection after successful open
@@ -402,6 +404,10 @@ size_t usb_cdc_write(const uint8_t* data, size_t len) {
     // xQueueSend with 0 timeout: drop silently if queue full (pad events are
     // best-effort visual sync; dropped frames don't affect audio)
     return (xQueueSend(s_tx_queue, &pkt, 0) == pdTRUE) ? len : 0;
+}
+
+size_t usb_cdc_tx_pending(void) {
+    return s_tx_queue ? static_cast<size_t>(uxQueueMessagesWaiting(s_tx_queue)) : 0u;
 }
 
 const char* usb_cdc_status_str(void) {

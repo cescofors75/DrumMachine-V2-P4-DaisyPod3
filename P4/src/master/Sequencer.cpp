@@ -488,6 +488,64 @@ void Sequencer::snapshotTrackForUpload(int pattern, int track, int stepCount, St
   unlockPattern();
 }
 
+bool Sequencer::snapshotPatternForStorage(int pattern, PatternStorageData* out) {
+  if (!out || pattern < 0 || pattern >= MAX_PATTERNS) return false;
+  lockPattern();
+  out->metadata = pd->metadata[pattern];
+  for (int t = 0; t < MAX_TRACKS; ++t) {
+    for (int s = 0; s < STEPS_PER_PATTERN; ++s) {
+      PatternStorageStep& dst = out->steps[t][s];
+      dst.active       = pd->steps[pattern][t][s] ? 1u : 0u;
+      dst.velocity     = pd->velocities[pattern][t][s];
+      dst.noteLenDiv   = pd->noteLenDivs[pattern][t][s];
+      dst.probability  = pd->probabilities[pattern][t][s];
+      dst.ratchet      = pd->ratchets[pattern][t][s];
+      dst.flags        = pd->stepFlags[pattern][t][s];
+      memcpy(dst.noteVoices, pd->stepNoteVoices[pattern][t][s],
+             sizeof(dst.noteVoices));
+      dst.cutoffEn     = pd->stepCutoffLockEnabled[pattern][t][s] ? 1u : 0u;
+      dst.cutoffHz     = pd->stepCutoffLockHz[pattern][t][s];
+      dst.reverbEn     = pd->stepReverbSendLockEnabled[pattern][t][s] ? 1u : 0u;
+      dst.reverbSend   = pd->stepReverbSendLockValue[pattern][t][s];
+      dst.volumeEn     = pd->stepVolumeLockEnabled[pattern][t][s] ? 1u : 0u;
+      dst.volume       = pd->stepVolumeLockValue[pattern][t][s];
+    }
+  }
+  unlockPattern();
+  return true;
+}
+
+bool Sequencer::restorePatternFromStorage(int pattern, const PatternStorageData* in) {
+  if (!in || pattern < 0 || pattern >= MAX_PATTERNS) return false;
+  lockPattern();
+  pd->metadata[pattern] = in->metadata;
+  pd->metadata[pattern].name[sizeof(pd->metadata[pattern].name) - 1] = '\0';
+  pd->metadata[pattern].genre[sizeof(pd->metadata[pattern].genre) - 1] = '\0';
+  pd->metadata[pattern].kit[sizeof(pd->metadata[pattern].kit) - 1] = '\0';
+  for (int t = 0; t < MAX_TRACKS; ++t) {
+    for (int s = 0; s < STEPS_PER_PATTERN; ++s) {
+      const PatternStorageStep& src = in->steps[t][s];
+      pd->steps[pattern][t][s] = src.active != 0;
+      pd->velocities[pattern][t][s] = constrain(src.velocity, 1, 127);
+      pd->noteLenDivs[pattern][t][s] = src.noteLenDiv;
+      pd->probabilities[pattern][t][s] = constrain(src.probability, 0, 100);
+      pd->ratchets[pattern][t][s] = constrain(src.ratchet, 1, 4);
+      pd->stepFlags[pattern][t][s] = src.flags;
+      memcpy(pd->stepNoteVoices[pattern][t][s], src.noteVoices,
+             sizeof(src.noteVoices));
+      pd->stepNotes[pattern][t][s] = src.noteVoices[0];
+      pd->stepCutoffLockEnabled[pattern][t][s] = src.cutoffEn != 0;
+      pd->stepCutoffLockHz[pattern][t][s] = constrain(src.cutoffHz, 20, 20000);
+      pd->stepReverbSendLockEnabled[pattern][t][s] = src.reverbEn != 0;
+      pd->stepReverbSendLockValue[pattern][t][s] = src.reverbSend;
+      pd->stepVolumeLockEnabled[pattern][t][s] = src.volumeEn != 0;
+      pd->stepVolumeLockValue[pattern][t][s] = constrain(src.volume, 0, 150);
+    }
+  }
+  unlockPattern();
+  return true;
+}
+
 // ============= VELOCITY EDITING =============
 
 void Sequencer::setStepVelocity(int track, int step, uint8_t velocity) {
@@ -687,6 +745,7 @@ void Sequencer::setPatternBulk(int pattern, const bool stepsData[MAX_TRACKS][STE
     for (int s = 0; s < STEPS_PER_PATTERN; s++) {
       pd->steps[pattern][t][s] = stepsData[t][s];
       pd->velocities[pattern][t][s] = velsData[t][s];
+      pd->noteLenDivs[pattern][t][s] = 1;
       pd->probabilities[pattern][t][s] = 100;
       pd->ratchets[pattern][t][s] = 1;
       pd->stepVolumeLockEnabled[pattern][t][s] = false;
@@ -695,6 +754,10 @@ void Sequencer::setPatternBulk(int pattern, const bool stepsData[MAX_TRACKS][STE
       pd->stepCutoffLockHz[pattern][t][s] = 1000;
       pd->stepReverbSendLockEnabled[pattern][t][s] = false;
       pd->stepReverbSendLockValue[pattern][t][s] = 0;
+      pd->stepNotes[pattern][t][s] = 0;
+      memset(pd->stepNoteVoices[pattern][t][s], 0,
+             sizeof(pd->stepNoteVoices[pattern][t][s]));
+      pd->stepFlags[pattern][t][s] = 0;
     }
   }
   unlockPattern();
@@ -1129,7 +1192,10 @@ void Sequencer::setPatternMetadata(int pattern, const PatternMetadata& metadata)
   pd->metadata[pattern].name[sizeof(pd->metadata[pattern].name) - 1] = '\0';
   pd->metadata[pattern].genre[sizeof(pd->metadata[pattern].genre) - 1] = '\0';
   pd->metadata[pattern].kit[sizeof(pd->metadata[pattern].kit) - 1] = '\0';
-  pd->metadata[pattern].recommendedBpm = constrain(pd->metadata[pattern].recommendedBpm, 30, 300);
+  // 0 is a deliberate sentinel for imported MIDI files with no Set Tempo
+  // event. All defined source tempos remain constrained to the playable range.
+  if (pd->metadata[pattern].recommendedBpm != 0)
+    pd->metadata[pattern].recommendedBpm = constrain(pd->metadata[pattern].recommendedBpm, 30, 300);
   pd->metadata[pattern].swing = constrain(pd->metadata[pattern].swing, 0, 100);
   pd->metadata[pattern].humanizeTimingMs = constrain(pd->metadata[pattern].humanizeTimingMs, 0, 30);
   pd->metadata[pattern].humanizeVelocity = constrain(pd->metadata[pattern].humanizeVelocity, 0, 40);

@@ -19,10 +19,36 @@
 
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static esp_lcd_panel_io_handle_t io_handle = NULL;
+static bool backlight_pwm_ready = false;
+static uint8_t backlight_brightness = 100;
+
+static void ensure_backlight_pwm() {
+    if (backlight_pwm_ready) return;
+    pinMode(LCD_BL_GPIO, OUTPUT);
+    backlight_pwm_ready = ledcAttach(LCD_BL_GPIO, 20000, 8);
+}
+
+void display_set_brightness(uint8_t percent) {
+    if (percent > 100) percent = 100;
+    backlight_brightness = percent;
+    ensure_backlight_pwm();
+    if (backlight_pwm_ready) {
+        const uint32_t duty = (static_cast<uint32_t>(percent) * 255u + 50u) / 100u;
+        ledcWrite(LCD_BL_GPIO, duty);
+    } else {
+        digitalWrite(LCD_BL_GPIO, percent > 0 ? HIGH : LOW);
+    }
+}
+
+uint8_t display_get_brightness(void) {
+    return backlight_brightness;
+}
 
 void display_backlight(bool on) {
-    pinMode(LCD_BL_GPIO, OUTPUT);
-    digitalWrite(LCD_BL_GPIO, on ? HIGH : LOW);
+    ensure_backlight_pwm();
+    if (on) display_set_brightness(backlight_brightness);
+    else if (backlight_pwm_ready) ledcWrite(LCD_BL_GPIO, 0);
+    else digitalWrite(LCD_BL_GPIO, LOW);
 }
 
 esp_lcd_panel_handle_t display_get_panel(void) {

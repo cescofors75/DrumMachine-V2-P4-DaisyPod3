@@ -22,6 +22,13 @@ class DaisyUsbTransport
         uint32_t crc_errors;
         uint32_t framing_errors;
         uint32_t tx_drops;
+        uint32_t round_trip_ms;
+        uint32_t query_timeouts;
+        uint32_t stale_responses;
+        uint16_t protocol_version;
+        uint16_t capability_flags;
+        uint32_t daisy_rx_drops;
+        uint32_t daisy_protocol_errors;
         bool sd_present;
         uint16_t sample_mask;
         uint8_t xtra_sample_mask;
@@ -72,6 +79,8 @@ class DaisyUsbTransport
                      const bool steps[16], uint8_t velocity = 100);
     void setTrackMute(uint8_t track, bool muted);
     void setTrackSolo(uint8_t track, bool soloed);
+    void setTrackMuteMask(uint16_t mask);
+    void setTrackSoloMask(uint16_t mask);
     void setTrackVolume(uint8_t track, uint8_t volume);
     void setTrackEngine(uint8_t track, int8_t engine);
     void synthTrigger(uint8_t engine, uint8_t instrument, uint8_t velocity);
@@ -81,6 +90,8 @@ class DaisyUsbTransport
     void synthParam(uint8_t engine, uint8_t instrument, uint8_t parameter,
                     float value);
     void synthPreset(uint8_t engine, uint8_t preset);
+    bool uploadSong(const SongEntry* entries, uint8_t count);
+    bool controlSong(uint8_t action); // 0=stop, 1=play, 2=reset
 
     bool connected() const { return state_.engine_responding; }
     const TransportState& state() const { return state_; }
@@ -99,6 +110,10 @@ class DaisyUsbTransport
 
   private:
     static uint16_t crc16(const uint8_t* data, uint16_t length);
+    bool sendPacket(uint8_t command, const void* payload,
+                    uint16_t payload_length, uint16_t* assigned_sequence);
+    bool sendQuery(uint8_t command, const void* payload = nullptr,
+                   uint16_t payload_length = 0);
     void parseByte(uint8_t byte);
     void handleResponse(const uint8_t* packet, uint16_t packet_length);
     void poll();
@@ -111,6 +126,10 @@ class DaisyUsbTransport
     uint32_t last_position_ms_ = 0;
     uint32_t last_status_ms_ = 0;
     uint32_t last_pod_state_ms_ = 0;
+    bool pending_query_ = false;
+    uint8_t pending_query_command_ = 0;
+    uint16_t pending_query_sequence_ = 0;
+    uint32_t pending_query_since_ms_ = 0;
     std::atomic<uint32_t> sample_end_ack_revision_{0};
     std::atomic<uint8_t> sample_end_ack_pad_{0xFFu};
     std::atomic<bool> sample_end_ack_accepted_{false};

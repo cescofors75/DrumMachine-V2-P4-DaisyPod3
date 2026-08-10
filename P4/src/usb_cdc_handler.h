@@ -8,7 +8,9 @@
 #include <stddef.h>
 
 // Initialize USB Host Library + CDC ACM driver on USB-OTG port
-void usb_cdc_init(void);
+// Returns true only when the host library, daemon and CDC class driver are
+// installed. Device enumeration is reported separately by connected().
+bool usb_cdc_init(void);
 
 // Process USB Host events — call from main loop
 void usb_cdc_process(void);
@@ -24,6 +26,11 @@ int usb_cdc_read(void);
 
 // Send data to DaisyPod3 via USB CDC
 size_t usb_cdc_write(const uint8_t* data, size_t len);
+
+// Number of framed packets waiting for the USB TX worker. The protocol layer
+// uses this to defer low-priority telemetry while live notes/controls are
+// queued, keeping musical input ahead of status polling.
+size_t usb_cdc_tx_pending(void);
 
 // Get diagnostic string for the P4/DaisyPod3 USB CDC state.
 // Returns: "init=X conn=X dev=X open=X disc=X last_err=X"

@@ -78,6 +78,29 @@ struct StepUploadData {
   uint8_t  volume;
 };
 
+// Stable, packed representation used by the P4 user-pattern store. It is
+// deliberately independent from PatternData's compiler-specific bool layout.
+struct __attribute__((packed)) PatternStorageStep {
+  uint8_t  active;
+  uint8_t  velocity;
+  uint8_t  noteLenDiv;
+  uint8_t  probability;
+  uint8_t  ratchet;
+  uint8_t  flags;
+  uint8_t  noteVoices[MELODY_STEP_VOICES];
+  uint8_t  cutoffEn;
+  uint16_t cutoffHz;
+  uint8_t  reverbEn;
+  uint8_t  reverbSend;
+  uint8_t  volumeEn;
+  uint8_t  volume;
+};
+
+struct __attribute__((packed)) PatternStorageData {
+  PatternMetadata metadata;
+  PatternStorageStep steps[MAX_TRACKS][STEPS_PER_PATTERN];
+};
+
 class Sequencer {
 public:
   Sequencer();
@@ -106,6 +129,8 @@ public:
   // Copia consistente (bajo un solo lock) de los datos de una pista de un
   // patron para subirlos a la Daisy sin races con ediciones de la web.
   void snapshotTrackForUpload(int pattern, int track, int stepCount, StepUploadData* out);
+  bool snapshotPatternForStorage(int pattern, PatternStorageData* out);
+  bool restorePatternFromStorage(int pattern, const PatternStorageData* in);
   
   // Velocity editing per step
   void setStepVelocity(int track, int step, uint8_t velocity);
@@ -212,7 +237,7 @@ public:
   int getSongLength();
 
   // Song Chain mode (pattern chain with repeats)
-  static constexpr int SONG_CHAIN_MAX = 32;
+  static constexpr int SONG_CHAIN_MAX = 128;
   struct SongChainEntry { uint8_t pattern; uint8_t repeats; };
   void songChainUpload(const SongChainEntry* entries, uint8_t count);
   void songChainPlay();
@@ -301,7 +326,7 @@ private:
 
   // Song Chain mode
   bool songChainActive;
-  uint8_t songChainCount;     // number of entries (0-32)
+  uint8_t songChainCount;     // number of entries (0-128)
   uint8_t songChainIdx;       // current index in chain
   uint8_t songChainRepeatCnt; // current repeat count for current entry
   SongChainEntry songChain[SONG_CHAIN_MAX];

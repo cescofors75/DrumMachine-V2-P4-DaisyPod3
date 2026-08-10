@@ -1,4 +1,5 @@
 #include "PatternBank.h"
+#include "LegacyFactoryBank.generated.h"
 
 #include <cstring>
 
@@ -426,6 +427,60 @@ void initializeProfessionalPatternBank(Sequencer& sequencer) {
   }
   sequencer.selectPattern(0);
   sequencer.setHumanize(META[0].timing, META[0].velocity);
+}
+
+void initializeEsp32S3FactoryPatternBank(Sequencer& sequencer) {
+  // The S3 firmware first built its integrated bank, then the factory JSON
+  // replaced the musical data while retaining metadata defaults (swing and
+  // humanize) for slots 0..15. Reproduce that order exactly.
+  initializeProfessionalPatternBank(sequencer);
+  sequencer.setPatternLength(16);
+  sequencer.setTempo((float)LEGACY_FACTORY_TEMPO);
+  resetPatternSoundProfiles();
+
+  for (const LegacyFactoryPatternSeed& pattern : LEGACY_FACTORY_PATTERNS) {
+    if (pattern.slot >= MAX_PATTERNS) continue;
+
+    PatternMetadata metadata{};
+    sequencer.getPatternMetadata(pattern.slot, metadata);
+    strncpy(metadata.name, pattern.name, sizeof(metadata.name) - 1);
+    metadata.name[sizeof(metadata.name) - 1] = '\0';
+    metadata.recommendedBpm = LEGACY_FACTORY_TEMPO;
+
+    sequencer.clearPattern(pattern.slot);
+    sequencer.setPatternMetadata(pattern.slot, metadata);
+
+    BuiltinPatternSoundProfile profile{};
+    for (int track = 0; track < MAX_TRACKS; ++track)
+      profile.engines[track] = -1;
+
+    const uint16_t end = pattern.firstTrack + pattern.trackCount;
+    for (uint16_t index = pattern.firstTrack; index < end; ++index) {
+      const LegacyFactoryTrackSeed& source = LEGACY_FACTORY_TRACKS[index];
+      if (source.track >= MAX_TRACKS) continue;
+      profile.engines[source.track] = source.engine;
+      if (source.engine >= 0 && source.engine < BUILTIN_ENGINE_COUNT)
+        profile.presets[source.engine] = source.preset;
+
+      for (uint8_t step = 0; step < 16; ++step) {
+        const bool active = (source.activeMask & (uint16_t)(1u << step)) != 0;
+        sequencer.setStep(pattern.slot, source.track, step, active,
+                          source.velocities[step]);
+        sequencer.setStepNote(pattern.slot, source.track, step,
+                              source.notes[step]);
+        sequencer.setStepFlags(pattern.slot, source.track, step,
+                               source.flags[step]);
+      }
+    }
+    setPatternSoundProfile(pattern.slot, profile);
+  }
+
+  // This cleanup was also executed by the S3 JSON loader for this exact bank.
+  refineFactoryTwentyPatternBank(sequencer);
+  sequencer.selectPattern(0);
+  PatternMetadata initial{};
+  if (sequencer.getPatternMetadata(0, initial))
+    sequencer.setHumanize(initial.humanizeTimingMs, initial.humanizeVelocity);
 }
 
 bool getBuiltinPatternSoundProfile(int pattern, BuiltinPatternSoundProfile& out) {

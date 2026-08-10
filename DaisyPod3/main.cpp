@@ -409,6 +409,10 @@ static inline void DspProfBlockDone() {}
 #define CMD_PING              0xEE
 #define CMD_RESET             0xEF
 
+#define RED808_PROTOCOL_VERSION       0x0203u
+#define RED808_CAP_EXTENDED_PONG      0x0001u
+#define RED808_CAP_USB_RX_DIAGNOSTICS 0x0002u
+
 /* Synth Engine */
 #define CMD_SYNTH_TRIGGER     0xC0  /* [engine(1), instrument(1), velocity(1)] */
 #define CMD_SYNTH_PARAM       0xC1  /* [engine(1), instrument(1), paramId(1), value(4)] */
@@ -469,6 +473,8 @@ enum MasterFxRouteId : uint8_t {
 
 /* Expanded per-track LFO targets */
 #define CMD_TRACK_LFO_CONFIG   0x67  /* [track, wave, target, rateHi, rateLo, depthHi, depthLo] */
+#define CMD_TRACK_MUTE_MASK     0x68  /* [maskLo,maskHi] atomic mixer + sequencer mute state */
+#define CMD_TRACK_SOLO_MASK     0x69  /* [maskLo,maskHi] atomic mixer solo state             */
 
 /* Bulk */
 #define CMD_BULK_TRIGGERS     0xF0
@@ -522,6 +528,15 @@ struct __attribute__((packed)) SPIPacketHeader {
     uint16_t length;
     uint16_t sequence;
     uint16_t checksum;
+};
+
+struct __attribute__((packed)) LinkHealthResponse {
+    uint32_t echoMs;
+    uint32_t uptimeMs;
+    uint16_t protocolVersion;
+    uint16_t capabilityFlags;
+    uint32_t rxDrops;
+    uint32_t protocolErrors;
 };
 
 struct __attribute__((packed)) CpuLoadResponse {
@@ -897,6 +912,7 @@ struct DsqStepFull {
 
 /* Resident patterns live in SDRAM; richer steps preserve melodic expression. */
 DSY_SDRAM_BSS static DsqStepFull dsqSteps[DSQ_PATTERNS][DSQ_TRACKS][DSQ_MAX_STEPS];
+static uint32_t dsqLoadedPatternMask = 0;
 
 struct DaisySeqState {
     bool     playing;
@@ -968,6 +984,18 @@ enum PodControlFunction : uint8_t {
     POD_FUNC_XTRA_PADS,
     POD_FUNC_DELAY_MIX,
     POD_FUNC_REVERB_MIX,
+    POD_FUNC_CONTROL_CONFIG,
+    POD_FUNC_SCREEN_BRIGHTNESS,
+    POD_FUNC_FLANGER_DEPTH,
+    POD_FUNC_WAVEFOLDER_GAIN,
+    POD_FUNC_CRUSH_MACRO,
+    POD_FUNC_PHASER_DEPTH,
+    POD_FUNC_FILTER_CUTOFF,
+    POD_FUNC_FILTER_RESONANCE,
+    POD_FUNC_DISTORTION,
+    POD_FUNC_BIT_DEPTH,
+    POD_FUNC_SAMPLE_RATE,
+    POD_FUNC_FILTER_TYPE,
     POD_FUNC_COUNT
 };
 
@@ -989,6 +1017,11 @@ struct __attribute__((packed)) PodConfigPayload {
     uint8_t knob2Function;
     uint8_t encoderFunction;
     uint8_t encoderButtonFunction;
+    uint8_t rotary1Function;
+    uint8_t rotary2Function;
+    uint8_t rotary3Function;
+    uint8_t rotary4Function;
+    uint8_t selectorFunction;
     uint8_t led1Function;
     uint8_t led1R;
     uint8_t led1G;
@@ -997,8 +1030,11 @@ struct __attribute__((packed)) PodConfigPayload {
     uint8_t led2R;
     uint8_t led2G;
     uint8_t led2B;
-    uint8_t reserved;
+    uint8_t faderFunction;
 };
+
+static_assert(sizeof(PodConfigPayload) == 21,
+              "P4/Daisy PodConfigPayload wire layout changed");
 
 struct __attribute__((packed)) PodStatePayload {
     PodConfigPayload config;
@@ -1019,7 +1055,18 @@ struct __attribute__((packed)) PodStatePayload {
     uint8_t liveVolume;
     uint8_t delayMixValue;
     uint8_t reverbMixValue;
-    uint8_t fxActiveBits;    /* bit0=delay, bit1=reverb */
+    uint8_t fxActiveBits;    /* delay,reverb,flanger,phaser,fold,crush,filter,drive */
+    uint8_t flangerDepthValue;
+    uint8_t phaserDepthValue;
+    uint8_t wavefolderValue;
+    uint8_t crushValue;
+    uint8_t filterType;
+    uint8_t bitDepth;
+    uint8_t distortionPct;
+    uint8_t reservedFx;
+    uint16_t cutoffHz;
+    uint16_t resonanceX10;
+    uint16_t sampleRateHz;
     uint16_t bpmX10;
     uint8_t playing;
     uint8_t sdPresent;
@@ -1027,15 +1074,21 @@ struct __attribute__((packed)) PodStatePayload {
     uint32_t revision;
 };
 
-static constexpr uint8_t POD_CONFIG_VERSION = 2;
+static_assert(sizeof(PodStatePayload) == 66,
+              "P4/Daisy PodStatePayload wire layout changed");
+
+static constexpr uint8_t POD_CONFIG_VERSION = 7;
 static PodConfigPayload podConfig = {
     POD_CONFIG_VERSION,
-    POD_FUNC_PLAY_TOGGLE, POD_FUNC_BACK,
+    POD_FUNC_BACK, POD_FUNC_CONTROL_CONFIG,
+    POD_FUNC_MASTER_VOLUME, POD_FUNC_TEMPO,
+    POD_FUNC_PATTERN_NEXT, POD_FUNC_PLAY_TOGGLE,
     POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX,
-    POD_FUNC_SELECT_PAD, POD_FUNC_TRIGGER_SELECTED,
-    POD_LED_USB_LINK, 0, 110, 255,
-    POD_LED_PAD_ACTIVITY, 255, 0, 180,
-    0
+    POD_FUNC_FLANGER_DEPTH, POD_FUNC_PHASER_DEPTH,
+    POD_FUNC_NONE,
+    POD_LED_USB_LINK, 255, 24, 12,
+    POD_LED_SAMPLES_READY, 0, 255, 90,
+    POD_FUNC_SCREEN_BRIGHTNESS
 };
 static uint16_t podKnobRaw[2] = {};
 static int16_t podLastKnobRaw[2] = {-1, -1};
@@ -1048,10 +1101,34 @@ static uint32_t podPadPulseUntilMs = 0;
 static uint32_t podStateRevision = 1;
 static bool podApplyingCommand = false;
 
+static bool PodFunctionsConflict(uint8_t left, uint8_t right)
+{
+    if(left == POD_FUNC_NONE || right == POD_FUNC_NONE) return false;
+    if(left == right) return true;
+    const bool leftCrush = left == POD_FUNC_CRUSH_MACRO;
+    const bool rightCrush = right == POD_FUNC_CRUSH_MACRO;
+    return (leftCrush && (right == POD_FUNC_BIT_DEPTH
+                          || right == POD_FUNC_SAMPLE_RATE))
+        || (rightCrush && (left == POD_FUNC_BIT_DEPTH
+                           || left == POD_FUNC_SAMPLE_RATE));
+}
+
 static bool PodOwnsFunction(uint8_t function)
 {
     return podConfig.knob1Function == function
         || podConfig.knob2Function == function;
+}
+
+static bool PodOwnsBitDepth()
+{
+    return PodOwnsFunction(POD_FUNC_CRUSH_MACRO)
+        || PodOwnsFunction(POD_FUNC_BIT_DEPTH);
+}
+
+static bool PodOwnsSampleRate()
+{
+    return PodOwnsFunction(POD_FUNC_CRUSH_MACRO)
+        || PodOwnsFunction(POD_FUNC_SAMPLE_RATE);
 }
 
 /* Map synth-engine (or -1 for sampler) + drum instrument to priority */
@@ -1090,6 +1167,7 @@ static void DsqInit() {
      * DsqFireStep ponga trackGain[t]=0 al disparar el primer step y
      * silenciando todos los live pads permanentemente. */
     memset(dsqSteps, 0, sizeof(dsqSteps));
+    dsqLoadedPatternMask = 0;
     memset(&dseq, 0, sizeof(dseq));
     memset(dsqTrackSwing, 0, sizeof(dsqTrackSwing));   /* E4 */
     memset(pendingTriggers, 0, sizeof(pendingTriggers)); /* E4 */
@@ -1224,16 +1302,25 @@ struct BiquadEQ {
     }
 };
 
+static inline float GlobalEqGainDb(uint8_t type)
+{
+    /* The master payload has no EQ-gain field. A fixed musical boost keeps
+     * PEAK/LOW SHELF/HIGH SHELF distinct instead of becoming identity filters. */
+    return (type == FTYPE_PEAKING || type == FTYPE_LOWSHELF
+            || type == FTYPE_HIGHSHELF) ? 6.0f : 0.0f;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  11. DaisySP MASTER FX
  * ═══════════════════════════════════════════════════════════════════ */
 static DelayLine<float, MAX_DELAY_SAMPLES> DSY_SDRAM_BSS masterDelay;
 DSY_SDRAM_BSS static ReverbSc   masterReverb;
-DSY_SDRAM_BSS static Chorus     masterChorus;
+DSY_SDRAM_BSS static ChorusEngine masterChorusL;
+DSY_SDRAM_BSS static ChorusEngine masterChorusR;
 static Tremolo    masterTremolo;
 static Compressor masterComp;
-static Fold       masterFold;
-DSY_SDRAM_BSS static Phaser     masterPhaser;
+DSY_SDRAM_BSS static Phaser     masterPhaserL;
+DSY_SDRAM_BSS static Phaser     masterPhaserR;
 DSY_SDRAM_BSS static Flanger    masterFlangerL;
 DSY_SDRAM_BSS static Flanger    masterFlangerR;
 
@@ -1267,6 +1354,7 @@ static bool  compRouted = true;
 /* Phaser */
 static bool  phaserActive   = false;
 static bool  phaserRouted   = true;
+static float phaserDepth    = 0.4f;
 
 /* Flanger (DaisySP) */
 static bool  flangerActive  = false;
@@ -1283,7 +1371,8 @@ static bool  limiterActive  = false;
 static bool  limiterRouted  = true;
 
 /* Autowah (DaisySP) */
-static Autowah    masterAutowah;
+static Autowah    masterAutowahL;
+static Autowah    masterAutowahR;
 static bool  autowahActive  = false;
 static bool  autowahRouted  = true;
 static float autowahLevel   = 0.5f;
@@ -1319,6 +1408,8 @@ static bool  chorusStereoMode = true;  /* default: stereo for wider mix */
 #define ER_TAPS 6
 static DelayLine<float, 4800> DSY_SDRAM_BSS erDelayL;  /* 100ms max */
 static DelayLine<float, 4800> DSY_SDRAM_BSS erDelayR;
+static DelayLine<float, 4800> DSY_SDRAM_BSS combDelayL;
+static DelayLine<float, 4800> DSY_SDRAM_BSS combDelayR;
 static bool  erActive  = false;
 static bool  erRouted  = true;
 static float erMix     = 0.15f;
@@ -1330,7 +1421,7 @@ static const float erTapGains[ER_TAPS]  = { 0.8f, 0.65f, 0.5f, 0.4f, 0.3f, 0.22f
 static uint8_t chokeGroup[MAX_PADS];
 
 /* Song Mode — chain of pattern+repeats */
-#define SONG_MAX_ENTRIES 32
+#define SONG_MAX_ENTRIES 128
 struct SongEntry { uint8_t pattern; uint8_t repeats; };
 static SongEntry songChain[SONG_MAX_ENTRIES];
 static uint8_t songLength    = 0;
@@ -1371,7 +1462,8 @@ static float   gFilterDist    = 0.0f;
 static uint8_t gFilterDistMode= DMODE_SOFT;
 static uint32_t gFilterSrReduce = 0;  /* 0 = disabled */
 static float   gSrHoldL = 0, gSrHoldR = 0;
-static uint32_t gSrCounter = 0;
+static uint32_t gSrPhase = 0;
+static bool     gSrPrimed = false;
 
 static bool* GetMasterFxRouteFlag(uint8_t fxId)
 {
@@ -2353,6 +2445,15 @@ static inline float SoftClipKnee(float x)
     return copysignf(shaped, x);
 }
 
+/* Stateless triangle wavefolder. It is transparent for -1..+1 at gain 1,
+ * then folds every excursion back into that range without channel crosstalk. */
+static inline float WaveFoldSample(float input, float gain)
+{
+    float phase = fmodf(input * gain + 1.0f, 4.0f);
+    if(phase < 0.0f) phase += 4.0f;
+    return phase <= 2.0f ? phase - 1.0f : 3.0f - phase;
+}
+
 static void ResetMasterProcessingState()
 {
     delayActive = false;
@@ -2363,6 +2464,9 @@ static void ResetMasterProcessingState()
     phaserActive = false;
     flangerActive = false;
     waveFolderGain = 1.0f;
+    phaserDepth = 0.4f;
+    masterPhaserL.SetLfoDepth(phaserDepth);
+    masterPhaserR.SetLfoDepth(phaserDepth);
     limiterActive = false;
     autowahActive = false;
     erActive = false;
@@ -2389,7 +2493,8 @@ static void ResetMasterProcessingState()
     gFilterSrReduce = 0;
     gSrHoldL = 0.0f;
     gSrHoldR = 0.0f;
-    gSrCounter = 0;
+    gSrPhase = 0;
+    gSrPrimed = false;
 
     /* Mega upgrade state */
     stereoWidth = 1.0f;
@@ -2711,10 +2816,13 @@ static void RunStartup808SelfTest(uint32_t nowMs)
         reverbMix = 0.24f;
         chorusMix = 0.16f;
         masterDelay.SetDelay(0.18f * (float)SAMPLE_RATE);
+        masterDelayR.SetDelay(0.18f * (float)SAMPLE_RATE);
         masterReverb.SetFeedback(0.83f);
         masterReverb.SetLpFreq(7600.0f);
-        masterChorus.SetLfoFreq(0.35f);
-        masterChorus.SetLfoDepth(0.35f);
+        masterChorusL.SetLfoFreq(0.35f);
+        masterChorusR.SetLfoFreq(0.3535f);
+        masterChorusL.SetLfoDepth(0.35f);
+        masterChorusR.SetLfoDepth(0.35f);
 
         int picked = -1;
         for(int k = 0; k < MAX_PADS; k++){
@@ -2947,33 +3055,28 @@ static inline float fast_powf(float base, float exponent){
 
 static float ApplyDist(float s, float drive, uint8_t mode){
     if(!isfinite(s)) return 0.0f;          // nunca propagar NaN/Inf al DSP
-    drive = clampF(drive, 0.f, 100.f);
-    if(drive < 0.01f) return s;
-    float d = 1.0f + drive * 15.0f;
-    s *= d;
+    drive = clampF(drive, 0.f, 1.f);
+    if(drive < 0.001f) return s;
+    const float dry = s;
+    const float preGain = 1.0f + drive * 24.0f;
+    s *= preGain;
     switch(mode){
         case DMODE_SOFT: s = MySoftClip(s); break;
         case DMODE_HARD: s = clampF(s,-1.f,1.f); break;
         case DMODE_TUBE: s = AsymClip(s); break;  // asimétrico tube (AudioNoise)
-        case DMODE_FUZZ: { // fold-back fuzz — acotado, nunca puede colgar el callback
-            s = clampF(s, -1.0e6f, 1.0e6f);
-            int guard = 64;
-            while((s >  1.f || s < -1.f) && guard-- > 0){
-                if(s >  1.f) s =  2.f - s;
-                if(s < -1.f) s = -2.f - s;
-            }
-            s = clampF(s, -1.f, 1.f);
-            break;
-        }
+        case DMODE_FUZZ: s = WaveFoldSample(s, 1.0f); break;
+        default: s = MySoftClip(s); break;
     }
-    float out = s / d * (1.f + drive * 0.5f);
+    const float wet = s * (1.0f - drive * 0.15f);
+    const float out = dry * (1.0f - drive) + wet * drive;
     return isfinite(out) ? out : 0.0f;
 }
 
 static float BitCrush(float s, uint8_t bits){
     if(bits >= 16) return s;
-    float levels = (float)(1 << bits);
-    return roundf(s * levels) / levels;
+    bits = bits < 2 ? 2 : bits;
+    const float steps = (float)((1u << (bits - 1u)) - 1u);
+    return roundf(clampF(s, -1.0f, 1.0f) * steps) / steps;
 }
 
 static void StopPadVoices(uint8_t pad)
@@ -4013,6 +4116,7 @@ static void SetPerformanceStressProfile(uint8_t profile)
         delayFeedback = 0.42f;
         delayMix = 0.18f;
         masterDelay.SetDelay(delayTime / 1000.0f * (float)SAMPLE_RATE);
+        masterDelayR.SetDelay(delayTime / 1000.0f * (float)SAMPLE_RATE);
         reverbActive = true;
         reverbMix = 0.22f;
         chorusActive = true;
@@ -4623,6 +4727,7 @@ static void RunStartupShowcaseDemo(uint32_t nowMs)
     delayFeedback = 0.24f;
     chorusMix = 0.035f;
     masterDelay.SetDelay(0.1875f * (float)SAMPLE_RATE);
+    masterDelayR.SetDelay(0.1875f * (float)SAMPLE_RATE);
     masterReverb.SetFeedback(0.76f);
     masterReverb.SetLpFreq(6800.0f);
 
@@ -4938,18 +5043,21 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                                 dseq.currentPattern = songChain[0].pattern;
                             } else {
                                 songPlaying = false;
+                                dseq.playing = false;
                             }
                         } else {
                             dseq.currentPattern = songChain[songIdx].pattern;
                         }
                     }
                 }
-                DsqFireStep();
+                // Natural song end stops on the bar boundary. Do not fire
+                // step zero of the final scene once songPlaying has cleared.
+                if(dseq.playing) DsqFireStep();
                 /* ── Stems: re-trigger enabled clean tracks from the top at each
                  *    pattern restart so a one-shot stem stays locked to the bar
                  *    (plays in sync with the looping sequencer). Muted tracks are
                  *    armed but stay silent in the mixer until unmuted. ── */
-                if(dseq.currentStep == 0){
+                if(dseq.playing && dseq.currentStep == 0){
                     for(int ct = 0; ct < CLEAN_TRACK_COUNT; ct++){
                         if(cleanTrackEnabled[ct] && cleanTrackLoaded[ct]){
                             cleanTrackPlayhead[ct] = 0;
@@ -5456,7 +5564,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         chorusBusR = sanitizeF(chorusBusR);
 
         /* ── Global filter ── */
-        if(IsGlobalFilterEngaged()){
+        if(gFilterRouted && gFilterType != FTYPE_NONE){
             /* Ladder / SVF / Comb filter handled by DaisySP modules */
             if(gFilterType == FTYPE_LADDER){
                 L = sanitizeF(masterLadderL.Process(L));
@@ -5471,10 +5579,10 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 /* Comb filter via short delay line with feedback */
                 float combDelay = clampF(1.f / (gFilterCutoff > 20.f ? gFilterCutoff : 20.f) * (float)SAMPLE_RATE, 1.f, 4799.f);
                 float combFb = clampF(gFilterQ / 30.f, 0.f, 0.98f);
-                float combL = erDelayL.Read(combDelay);
-                float combR = erDelayR.Read(combDelay);
-                erDelayL.Write(clampF(L + combL * combFb, -4.f, 4.f));
-                erDelayR.Write(clampF(R + combR * combFb, -4.f, 4.f));
+                float combL = combDelayL.Read(combDelay);
+                float combR = combDelayR.Read(combDelay);
+                combDelayL.Write(clampF(L + combL * combFb, -4.f, 4.f));
+                combDelayR.Write(clampF(R + combR * combFb, -4.f, 4.f));
                 L = L * 0.5f + combL * 0.5f;
                 R = R * 0.5f + combR * 0.5f;
             } else {
@@ -5490,7 +5598,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         }
 
         /* ── Global bitcrush + distortion ── */
-        if(IsGlobalFilterEngaged()){
+        if(gFilterRouted && (gFilterBitDepth < 16
+           || fabsf(gFilterDist) > 0.0001f)){
             L = BitCrush(L, gFilterBitDepth);
             R = BitCrush(R, gFilterBitDepth);
             L = ApplyDist(L, gFilterDist, gFilterDistMode);
@@ -5498,23 +5607,26 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         }
 
         /* ── Global SAMPLE_RATE reduce ── */
-        if(IsGlobalFilterEngaged() && gFilterSrReduce > 0 && gFilterSrReduce < (uint32_t)SAMPLE_RATE){
-            uint32_t step = (uint32_t)SAMPLE_RATE / gFilterSrReduce;
-            if(step < 1) step = 1;
-            gSrCounter++;
-            if(gSrCounter >= step){
-                gSrCounter = 0;
+        if(gFilterRouted && gFilterSrReduce > 0
+           && gFilterSrReduce < (uint32_t)SAMPLE_RATE){
+            if(!gSrPrimed){
                 gSrHoldL = L; gSrHoldR = R;
-            } else {
-                L = gSrHoldL; R = gSrHoldR;
+                gSrPrimed = true;
             }
+            gSrPhase += gFilterSrReduce;
+            if(gSrPhase >= (uint32_t)SAMPLE_RATE){
+                gSrPhase -= (uint32_t)SAMPLE_RATE;
+                gSrHoldL = L; gSrHoldR = R;
+            }
+            L = gSrHoldL; R = gSrHoldR;
         }
 
         /* ── Autowah ── */
         if(!fxShed && IsAutowahEngaged()){
-            float awL = sanitizeF(masterAutowah.Process(L));
+            float awL = sanitizeF(masterAutowahL.Process(L));
+            float awR = sanitizeF(masterAutowahR.Process(R));
             L = L * (1.0f - autowahMix) + awL * autowahMix;
-            R = R * (1.0f - autowahMix) + awL * autowahMix;
+            R = R * (1.0f - autowahMix) + awR * autowahMix;
         }
 
         /* ── Delay (mono or ping-pong stereo) ── */
@@ -5529,7 +5641,9 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 R = R * (1.0f - delayMix) + wetR * delayMix;
             } else {
                 float wet = masterDelay.Read();
-                masterDelay.Write(clampF(L + delaySendMono + wet * delayFeedback, -4.f, 4.f));
+                const float monoIn = (L + R) * 0.5f;
+                masterDelay.Write(clampF(monoIn + delaySendMono
+                                        + wet * delayFeedback, -4.f, 4.f));
                 L = L * (1.0f - delayMix) + wet * delayMix;
                 R = R * (1.0f - delayMix) + wet * delayMix;
             }
@@ -5543,15 +5657,16 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
 
         /* ── Wavefolder ── */
         if(!fxShed && IsWaveFolderEngaged()){
-            masterFold.SetIncrement(waveFolderGain);
-            L = sanitizeF(masterFold.Process(L));
-            R = sanitizeF(masterFold.Process(R));
+            L = WaveFoldSample(L, waveFolderGain);
+            R = WaveFoldSample(R, waveFolderGain);
         }
 
         /* ── Phaser ── */
         if(!fxShed && IsPhaserEngaged()){
-            L = sanitizeF(masterPhaser.Process(L));
-            R = R * 0.7f + L * 0.3f;
+            /* DaisySP Phaser sums four engines; normalize the sum to avoid a
+             * 12 dB level jump before the output limiter. */
+            L = sanitizeF(masterPhaserL.Process(L) * 0.25f);
+            R = sanitizeF(masterPhaserR.Process(R) * 0.25f);
         }
 
         /* ── Flanger (DaisySP) ── */
@@ -5572,12 +5687,13 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         if(!fxShed && IsChorusEngaged()){
             float chorusSendMono = (chorusBusL + chorusBusR) * 0.5f;
             if(chorusStereoMode){
-                float wetL = sanitizeF(masterChorus.Process(L + chorusSendMono));
-                float wetR = sanitizeF(masterChorus.Process(R + chorusSendMono));
+                float wetL = sanitizeF(masterChorusL.Process(L + chorusSendMono));
+                float wetR = sanitizeF(masterChorusR.Process(R + chorusSendMono));
                 L = L * (1.0f - chorusMix) + wetL * chorusMix;
                 R = R * (1.0f - chorusMix) + wetR * chorusMix;
             } else {
-                float wet = sanitizeF(masterChorus.Process(L + chorusSendMono));
+                const float monoIn = (L + R) * 0.5f + chorusSendMono;
+                float wet = sanitizeF(masterChorusL.Process(monoIn));
                 L = L * (1.0f - chorusMix) + wet * chorusMix;
                 R = R * (1.0f - chorusMix) + wet * chorusMix;
             }
@@ -5726,7 +5842,38 @@ static void BuildPodState(PodStatePayload& state)
     state.liveVolume = podCurrentLiveVolume;
     state.delayMixValue = static_cast<uint8_t>(clampF(delayMix, 0.0f, 1.0f) * 127.0f + 0.5f);
     state.reverbMixValue = static_cast<uint8_t>(clampF(reverbMix, 0.0f, 1.0f) * 127.0f + 0.5f);
-    state.fxActiveBits = (delayActive ? 1u : 0u) | (reverbActive ? 2u : 0u);
+    state.flangerDepthValue = static_cast<uint8_t>(
+        clampF(flangerDepth, 0.0f, 1.0f) * 127.0f + 0.5f);
+    state.phaserDepthValue = static_cast<uint8_t>(
+        clampF(phaserDepth, 0.0f, 1.0f) * 127.0f + 0.5f);
+    state.wavefolderValue = static_cast<uint8_t>(
+        clampF((waveFolderGain - 1.0f) / 9.0f, 0.0f, 1.0f) * 127.0f + 0.5f);
+    const float crushBits = clampF((16.0f - static_cast<float>(gFilterBitDepth))
+                                   / 10.0f, 0.0f, 1.0f);
+    const float crushRate = gFilterSrReduce == 0 ? 0.0f
+        : clampF(logf(clampF(static_cast<float>(gFilterSrReduce), 4000.0f,
+                             42000.0f) / 42000.0f)
+                 / logf(4000.0f / 42000.0f), 0.0f, 1.0f);
+    state.crushValue = static_cast<uint8_t>(
+        (crushBits > crushRate ? crushBits : crushRate) * 127.0f + 0.5f);
+    state.filterType = gFilterType;
+    state.bitDepth = gFilterBitDepth;
+    state.distortionPct = static_cast<uint8_t>(
+        clampF(gFilterDist, 0.0f, 1.0f) * 100.0f + 0.5f);
+    state.cutoffHz = static_cast<uint16_t>(
+        clampF(gFilterCutoff, 20.0f, 20000.0f) + 0.5f);
+    state.resonanceX10 = static_cast<uint16_t>(
+        clampF(gFilterQ, 0.3f, 40.0f) * 10.0f + 0.5f);
+    state.sampleRateHz = static_cast<uint16_t>(gFilterSrReduce > 48000u
+        ? 0u : gFilterSrReduce);
+    state.fxActiveBits = (delayActive ? 1u : 0u)
+                       | (reverbActive ? 2u : 0u)
+                       | (flangerActive ? 4u : 0u)
+                       | (phaserActive ? 8u : 0u)
+                       | (waveFolderGain > 1.01f ? 16u : 0u)
+                       | ((gFilterBitDepth < 16 || gFilterSrReduce > 0) ? 32u : 0u)
+                       | (gFilterType != FTYPE_NONE ? 64u : 0u)
+                       | (gFilterDist > 0.0001f ? 128u : 0u);
     state.bpmX10 = podCurrentBpmX10;
     state.playing = dseq.playing ? 1u : 0u;
     state.sdPresent = sdPresent ? 1u : 0u;
@@ -5738,14 +5885,27 @@ static void BuildPodState(PodStatePayload& state)
 static void ValidatePodConfig(PodConfigPayload& config)
 {
     config.version = POD_CONFIG_VERSION;
-    config.reserved = 0;
     uint8_t* functions[] = {
         &config.button1Function, &config.button2Function,
         &config.knob1Function, &config.knob2Function,
-        &config.encoderFunction, &config.encoderButtonFunction
+        &config.encoderFunction, &config.encoderButtonFunction,
+        &config.rotary1Function, &config.rotary2Function,
+        &config.rotary3Function, &config.rotary4Function,
+        &config.selectorFunction, &config.faderFunction
     };
-    for(uint8_t i = 0; i < 6; i++)
+    for(uint8_t i = 0; i < 12; i++)
+    {
         if(*functions[i] >= POD_FUNC_COUNT) *functions[i] = POD_FUNC_NONE;
+        if(*functions[i] == POD_FUNC_NONE) continue;
+        for(uint8_t previous = 0; previous < i; previous++)
+        {
+            if(PodFunctionsConflict(*functions[previous], *functions[i]))
+            {
+                *functions[i] = POD_FUNC_NONE;
+                break;
+            }
+        }
+    }
     if(config.led1Function >= POD_LED_COUNT) config.led1Function = POD_LED_FIXED;
     if(config.led2Function >= POD_LED_COUNT) config.led2Function = POD_LED_FIXED;
 }
@@ -5783,12 +5943,16 @@ static void ProcessCommand()
      *  PING
      * ════════════════════════════════════════════ */
     case CMD_PING: {
-        uint32_t echo = 0, uptime = hw.system.GetNow();
-        if(len >= 4) memcpy(&echo, p, 4);
-        uint8_t pong[8];
-        memcpy(pong,     &echo,   4);
-        memcpy(pong + 4, &uptime, 4);
-        BuildResponse(CMD_PING, hdr->sequence, pong, 8);
+        LinkHealthResponse pong = {};
+        if(len >= 4) memcpy(&pong.echoMs, p, 4);
+        pong.uptimeMs = hw.system.GetNow();
+        pong.protocolVersion = RED808_PROTOCOL_VERSION;
+        pong.capabilityFlags = RED808_CAP_EXTENDED_PONG
+                             | RED808_CAP_USB_RX_DIAGNOSTICS;
+        pong.rxDrops = usbRxDrops;
+        pong.protocolErrors = spiErrCnt;
+        BuildResponse(CMD_PING, hdr->sequence,
+                      reinterpret_cast<const uint8_t*>(&pong), sizeof(pong));
         return;
     }
 
@@ -5962,18 +6126,21 @@ static void ProcessCommand()
         if(len >= 1 && (podApplyingCommand || !PodOwnsFunction(POD_FUNC_MASTER_VOLUME))){
             podCurrentMasterVolume = p[0] > 150 ? 150 : p[0];
             if(!kForceMasterGainDebug) masterGain = VolumeByteToGain(podCurrentMasterVolume);
+            podStateRevision++;
         }
         break;
     case CMD_SEQ_VOLUME:
         if(len >= 1 && (podApplyingCommand || !PodOwnsFunction(POD_FUNC_SEQ_VOLUME))){
             podCurrentSeqVolume = p[0] > 150 ? 150 : p[0];
             seqVolume = VolumeByteToGain(podCurrentSeqVolume);
+            podStateRevision++;
         }
         break;
     case CMD_LIVE_VOLUME:
         if(len >= 1 && (podApplyingCommand || !PodOwnsFunction(POD_FUNC_LIVE_VOLUME))){
             podCurrentLiveVolume = p[0] > 150 ? 150 : p[0];
             liveVolume = VolumeByteToGain(podCurrentLiveVolume);
+            podStateRevision++;
         }
         break;
     case CMD_TRACK_VOLUME:
@@ -6015,6 +6182,7 @@ static void ProcessCommand()
             dseq.tempo = transportBpm;   /* sync DSQ clock */
             podCurrentBpmX10 = static_cast<uint16_t>(transportBpm * 10.0f + 0.5f);
             DsqUpdateSamplesPerStep();
+            podStateRevision++;
         }
         break;
 
@@ -6031,16 +6199,38 @@ static void ProcessCommand()
              * NO coincidían con el struct del master: el cutoff aterrizaba
              * como float basura y bitDepth=0 pasaba sin clamp → BitCrush a
              * 0 bits = silencio total. Era el "se cuelga con filtros OUT". */
-            gFilterType = p[0];
-            gFilterDistMode = p[1];
-            gFilterBitDepth = p[2];
-            memcpy(&gFilterCutoff,   p + 4,  4);
-            memcpy(&gFilterQ,        p + 8,  4);
-            memcpy(&gFilterDist,     p + 12, 4);
-            memcpy(&gFilterSrReduce, p + 16, 4);
+            uint8_t incomingType = p[0];
+            uint8_t incomingDistMode = p[1];
+            uint8_t incomingBitDepth = p[2];
+            float incomingCutoff = 0.f, incomingQ = 0.f, incomingDist = 0.f;
+            uint32_t incomingSrReduce = 0;
+            memcpy(&incomingCutoff,   p + 4,  4);
+            memcpy(&incomingQ,        p + 8,  4);
+            memcpy(&incomingDist,     p + 12, 4);
+            memcpy(&incomingSrReduce, p + 16, 4);
+            if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_FILTER_TYPE))
+                gFilterType = incomingType;
+            if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_DISTORTION)){
+                gFilterDistMode = incomingDistMode;
+                gFilterDist = incomingDist;
+            }
+            if(podApplyingCommand || !PodOwnsBitDepth())
+                gFilterBitDepth = incomingBitDepth;
+            if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_FILTER_CUTOFF))
+                gFilterCutoff = incomingCutoff;
+            if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_FILTER_RESONANCE))
+                gFilterQ = incomingQ;
+            if(podApplyingCommand || !PodOwnsSampleRate()){
+                gFilterSrReduce = incomingSrReduce;
+                gSrPhase = 0;
+                gSrPrimed = false;
+            }
             /* Clamps defensivos: ningún payload puede matar el audio. */
+            if(gFilterType > FTYPE_COMB) gFilterType = FTYPE_NONE;
+            if(gFilterDistMode > DMODE_FUZZ) gFilterDistMode = DMODE_SOFT;
             if(gFilterBitDepth < 4 || gFilterBitDepth > 16) gFilterBitDepth = 16;
-            gFilterDist = clampF(gFilterDist, 0.f, 100.f);
+            if(gFilterDist > 1.0f) gFilterDist *= 0.01f;
+            gFilterDist = clampF(gFilterDist, 0.f, 1.f);
             if(gFilterSrReduce > (uint32_t)SAMPLE_RATE) gFilterSrReduce = 0;
             gFilterCutoff = clampF(gFilterCutoff, 20.f, 20000.f);
             gFilterQ      = (gFilterType == FTYPE_RESONANT) ? clampF(gFilterQ, 0.3f, 40.f) : clampF(gFilterQ, 0.3f, 28.f);
@@ -6055,17 +6245,21 @@ static void ProcessCommand()
                 masterSvfL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
                 masterSvfR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
             } else {
-                gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
+                gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ,
+                                 (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
+                gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ,
+                                 (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
                 if(gFilterType == FTYPE_RESONANT){
                     gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
                     gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
                 }
             }
+            podStateRevision++;
         }
         break;
     case CMD_FILTER_CUTOFF:
-        if(len >= 4){
+        if(len >= 4 && (podApplyingCommand
+           || !PodOwnsFunction(POD_FUNC_FILTER_CUTOFF))){
             memcpy(&gFilterCutoff, p, 4);
             gFilterCutoff = clampF(gFilterCutoff, 20.f, 20000.f);
             if(gFilterType){
@@ -6076,18 +6270,22 @@ static void ProcessCommand()
                     masterSvfL.SetFreq(gFilterCutoff);
                     masterSvfR.SetFreq(gFilterCutoff);
                 } else {
-                    gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                    gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
+                    gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ,
+                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
+                    gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ,
+                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
                     if(gFilterType == FTYPE_RESONANT){
                         gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
                         gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
                     }
                 }
             }
+            podStateRevision++;
         }
         break;
     case CMD_FILTER_RESONANCE:
-        if(len >= 4){
+        if(len >= 4 && (podApplyingCommand
+           || !PodOwnsFunction(POD_FUNC_FILTER_RESONANCE))){
             memcpy(&gFilterQ, p, 4);
             gFilterQ = (gFilterType == FTYPE_RESONANT) ? clampF(gFilterQ, 0.3f, 40.f) : clampF(gFilterQ, 0.3f, 28.f);
             if(gFilterType){
@@ -6098,32 +6296,46 @@ static void ProcessCommand()
                     masterSvfL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
                     masterSvfR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
                 } else {
-                    gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                    gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
+                    gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ,
+                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
+                    gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ,
+                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
                     if(gFilterType == FTYPE_RESONANT){
                         gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
                         gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
                     }
                 }
             }
+            podStateRevision++;
         }
         break;
     case CMD_FILTER_BITDEPTH:
-        if(len >= 1) gFilterBitDepth = (p[0] < 4) ? 4 : (p[0] > 16 ? 16 : p[0]);
+        if(len >= 1 && (podApplyingCommand || !PodOwnsBitDepth())){
+            gFilterBitDepth = (p[0] < 4) ? 4 : (p[0] > 16 ? 16 : p[0]);
+            podStateRevision++;
+        }
         break;
     case CMD_FILTER_DISTORTION:
-        if(len >= 4){
+        if(len >= 4 && (podApplyingCommand
+           || !PodOwnsFunction(POD_FUNC_DISTORTION))){
             memcpy(&gFilterDist, p, 4);
-            gFilterDist = clampF(gFilterDist, 0.f, 100.f);
+            if(gFilterDist > 1.0f) gFilterDist *= 0.01f;
+            gFilterDist = clampF(gFilterDist, 0.f, 1.f);
+            podStateRevision++;
         }
         break;
     case CMD_FILTER_DIST_MODE:
-        if(len >= 1) gFilterDistMode = p[0];
+        if(len >= 1 && (podApplyingCommand
+           || !PodOwnsFunction(POD_FUNC_DISTORTION)))
+            gFilterDistMode = p[0];
         break;
     case CMD_FILTER_SR_REDUCE:
-        if(len >= 4){
+        if(len >= 4 && (podApplyingCommand || !PodOwnsSampleRate())){
             memcpy(&gFilterSrReduce, p, 4);
             if(gFilterSrReduce > (uint32_t)SAMPLE_RATE) gFilterSrReduce = 0;
+            gSrPhase = 0;
+            gSrPrimed = false;
+            podStateRevision++;
         }
         break;
     case CMD_MASTER_FX_ROUTE:
@@ -6137,18 +6349,22 @@ static void ProcessCommand()
      *  DELAY (0x30-0x33)
      * ════════════════════════════════════════════ */
     case CMD_DELAY_ACTIVE:
-        if(len >= 1 && (podApplyingCommand || !PodOwnsFunction(POD_FUNC_DELAY_MIX)))
+        if(len >= 1 && (podApplyingCommand || !PodOwnsFunction(POD_FUNC_DELAY_MIX))){
             delayActive = (p[0] != 0);
+            podStateRevision++;
+        }
         break;
     case CMD_DELAY_TIME:
         if(len >= 4){
             float ms; memcpy(&ms, p, 4);
             delayTime = clampF(ms, 10.f, 2000.f);
             masterDelay.SetDelay(delayTime / 1000.0f * (float)SAMPLE_RATE);
+            masterDelayR.SetDelay(delayTime / 1000.0f * (float)SAMPLE_RATE);
         } else if(len >= 2){
             uint16_t ms16 = 0; memcpy(&ms16, p, 2);
-            delayTime = (float)ms16;
+            delayTime = clampF((float)ms16, 10.f, 2000.f);
             masterDelay.SetDelay(delayTime / 1000.0f * (float)SAMPLE_RATE);
+            masterDelayR.SetDelay(delayTime / 1000.0f * (float)SAMPLE_RATE);
         }
         break;
     case CMD_DELAY_FEEDBACK:
@@ -6159,6 +6375,7 @@ static void ProcessCommand()
         if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_DELAY_MIX)){
             if(len >= 4){ float v; memcpy(&v, p, 4); delayMix = clampF(v, 0.f, 1.f); }
             else if(len >= 1) delayMix = p[0] / 100.0f;
+            if(len >= 1) podStateRevision++;
         }
         break;
 
@@ -6166,36 +6383,65 @@ static void ProcessCommand()
      *  PHASER (0x34-0x37)
      * ════════════════════════════════════════════ */
     case CMD_PHASER_ACTIVE:
-        if(len >= 1) phaserActive = (p[0] != 0);
+        if(len >= 1 && (podApplyingCommand
+           || !PodOwnsFunction(POD_FUNC_PHASER_DEPTH))){
+            phaserActive = (p[0] != 0);
+            podStateRevision++;
+        }
         break;
     case CMD_PHASER_RATE:
-        if(len >= 4){ float v; memcpy(&v, p, 4); masterPhaser.SetFreq(clampF(v * 10.f, 0.1f, 10.f)); }
-        else if(len >= 1) masterPhaser.SetFreq(p[0] / 10.0f);
+        if(len >= 4){
+            float v; memcpy(&v, p, 4); v = clampF(v, 0.1f, 10.f);
+            masterPhaserL.SetFreq(v); masterPhaserR.SetFreq(v * 1.013f);
+        } else if(len >= 1){
+            float v = clampF(p[0] / 10.0f, 0.1f, 10.f);
+            masterPhaserL.SetFreq(v); masterPhaserR.SetFreq(v * 1.013f);
+        }
         break;
     case CMD_PHASER_DEPTH:
-        if(len >= 4){ float v; memcpy(&v, p, 4); masterPhaser.SetLfoDepth(clampF(v, 0.f, 1.f)); }
-        else if(len >= 1) masterPhaser.SetLfoDepth(p[0] / 100.0f);
+        if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_PHASER_DEPTH)){
+            float v = 0.f;
+            if(len >= 4) memcpy(&v, p, 4);
+            else if(len >= 1) v = p[0] / 100.0f;
+            else break;
+            v = clampF(v, 0.f, 1.f);
+            phaserDepth = v;
+            masterPhaserL.SetLfoDepth(v); masterPhaserR.SetLfoDepth(v);
+            podStateRevision++;
+        }
         break;
     case CMD_PHASER_FEEDBACK:
-        if(len >= 4){ float v; memcpy(&v, p, 4); masterPhaser.SetFeedback(clampF(v, 0.f, 0.95f)); }
-        else if(len >= 1) masterPhaser.SetFeedback(p[0] / 100.0f);
+        if(len >= 4){
+            float v; memcpy(&v, p, 4); v = clampF(v, 0.f, 0.95f);
+            masterPhaserL.SetFeedback(v); masterPhaserR.SetFeedback(v);
+        } else if(len >= 1){
+            float v = clampF(p[0] / 100.0f, 0.f, 0.95f);
+            masterPhaserL.SetFeedback(v); masterPhaserR.SetFeedback(v);
+        }
         break;
 
     /* ════════════════════════════════════════════
      *  FLANGER (0x38-0x3C)
      * ════════════════════════════════════════════ */
     case CMD_FLANGER_ACTIVE:
-        if(len >= 1) flangerActive = (p[0] != 0);
+        if(len >= 1 && (podApplyingCommand
+           || !PodOwnsFunction(POD_FUNC_FLANGER_DEPTH))){
+            flangerActive = (p[0] != 0);
+            podStateRevision++;
+        }
         break;
     case CMD_FLANGER_RATE:
-        if(len >= 4){ float v; memcpy(&v, p, 4); flangerRate = clampF(v * 10.f, 0.1f, 10.f); ConfigureMasterFlanger(); }
+        if(len >= 4){ float v; memcpy(&v, p, 4); flangerRate = clampF(v, 0.1f, 10.f); ConfigureMasterFlanger(); }
         else if(len >= 1) flangerRate = clampF(p[0] * 0.1f, 0.1f, 20.f);
         ConfigureMasterFlanger();
         break;
     case CMD_FLANGER_DEPTH:
-        if(len >= 4){ float v; memcpy(&v, p, 4); flangerDepth = clampF(v, 0.f, 1.f); ConfigureMasterFlanger(); }
-        else if(len >= 1) flangerDepth = p[0] / 100.0f;
-        ConfigureMasterFlanger();
+        if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_FLANGER_DEPTH)){
+            if(len >= 4){ float v; memcpy(&v, p, 4); flangerDepth = clampF(v, 0.f, 1.f); }
+            else if(len >= 1) flangerDepth = clampF(p[0] / 100.0f, 0.f, 1.f);
+            ConfigureMasterFlanger();
+            if(len >= 1) podStateRevision++;
+        }
         break;
     case CMD_FLANGER_FEEDBACK:
         if(len >= 4){ float v; memcpy(&v, p, 4); flangerFb = clampF(v, 0.f, 0.95f); ConfigureMasterFlanger(); }
@@ -6238,8 +6484,10 @@ static void ProcessCommand()
      *  REVERB (0x43-0x46)
      * ════════════════════════════════════════════ */
     case CMD_REVERB_ACTIVE:
-        if(len >= 1 && (podApplyingCommand || !PodOwnsFunction(POD_FUNC_REVERB_MIX)))
+        if(len >= 1 && (podApplyingCommand || !PodOwnsFunction(POD_FUNC_REVERB_MIX))){
             reverbActive = (p[0] != 0);
+            podStateRevision++;
+        }
         break;
     case CMD_REVERB_FEEDBACK:
         if(len >= 4){
@@ -6266,6 +6514,7 @@ static void ProcessCommand()
         if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_REVERB_MIX)){
             if(len >= 4){ float v; memcpy(&v, p, 4); reverbMix = clampF(v, 0.f, 1.f); }
             else if(len >= 1) reverbMix = p[0] / 100.0f;
+            if(len >= 1) podStateRevision++;
         }
         break;
 
@@ -6276,12 +6525,22 @@ static void ProcessCommand()
         if(len >= 1) chorusActive = (p[0] != 0);
         break;
     case CMD_CHORUS_RATE:
-        if(len >= 4){ float v; memcpy(&v, p, 4); masterChorus.SetLfoFreq(clampF(v, 0.1f, 10.f)); }
-        else if(len >= 1) masterChorus.SetLfoFreq(p[0] / 10.0f);
+        if(len >= 4){
+            float v; memcpy(&v, p, 4); v = clampF(v, 0.1f, 10.f);
+            masterChorusL.SetLfoFreq(v); masterChorusR.SetLfoFreq(v * 1.013f);
+        } else if(len >= 1){
+            float v = clampF(p[0] / 10.0f, 0.1f, 10.f);
+            masterChorusL.SetLfoFreq(v); masterChorusR.SetLfoFreq(v * 1.013f);
+        }
         break;
     case CMD_CHORUS_DEPTH:
-        if(len >= 4){ float v; memcpy(&v, p, 4); masterChorus.SetLfoDepth(clampF(v, 0.f, 1.f)); }
-        else if(len >= 1) masterChorus.SetLfoDepth(p[0] / 100.0f);
+        if(len >= 4){
+            float v; memcpy(&v, p, 4); v = clampF(v, 0.f, 1.f);
+            masterChorusL.SetLfoDepth(v); masterChorusR.SetLfoDepth(v);
+        } else if(len >= 1){
+            float v = clampF(p[0] / 100.0f, 0.f, 1.f);
+            masterChorusL.SetLfoDepth(v); masterChorusR.SetLfoDepth(v);
+        }
         break;
     case CMD_CHORUS_MIX:
         if(len >= 4){ float v; memcpy(&v, p, 4); chorusMix = clampF(v, 0.f, 1.f); }
@@ -6307,8 +6566,11 @@ static void ProcessCommand()
      *  WAVEFOLDER + LIMITER (0x4E-0x4F)
      * ════════════════════════════════════════════ */
     case CMD_WAVEFOLDER_GAIN:
-        if(len >= 4){ float v; memcpy(&v, p, 4); waveFolderGain = clampF(v, 1.f, 10.f); }
-        else if(len >= 1) waveFolderGain = p[0] / 10.0f;
+        if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_WAVEFOLDER_GAIN)){
+            if(len >= 4){ float v; memcpy(&v, p, 4); waveFolderGain = clampF(v, 1.f, 10.f); }
+            else if(len >= 1) waveFolderGain = clampF(p[0] / 10.0f, 1.f, 10.f);
+            if(len >= 1) podStateRevision++;
+        }
         break;
     case CMD_LIMITER_ACTIVE:
         if(len >= 1) limiterActive = (p[0] != 0);
@@ -6493,6 +6755,24 @@ static void ProcessCommand()
             anySolo = false;
             for(int i = 0; i < MAX_PADS; i++)
                 if(trackSolo[i]){ anySolo = true; break; }
+        }
+        break;
+    case CMD_TRACK_MUTE_MASK:
+        if(len >= 2){
+            const uint16_t mask = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+            for(int i = 0; i < MAX_PADS; ++i){
+                const bool muted = (mask & ((uint16_t)1u << i)) != 0;
+                trackMute[i] = muted;
+                if(i < DSQ_TRACKS) dseq.trackMuted[i] = muted;
+            }
+        }
+        break;
+    case CMD_TRACK_SOLO_MASK:
+        if(len >= 2){
+            const uint16_t mask = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+            anySolo = mask != 0;
+            for(int i = 0; i < MAX_PADS; ++i)
+                trackSolo[i] = (mask & ((uint16_t)1u << i)) != 0;
         }
         break;
 
@@ -7445,14 +7725,18 @@ static void ProcessCommand()
         for(int i=0;i<16;i++) trackSH101Note[i] = (uint8_t)(60 + (i % 12));
         for(int i=0;i<16;i++) trackFM2OpNote[i] = (uint8_t)(60 + (i % 12));
         /* Reset mega upgrade state */
-        masterAutowah.Init((float)SAMPLE_RATE);
+        masterAutowahL.Init((float)SAMPLE_RATE);
+        masterAutowahR.Init((float)SAMPLE_RATE);
         masterLadderL.Init((float)SAMPLE_RATE);
         masterLadderR.Init((float)SAMPLE_RATE);
         masterSvfL.Init((float)SAMPLE_RATE);
         masterSvfR.Init((float)SAMPLE_RATE);
         erDelayL.Init();
         erDelayR.Init();
+        combDelayL.Init();
+        combDelayR.Init();
         masterDelayR.Init();
+        masterDelayR.SetDelay(delayTime / 1000.0f * (float)SAMPLE_RATE);
         memset(beatRepBufL, 0, sizeof(beatRepBufL));
         memset(beatRepBufR, 0, sizeof(beatRepBufR));
         memset(chokeGroup, 0, sizeof(chokeGroup));
@@ -7965,6 +8249,7 @@ static void ProcessCommand()
                 memset(dst.notes, 0, sizeof(dst.notes));
                 /* param locks preserved — only reset on full pattern clear */
             }
+            dsqLoadedPatternMask |= (1u << pat);
         }
         break;
 
@@ -7982,6 +8267,7 @@ static void ProcessCommand()
                 if(s.noteLenDiv == 0) s.noteLenDiv = 1;
                 s.ratchet      = ((p[5] >> 4) & 0x03) + 1;
                 s.probability  = p[6];
+                dsqLoadedPatternMask |= (1u << pat);
             }
         }
         break;
@@ -8014,6 +8300,7 @@ static void ProcessCommand()
                     cleanTrackPlayhead[i] = 0;
                 }
             }
+            podStateRevision++;
         }
         break;
 
@@ -8147,7 +8434,8 @@ static void ProcessCommand()
         if(len >= 4){
             float lvl; memcpy(&lvl, p, 4);
             autowahLevel = clampF(lvl, 0.f, 1.f);
-            masterAutowah.SetLevel(autowahLevel);
+            masterAutowahL.SetLevel(autowahLevel);
+            masterAutowahR.SetLevel(autowahLevel);
         }
         break;
     case CMD_AUTOWAH_MIX:
@@ -8230,7 +8518,9 @@ static void ProcessCommand()
         if(len >= 1){
             uint8_t cnt = p[0];
             if(cnt > SONG_MAX_ENTRIES) cnt = SONG_MAX_ENTRIES;
-            for(uint8_t si = 0; si < cnt && (1 + si*2 + 2) <= len; si++){
+            const uint8_t available = (uint8_t)((len - 1u) / 2u);
+            if(cnt > available) cnt = available;
+            for(uint8_t si = 0; si < cnt; si++){
                 songChain[si].pattern = p[1 + si*2] % DSQ_PATTERNS;
                 songChain[si].repeats = p[2 + si*2];
                 if(songChain[si].repeats == 0) songChain[si].repeats = 1;
@@ -8351,6 +8641,114 @@ static void ApplyPodButtonFunction(uint8_t function, uint32_t now)
     podStateRevision++;
 }
 
+static void ApplyPodFxNormalized(uint8_t function, float normalized)
+{
+    normalized = clampF(normalized, 0.0f, 1.0f);
+    switch(function)
+    {
+        case POD_FUNC_FLANGER_DEPTH: {
+            const uint8_t enabled = normalized > 0.005f ? 1u : 0u;
+            ApplyPodCommand(CMD_FLANGER_ACTIVE, &enabled, sizeof(enabled));
+            ApplyPodCommand(CMD_FLANGER_DEPTH, &normalized, sizeof(normalized));
+            break;
+        }
+        case POD_FUNC_WAVEFOLDER_GAIN: {
+            const float gain = 1.0f + normalized * 9.0f;
+            ApplyPodCommand(CMD_WAVEFOLDER_GAIN, &gain, sizeof(gain));
+            break;
+        }
+        case POD_FUNC_CRUSH_MACRO: {
+            const uint8_t bits = normalized <= 0.005f ? 16u
+                : static_cast<uint8_t>(clampF(16.0f - normalized * 10.0f,
+                                               6.0f, 16.0f) + 0.5f);
+            const uint32_t rate = normalized <= 0.005f ? 0u
+                : static_cast<uint32_t>(clampF(42000.0f
+                    * powf(4000.0f / 42000.0f, normalized),
+                    4000.0f, 42000.0f) + 0.5f);
+            ApplyPodCommand(CMD_FILTER_BITDEPTH, &bits, sizeof(bits));
+            ApplyPodCommand(CMD_FILTER_SR_REDUCE, &rate, sizeof(rate));
+            break;
+        }
+        case POD_FUNC_PHASER_DEPTH: {
+            const uint8_t enabled = normalized > 0.005f ? 1u : 0u;
+            ApplyPodCommand(CMD_PHASER_ACTIVE, &enabled, sizeof(enabled));
+            ApplyPodCommand(CMD_PHASER_DEPTH, &normalized, sizeof(normalized));
+            break;
+        }
+        case POD_FUNC_FILTER_CUTOFF: {
+            const float hz = 20.0f * powf(1000.0f, normalized);
+            ApplyPodCommand(CMD_FILTER_CUTOFF, &hz, sizeof(hz));
+            break;
+        }
+        case POD_FUNC_FILTER_RESONANCE: {
+            const float q = 0.7f + normalized * 19.3f;
+            ApplyPodCommand(CMD_FILTER_RESONANCE, &q, sizeof(q));
+            break;
+        }
+        case POD_FUNC_DISTORTION: {
+            const float percent = normalized * 100.0f;
+            ApplyPodCommand(CMD_FILTER_DISTORTION, &percent, sizeof(percent));
+            break;
+        }
+        case POD_FUNC_BIT_DEPTH: {
+            const uint8_t bits = static_cast<uint8_t>(
+                clampF(16.0f - normalized * 12.0f, 4.0f, 16.0f) + 0.5f);
+            ApplyPodCommand(CMD_FILTER_BITDEPTH, &bits, sizeof(bits));
+            break;
+        }
+        case POD_FUNC_SAMPLE_RATE: {
+            const uint32_t rate = normalized <= 0.005f ? 0u
+                : static_cast<uint32_t>(clampF(42000.0f
+                    * powf(4000.0f / 42000.0f, normalized),
+                    4000.0f, 42000.0f) + 0.5f);
+            ApplyPodCommand(CMD_FILTER_SR_REDUCE, &rate, sizeof(rate));
+            break;
+        }
+        case POD_FUNC_FILTER_TYPE: {
+            struct __attribute__((packed)) PodFilterPayload {
+                uint8_t type, distMode, bitDepth, reserved;
+                float cutoff, resonance, distortion;
+                uint32_t sampleRateReduce;
+            } payload = {
+                static_cast<uint8_t>(normalized * FTYPE_COMB + 0.5f),
+                gFilterDistMode, gFilterBitDepth, 0,
+                gFilterCutoff, gFilterQ, gFilterDist, gFilterSrReduce
+            };
+            static_assert(sizeof(PodFilterPayload) == 20,
+                          "Pod filter payload layout changed");
+            ApplyPodCommand(CMD_FILTER_SET, &payload, sizeof(payload));
+            break;
+        }
+        default: break;
+    }
+}
+
+static float PodFxCurrentNormalized(uint8_t function)
+{
+    switch(function)
+    {
+        case POD_FUNC_FLANGER_DEPTH: return flangerDepth;
+        case POD_FUNC_WAVEFOLDER_GAIN: return (waveFolderGain - 1.0f) / 9.0f;
+        case POD_FUNC_CRUSH_MACRO:
+            return (16.0f - static_cast<float>(gFilterBitDepth)) / 10.0f;
+        case POD_FUNC_PHASER_DEPTH: return phaserDepth;
+        case POD_FUNC_FILTER_CUTOFF:
+            return logf(clampF(gFilterCutoff, 20.0f, 20000.0f) / 20.0f)
+                 / logf(1000.0f);
+        case POD_FUNC_FILTER_RESONANCE: return (gFilterQ - 0.7f) / 19.3f;
+        case POD_FUNC_DISTORTION: return gFilterDist;
+        case POD_FUNC_BIT_DEPTH: return (16.0f - gFilterBitDepth) / 12.0f;
+        case POD_FUNC_SAMPLE_RATE:
+            return gFilterSrReduce == 0 ? 0.0f
+                : logf(clampF(static_cast<float>(gFilterSrReduce), 4000.0f,
+                              42000.0f) / 42000.0f)
+                  / logf(4000.0f / 42000.0f);
+        case POD_FUNC_FILTER_TYPE:
+            return static_cast<float>(gFilterType) / FTYPE_COMB;
+        default: return 0.0f;
+    }
+}
+
 static void ApplyPodAbsoluteFunction(uint8_t function, uint16_t raw)
 {
     const float normalized = static_cast<float>(raw) / 1000.0f;
@@ -8386,6 +8784,18 @@ static void ApplyPodAbsoluteFunction(uint8_t function, uint16_t raw)
             ApplyPodCommand(CMD_REVERB_MIX, &normalized, sizeof(normalized));
             break;
         }
+        case POD_FUNC_FLANGER_DEPTH:
+        case POD_FUNC_WAVEFOLDER_GAIN:
+        case POD_FUNC_CRUSH_MACRO:
+        case POD_FUNC_PHASER_DEPTH:
+        case POD_FUNC_FILTER_CUTOFF:
+        case POD_FUNC_FILTER_RESONANCE:
+        case POD_FUNC_DISTORTION:
+        case POD_FUNC_BIT_DEPTH:
+        case POD_FUNC_SAMPLE_RATE:
+        case POD_FUNC_FILTER_TYPE:
+            ApplyPodFxNormalized(function, normalized);
+            break;
         default: break;
     }
     podStateRevision++;
@@ -8447,6 +8857,23 @@ static void ApplyPodEncoderFunction(uint8_t function, int increment)
             ApplyPodCommand(CMD_REVERB_MIX, &value, sizeof(value));
             break;
         }
+        case POD_FUNC_FLANGER_DEPTH:
+        case POD_FUNC_WAVEFOLDER_GAIN:
+        case POD_FUNC_CRUSH_MACRO:
+        case POD_FUNC_PHASER_DEPTH:
+        case POD_FUNC_FILTER_CUTOFF:
+        case POD_FUNC_FILTER_RESONANCE:
+        case POD_FUNC_DISTORTION:
+        case POD_FUNC_BIT_DEPTH:
+        case POD_FUNC_SAMPLE_RATE:
+        case POD_FUNC_FILTER_TYPE: {
+            const float step = function == POD_FUNC_FILTER_TYPE
+                ? (1.0f / FTYPE_COMB) : 0.02f;
+            const float value = clampF(PodFxCurrentNormalized(function)
+                + (increment > 0 ? step : -step), 0.0f, 1.0f);
+            ApplyPodFxNormalized(function, value);
+            break;
+        }
         default: break;
     }
     podStateRevision++;
@@ -8464,8 +8891,15 @@ static bool PodLedIsActive(uint8_t function, uint32_t now)
             return now < podPadPulseUntilMs || ActiveVoices() > 0;
         case POD_LED_SD_STATE: return sdPresent;
         case POD_LED_SAMPLES_READY:
-            for(uint8_t i = 0; i < DSQ_TRACKS; i++) if(sampleLoaded[i]) return true;
-            return false;
+        {
+            bool samplesReady = false;
+            for(uint8_t i = 0; i < DSQ_TRACKS; i++)
+                if(sampleLoaded[i]) { samplesReady = true; break; }
+            const uint8_t pattern = dseq.currentPattern % DSQ_PATTERNS;
+            const bool patternReady =
+                (dsqLoadedPatternMask & (1u << pattern)) != 0;
+            return samplesReady && patternReady;
+        }
         default: return false;
     }
 }
@@ -8668,7 +9102,7 @@ static bool InitSD()
     return false;
 }
 
-static constexpr uint32_t POD_CONFIG_FILE_MAGIC = 0x32444F50u; /* "POD2" */
+static constexpr uint32_t POD_CONFIG_FILE_MAGIC = 0x36444F50u; /* "POD6" */
 static constexpr const char* POD_CONFIG_FILE_PATH = "/pod_controls.cfg";
 
 struct __attribute__((packed)) PodConfigFile {
@@ -9236,10 +9670,14 @@ static void InitFX()
     masterReverb.SetFeedback(0.6f);
     masterReverb.SetLpFreq(8000.0f);
 
-    masterChorus.Init(sr);
-    masterChorus.SetLfoFreq(0.3f);
-    masterChorus.SetLfoDepth(0.4f);
-    masterChorus.SetDelay(0.75f);
+    masterChorusL.Init(sr);
+    masterChorusR.Init(sr);
+    masterChorusL.SetLfoFreq(0.3f);
+    masterChorusR.SetLfoFreq(0.3039f);
+    masterChorusL.SetLfoDepth(0.4f);
+    masterChorusR.SetLfoDepth(0.4f);
+    masterChorusL.SetDelay(0.72f);
+    masterChorusR.SetDelay(0.78f);
 
     masterTremolo.Init(sr);
     masterTremolo.SetFreq(4.0f);
@@ -9254,13 +9692,14 @@ static void InitFX()
     masterComp.SetMakeup(1.0f);
     masterComp.AutoMakeup(true);
 
-    masterFold.Init();
-    masterFold.SetIncrement(1.0f);
-
-    masterPhaser.Init(sr);
-    masterPhaser.SetFreq(0.5f);
-    masterPhaser.SetLfoDepth(0.4f);
-    masterPhaser.SetFeedback(0.5f);
+    masterPhaserL.Init(sr);
+    masterPhaserR.Init(sr);
+    masterPhaserL.SetFreq(0.5f);
+    masterPhaserR.SetFreq(0.5065f);
+    masterPhaserL.SetLfoDepth(phaserDepth);
+    masterPhaserR.SetLfoDepth(phaserDepth);
+    masterPhaserL.SetFeedback(0.5f);
+    masterPhaserR.SetFeedback(0.5f);
 
     masterFlangerL.Init(sr);
     masterFlangerR.Init(sr);
@@ -9273,9 +9712,12 @@ static void InitFX()
     }
 
     /* ── Mega Upgrade: init new master FX modules ── */
-    masterAutowah.Init(sr);
-    masterAutowah.SetLevel(0.5f);
-    masterAutowah.SetWah(0.0f);
+    masterAutowahL.Init(sr);
+    masterAutowahR.Init(sr);
+    masterAutowahL.SetLevel(0.5f);
+    masterAutowahR.SetLevel(0.5f);
+    masterAutowahL.SetWah(0.0f);
+    masterAutowahR.SetWah(0.0f);
 
     masterLadderL.Init(sr);
     masterLadderR.Init(sr);
@@ -9295,6 +9737,8 @@ static void InitFX()
 
     erDelayL.Init();
     erDelayR.Init();
+    combDelayL.Init();
+    combDelayR.Init();
 
     masterDelayR.Init();
     masterDelayR.SetDelay(sr * 0.25f);
@@ -9650,7 +10094,7 @@ int main()
     }
     else if(loadedCount == 0)
     {
-        Log("Sin samples en QSPI y SD boot-load desactivado: arranque sin muestras locales (OK, llegan por SPI)");
+        Log("Sin samples en QSPI y SD boot-load desactivado: arranque sin muestras locales (OK, llegan por USB desde P4)");
     }
 
     Log("Samples cargados: %d / %d", loadedCount, MAX_PADS);

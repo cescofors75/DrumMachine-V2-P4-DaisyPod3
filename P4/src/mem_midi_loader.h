@@ -16,6 +16,37 @@
 
 namespace mem_midi {
 
+// Daisy has 20 resident sequencer patterns and a 128-entry song chain. The
+// importer deduplicates equal bars, so a long song with repeated sections can
+// usually fit without throwing away its arrangement.
+static constexpr int MIDI_SONG_MAX_PATTERNS = 20;
+static constexpr int MIDI_SONG_MAX_CHAIN = 128;
+
+struct MidiSongPattern {
+    bool steps[16][16];
+    uint8_t velocity[16][16];
+};
+
+struct MidiSongChainEntry {
+    uint8_t pattern;  // index in patterns[] / Daisy resident slot
+    uint8_t repeats;  // consecutive repetitions, 1..255
+};
+
+struct MidiSongData {
+    char name[32];
+    MidiSongPattern patterns[MIDI_SONG_MAX_PATTERNS];
+    MidiSongChainEntry chain[MIDI_SONG_MAX_CHAIN];
+    uint16_t total_bars;
+    uint16_t imported_bars;
+    uint32_t hits;
+    float bpm;
+    uint8_t pattern_count;
+    uint8_t chain_count;
+    uint8_t tracks_used;
+    uint8_t tempo_events;
+    bool truncated;
+};
+
 // Returns true if at least one drum hit was found.
 // steps[16][16] is written as a folded 1-bar grid.
 // name_out receives the stem of the filename (max name_max chars).
@@ -49,7 +80,7 @@ bool load_pattern_raw(const char* path,
 
         // Same parser, but reading from an arbitrary mounted filesystem such as
         // SD_MMC. This lets the P4 browse/import MIDI from its own SD card.
-        bool load_pattern_raw_from_fs(fs::FS& storage,
+bool load_pattern_raw_from_fs(fs::FS& storage,
                             const char* path,
                             bool raw_steps[16][64],
                             char* name_out,
@@ -58,6 +89,15 @@ bool load_pattern_raw(const char* path,
                             float* bpm_out = nullptr,
                             int* raw_len_out = nullptr,
                             int mode = 0);
+
+// Import a complete SMF arrangement. Notes are quantized to the nearest 16th,
+// velocities are preserved, equal bars share one resident pattern and adjacent
+// repetitions are run-length encoded into the Daisy song chain. The result is
+// bounded by MIDI_SONG_MAX_PATTERNS/MIDI_SONG_MAX_CHAIN; `truncated` reports
+// that the source exceeded those hardware limits.
+bool load_song(const char* path, MidiSongData* song, int mode = 0);
+bool load_song_from_fs(fs::FS& storage, const char* path,
+                       MidiSongData* song, int mode = 0);
 
         int list_midi_files_from_fs(fs::FS& storage,
                             const char* dir,

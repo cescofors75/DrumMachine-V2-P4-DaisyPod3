@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+namespace mem_midi { struct MidiSongData; }
+
 void control_init();
 void control_process();
 bool control_available();
@@ -18,11 +20,37 @@ void control_send_queue_pattern(int index);
 void control_send_cancel_pattern_queue();
 void control_send_fill();
 void control_send_variation();
+enum SequencerVariation : uint8_t {
+    SEQ_VAR_NEON_BREAK = 1,
+    SEQ_VAR_RATCHET_STORM,
+    SEQ_VAR_GHOST_GROOVE,
+    SEQ_VAR_POLYRHYTHM,
+    SEQ_VAR_HALF_TIME,
+    SEQ_VAR_MIRROR,
+    SEQ_VAR_TOM_CASCADE,
+    SEQ_VAR_ACID_SWITCH,
+    SEQ_VAR_HAT_LIFT,
+    SEQ_VAR_SPARSE_SPACE,
+    SEQ_VAR_UNDO
+};
+bool control_apply_sequencer_variation(uint8_t variation);
+bool control_variation_can_undo();
+bool control_sync_current_pattern();
+bool control_patterns_ready();
+uint8_t control_factory_patterns_found();
+uint8_t control_factory_patterns_expected();
 void control_send_build4();
 void control_send_drop();
 void control_send_launch_demo_set();
 void control_send_mix_preset(bool club_warm);
 void control_send_get_pattern(int pattern);
+bool control_save_user_pattern(int source, int destination);
+bool control_user_pattern_is_saved(int pattern);
+void control_set_pattern_source_tempo(int pattern, float bpm, const char* name);
+bool control_install_midi_song(const mem_midi::MidiSongData& song);
+bool control_midi_song_ready();
+bool control_midi_song_persisted();
+void control_cancel_midi_song();
 void control_send_unload_daisy(uint8_t pad);
 void control_send_set_step(int track, int step, bool active);
 void control_send_set_step_velocity(int track, int step, int velocity);
@@ -38,6 +66,7 @@ void control_send_set_filter_resonance(float value);
 void control_send_set_distortion(float value);
 void control_send_set_bitcrush(int bits);
 void control_send_set_sample_rate(int rate_hz);
+void control_send_set_crush_macro(uint8_t value);
 void control_send_fx_enc(int encoder, uint8_t value, bool muted);
 void control_send_fx_pot(int pot, uint8_t value, bool muted);
 void control_send_solo(int track, bool soloed);
@@ -45,6 +74,7 @@ void control_send_mute_mask(uint16_t mask);
 void control_send_solo_mask(uint16_t mask);
 void control_mark_fx_screen_dirty();
 bool control_consume_fx_screen_dirty();
+bool control_pattern_track_uses_sampler(int pattern, int track);
 
 void control_send_synth_note_on_ex(uint8_t engine, uint8_t note,
                                    uint8_t velocity, bool accent, bool slide);

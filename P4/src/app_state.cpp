@@ -8,8 +8,10 @@ P4State p4 = {
     .resonance_x10 = 10,
     .distortion_pct = 0,
     .bitcrush_bits = 16,
-    .sample_rate_hz = 32000,
+    .sample_rate_hz = 0,
 };
+
+P4BootState p4boot = {};
 
 P4SdState p4sd = {};
 

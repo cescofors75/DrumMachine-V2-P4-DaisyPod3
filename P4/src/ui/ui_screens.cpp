@@ -6,6 +6,7 @@
 #include "ui_screens.h"
 #include "ui_theme.h"
 #include "../drivers/lvgl_port.h"
+#include "../drivers/i2c_rotaries.h"
 #include "../control_api.h"
 #include "../daisy_usb_transport.h"
 #include "../app_state.h"
@@ -17,7 +18,9 @@
 #include <Arduino.h>
 #include <SD_MMC.h>
 #include <SPIFFS.h>
+#include "../pod_config_store.h"
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <atomic>
 #include <math.h>
 
@@ -53,6 +56,7 @@ static std::atomic<bool>     s_ctrl_mute_mask_pending{false};
 static std::atomic<uint16_t> s_ctrl_mute_mask{0};
 static std::atomic<bool>     s_ctrl_solo_mask_pending{false};
 static std::atomic<uint16_t> s_ctrl_solo_mask{0};
+static std::atomic<bool>     s_ctrl_pattern_sync_pending{false};
 
 // Touch debounce tuned for GT911 + multi-indev setup.
 static const uint32_t MUTE_DEBOUNCE_TRACK_MS = 180;
@@ -419,6 +423,7 @@ static void ui_show_toast(const char* text, lv_color_t accent) {
 static void seq_pattern_modal_show(int pattern);
 static void seq_pattern_modal_hide(void);
 static void seq_pattern_modal_mark_loaded(void);
+static void seq_launch_absolute_pattern(int pattern);
 static int  seq_queued_pattern = -1;
 static bool seq_quantize_enabled = true;
 
@@ -435,25 +440,10 @@ static void header_play_cb(lv_event_t* e) {
     // P4 owns its play/pause toggle — send once to DaisyPod3.
     if (next_play) control_send_start();
     else           control_send_stop();
-    // Update the local UI state through the same in-process command path.
-    local_apply_message(MSG_SYSTEM, SYS_PLAY_STATE, next_play ? 1 : 0);
     // P4 owns step clock: reset phase explicitly on every transport toggle.
     local_apply_message(MSG_SYSTEM, SYS_STEP, 0);
     p4.current_step = 0;
     p4.is_playing = next_play;
-}
-
-static void header_clear_track_isolation(void) {
-    if (!control_available()) return;
-    for (int track = 0; track < 16; track++) {
-        bool was_solo  = p4.track_solo[track];
-        bool was_muted = p4.track_muted[track];
-        p4.track_solo[track]  = false;
-        p4.track_muted[track] = false;
-        // Only send changes that were non-zero to keep the USB queue short.
-        if (was_solo)  control_send_solo(track, false);
-        if (was_muted) control_send_mute(track, false);
-    }
 }
 
 static void header_pattern_cb(lv_event_t* e) {
@@ -478,18 +468,7 @@ static void header_pattern_cb(lv_event_t* e) {
         return;
     }
 
-    seq_queued_pattern = -1;
-    p4.current_pattern = next_pattern;
-    ui_sequencer_sync_from_current_pattern();
-    if ((active_screen == 3 || lv_scr_act() == scr_sequencer) &&
-            (control_available() || control_engine_connected())) {
-        seq_pattern_modal_show(next_pattern);
-    } else {
-        seq_pattern_modal_hide();
-    }
-    header_clear_track_isolation();
-    control_send_select_pattern(next_pattern);
-    control_send_get_pattern(next_pattern);
+    seq_launch_absolute_pattern(next_pattern);
 }
 
 // =============================================================================
@@ -703,6 +682,12 @@ static lv_obj_t* live_pad_accent_strips[16] = {};
 static lv_obj_t* live_spectrum_bars[16] = {};  // spectrum bar per pad (bottom of pad)
 static lv_obj_t* live_home_panels[24] = {};
 static int       live_home_panel_count = 0;
+static lv_obj_t* grid_fx_btn = NULL;
+static lv_obj_t* grid_fx_active_badge = NULL;
+
+// Implemented with the FX state helpers below; HOME only needs the semantic
+// answer, not knowledge of individual DSP cards.
+static bool fx_any_active(void);
 
 // Defined after the sequencer raw grid (multi-bar patterns): true when the
 // track has a hit on the step that is actually SOUNDING right now.
@@ -717,6 +702,7 @@ static lv_obj_t*  s_pad_mode_modal = NULL;
 static lv_obj_t* grid_play_btn = NULL;
 static lv_obj_t* grid_play_lbl = NULL;
 static lv_obj_t* grid_bpm_lbl = NULL;
+static lv_obj_t* grid_tempo_ref_lbl = NULL;
 static lv_obj_t* grid_home_vol_lbl = NULL;
 static lv_obj_t* grid_pat_lbl = NULL;
 static lv_obj_t* grid_step_lbl = NULL;
@@ -752,12 +738,22 @@ static lv_obj_t* s_pad_inst_modal_kit_btns[3][5] = {};   // [engine 0=808/1=909/
 static lv_obj_t* s_pad_inst_modal_kit_lbl_eng[3] = {};   // labels "808"/"909"/"505"
 static lv_obj_t* s_pod_status_modal = NULL;
 static lv_obj_t* s_pod_status_label = NULL;
-static lv_obj_t* s_pod_control_value_labels[6] = {};
+static constexpr uint8_t POD_CONTROL_ROW_COUNT = 11;
+static lv_obj_t* s_pod_control_value_labels[POD_CONTROL_ROW_COUNT] = {};
+static lv_obj_t* s_pod_function_modal = NULL;
+static uint8_t s_pod_function_modal_row = 0xFF;
 static lv_obj_t* s_pod_led_function_labels[2] = {};
 static lv_obj_t* s_pod_led_color_labels[2] = {};
 static PodConfigPayload s_pod_config = {};
 static uint32_t s_pod_seen_revision = 0;
 static void pod_status_modal_close_cb(lv_event_t* e);
+static void pod_function_modal_close_cb(lv_event_t* e);
+
+static const char* POD_CONTROL_TITLES[POD_CONTROL_ROW_COUNT] = {
+    "BUTTON 1", "BUTTON 2", "KNOB 1", "KNOB 2", "ENCODER",
+    "ENC PUSH", "ROTARY 1 / CH0", "ROTARY 2 / CH1",
+    "ROTARY 3 / CH2", "ROTARY 4 / CH3", "FADER / GPIO20 ADC"
+};
 
 static const char* PAD_INST_NAMES[8] = {
     "Sampler", "808", "909", "505", "303", "WT", "FM2", "SH101"
@@ -1697,6 +1693,7 @@ static void grid_theme_cb(lv_event_t* e) {
 }
 
 static void grid_master_vol_step_cb(lv_event_t* e) {
+    if (i2c_rotaries_owns_function(POD_FUNC_MASTER_VOLUME)) return;
     int delta = (int)(intptr_t)lv_event_get_user_data(e);
     int next = constrain((int)p4.master_volume + delta, 0, Config::MAX_VOLUME);
     if (next == p4.master_volume) return;
@@ -1705,6 +1702,7 @@ static void grid_master_vol_step_cb(lv_event_t* e) {
 }
 
 static void grid_bpm_step_cb(lv_event_t* e) {
+    if (i2c_rotaries_owns_function(POD_FUNC_TEMPO)) return;
     int delta = (int)(intptr_t)lv_event_get_user_data(e);
     int next = constrain((int)p4.bpm_int + delta, 40, 240);
     if (next == p4.bpm_int) return;
@@ -2322,7 +2320,10 @@ static const char* pod_control_function_name(uint8_t function) {
         "PATTERN -", "PATTERN +", "MASTER VOL", "SEQ VOL",
         "LIVE VOL", "TEMPO", "SELECT PAD", "BACK", "MIXER", "FX",
         "SEQUENCER", "PAD GRID", "PAD SOUNDS", "XTRA PADS",
-        "DELAY MIX", "REVERB MIX"
+        "DELAY MIX", "REVERB MIX", "BUTTON CONFIG", "SCREEN BRIGHTNESS",
+        "FLANGER DEPTH", "WAVEFOLDER", "CRUSH MACRO", "PHASER DEPTH",
+        "FILTER CUTOFF", "FILTER RESONANCE", "DISTORTION", "BIT DEPTH",
+        "SAMPLE RATE", "FILTER TYPE"
     };
     return function < POD_FUNC_COUNT ? names[function] : "NONE";
 }
@@ -2330,9 +2331,96 @@ static const char* pod_control_function_name(uint8_t function) {
 static const char* pod_led_function_name(uint8_t function) {
     static const char* names[POD_LED_COUNT] = {
         "FIXED", "USB LINK", "PLAY STATE", "PAD ACTIVITY",
-        "DAISY SD", "SAMPLES READY"
+        "DAISY SD", "SAMPLES + PATTERN"
     };
     return function < POD_LED_COUNT ? names[function] : "FIXED";
+}
+
+// Small "HW" badges make mechanical ownership visible without changing the
+// established color language of each screen cell.
+struct PodOwnerBadge {
+    lv_obj_t* badge;
+    uint8_t function;
+    bool visible;
+};
+static constexpr uint8_t POD_OWNER_BADGE_MAX = 40;
+static PodOwnerBadge s_pod_owner_badges[POD_OWNER_BADGE_MAX] = {};
+static uint8_t s_pod_owner_badge_count = 0;
+
+static bool pod_control_functions_conflict(uint8_t left, uint8_t right) {
+    if (left == POD_FUNC_NONE || right == POD_FUNC_NONE) return false;
+    if (left == right) return true;
+    const bool leftCrush = left == POD_FUNC_CRUSH_MACRO;
+    const bool rightCrush = right == POD_FUNC_CRUSH_MACRO;
+    return (leftCrush && (right == POD_FUNC_BIT_DEPTH
+                          || right == POD_FUNC_SAMPLE_RATE))
+        || (rightCrush && (left == POD_FUNC_BIT_DEPTH
+                           || left == POD_FUNC_SAMPLE_RATE));
+}
+
+static bool pod_function_has_physical_owner(uint8_t function) {
+    if (function == POD_FUNC_NONE) return false;
+    const auto& podState = daisyUsb.state().pod;
+    const PodConfigPayload* config = podState.config.version == POD_CONFIG_VERSION
+        ? &podState.config
+        : (s_pod_config.version == POD_CONFIG_VERSION ? &s_pod_config : NULL);
+    if (!config) return false;
+    const uint8_t podAssigned[] = {
+        config->button1Function, config->button2Function,
+        config->knob1Function, config->knob2Function,
+        config->encoderFunction, config->encoderButtonFunction
+    };
+    for (uint8_t value : podAssigned)
+        if (pod_control_functions_conflict(value, function)) return true;
+
+    const uint8_t rotaryAssigned[] = {
+        config->rotary1Function, config->rotary2Function,
+        config->rotary3Function, config->rotary4Function
+    };
+    const uint8_t rotaryMask = i2c_rotaries_detected_mask();
+    for (uint8_t index = 0; index < 4; ++index)
+        if ((rotaryMask & (1u << index))
+            && pod_control_functions_conflict(rotaryAssigned[index], function))
+            return true;
+    if (p4_fader_detected()
+        && pod_control_functions_conflict(config->faderFunction, function))
+        return true;
+    return false;
+}
+
+static void pod_register_owner_badge(lv_obj_t* parent, uint8_t function) {
+    if (!parent || function == POD_FUNC_NONE
+        || s_pod_owner_badge_count >= POD_OWNER_BADGE_MAX) return;
+    PodOwnerBadge& entry = s_pod_owner_badges[s_pod_owner_badge_count++];
+    entry.function = function;
+    entry.visible = false;
+    entry.badge = lv_label_create(parent);
+    lv_label_set_text(entry.badge, "HW");
+    lv_obj_set_style_text_font(entry.badge, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(entry.badge, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(entry.badge, RED808_CYAN, 0);
+    lv_obj_set_style_bg_opa(entry.badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(entry.badge, 4, 0);
+    lv_obj_set_style_pad_hor(entry.badge, 4, 0);
+    lv_obj_set_style_pad_ver(entry.badge, 2, 0);
+    lv_obj_align(entry.badge, LV_ALIGN_TOP_RIGHT, -5, 5);
+    lv_obj_clear_flag(entry.badge, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(entry.badge, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void pod_owner_badges_update(void) {
+    for (uint8_t i = 0; i < s_pod_owner_badge_count; ++i) {
+        PodOwnerBadge& entry = s_pod_owner_badges[i];
+        const bool visible = pod_function_has_physical_owner(entry.function);
+        if (visible == entry.visible || !entry.badge) continue;
+        entry.visible = visible;
+        if (visible) {
+            lv_obj_clear_flag(entry.badge, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(entry.badge);
+        } else {
+            lv_obj_add_flag(entry.badge, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 static const char* sd_diag_stage_name(uint8_t stage) {
@@ -2359,18 +2447,79 @@ static uint8_t* pod_control_config_field(uint8_t row) {
         case 3: return &s_pod_config.knob2Function;
         case 4: return &s_pod_config.encoderFunction;
         case 5: return &s_pod_config.encoderButtonFunction;
+        case 6: return &s_pod_config.rotary1Function;
+        case 7: return &s_pod_config.rotary2Function;
+        case 8: return &s_pod_config.rotary3Function;
+        case 9: return &s_pod_config.rotary4Function;
+        case 10: return &s_pod_config.faderFunction;
         default: return NULL;
     }
 }
 
+static bool pod_control_function_used_by_other(uint8_t row, uint8_t function) {
+    if (function == POD_FUNC_NONE) return false;
+    for (uint8_t other = 0; other < POD_CONTROL_ROW_COUNT; ++other) {
+        if (other == row) continue;
+        uint8_t* otherField = pod_control_config_field(other);
+        if (otherField
+            && pod_control_functions_conflict(*otherField, function)) return true;
+    }
+    return false;
+}
+
+static void pod_control_function_list(uint8_t row, const uint8_t*& list,
+                                      size_t& count) {
+    static const uint8_t buttonFunctions[] = {
+        POD_FUNC_NONE, POD_FUNC_PLAY_TOGGLE, POD_FUNC_STOP,
+        POD_FUNC_TRIGGER_SELECTED, POD_FUNC_PATTERN_PREV, POD_FUNC_PATTERN_NEXT,
+        POD_FUNC_BACK, POD_FUNC_MIXER, POD_FUNC_FX, POD_FUNC_SEQUENCER,
+        POD_FUNC_PAD_GRID, POD_FUNC_PAD_SOUNDS, POD_FUNC_XTRA_PADS,
+        POD_FUNC_CONTROL_CONFIG
+    };
+    static const uint8_t absoluteFunctions[] = {
+        POD_FUNC_NONE, POD_FUNC_MASTER_VOLUME, POD_FUNC_SEQ_VOLUME,
+        POD_FUNC_LIVE_VOLUME, POD_FUNC_TEMPO, POD_FUNC_SELECT_PAD,
+        POD_FUNC_FLANGER_DEPTH, POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX,
+        POD_FUNC_WAVEFOLDER_GAIN, POD_FUNC_CRUSH_MACRO,
+        POD_FUNC_PHASER_DEPTH, POD_FUNC_FILTER_CUTOFF,
+        POD_FUNC_FILTER_RESONANCE, POD_FUNC_DISTORTION,
+        POD_FUNC_BIT_DEPTH, POD_FUNC_SAMPLE_RATE, POD_FUNC_FILTER_TYPE,
+        POD_FUNC_SCREEN_BRIGHTNESS
+    };
+    static const uint8_t encoderFunctions[] = {
+        POD_FUNC_NONE, POD_FUNC_PATTERN_NEXT, POD_FUNC_SELECT_PAD,
+        POD_FUNC_TEMPO, POD_FUNC_MASTER_VOLUME, POD_FUNC_SEQ_VOLUME,
+        POD_FUNC_LIVE_VOLUME, POD_FUNC_FLANGER_DEPTH, POD_FUNC_DELAY_MIX,
+        POD_FUNC_REVERB_MIX, POD_FUNC_WAVEFOLDER_GAIN,
+        POD_FUNC_CRUSH_MACRO, POD_FUNC_PHASER_DEPTH,
+        POD_FUNC_FILTER_CUTOFF, POD_FUNC_FILTER_RESONANCE,
+        POD_FUNC_DISTORTION, POD_FUNC_BIT_DEPTH, POD_FUNC_SAMPLE_RATE,
+        POD_FUNC_FILTER_TYPE
+    };
+    if (row == 4) {
+        list = encoderFunctions;
+        count = sizeof(encoderFunctions);
+    } else if (row == 0 || row == 1 || row == 5) {
+        list = buttonFunctions;
+        count = sizeof(buttonFunctions);
+    } else {
+        list = absoluteFunctions;
+        count = sizeof(absoluteFunctions);
+    }
+}
+
+static void pod_control_value_refresh(uint8_t row) {
+    if (row >= POD_CONTROL_ROW_COUNT || !s_pod_control_value_labels[row]) return;
+    uint8_t* field = pod_control_config_field(row);
+    if (!field) return;
+    lv_label_set_text(s_pod_control_value_labels[row],
+                      pod_control_function_name(*field));
+}
+
 static void pod_status_modal_refresh(void) {
     if (!s_pod_status_modal) return;
-    for (uint8_t row = 0; row < 6; row++) {
-        uint8_t* field = pod_control_config_field(row);
-        if (field && s_pod_control_value_labels[row])
-            lv_label_set_text(s_pod_control_value_labels[row],
-                              pod_control_function_name(*field));
-    }
+    for (uint8_t row = 0; row < POD_CONTROL_ROW_COUNT; row++)
+        pod_control_value_refresh(row);
     const uint8_t ledFunctions[2] = {
         s_pod_config.led1Function, s_pod_config.led2Function
     };
@@ -2395,48 +2544,151 @@ static void pod_status_modal_refresh(void) {
 }
 
 static void pod_send_config(void) {
-    s_pod_config.version = 2;
-    s_pod_config.reserved = 0;
+    pod_config_store_sanitize(s_pod_config);
+    if (!pod_config_store_save(s_pod_config))
+        ui_show_toast("No se pudo guardar controles", RED808_WARNING);
     if (!daisyUsb.send(CMD_POD_SET_CONFIG, &s_pod_config, sizeof(s_pod_config)))
         ui_show_toast("Daisy USB no disponible", RED808_WARNING);
 }
 
-static uint8_t pod_next_control_function(uint8_t row, uint8_t current) {
-    static const uint8_t buttonFunctions[] = {
-        POD_FUNC_NONE, POD_FUNC_PLAY_TOGGLE, POD_FUNC_STOP,
-        POD_FUNC_TRIGGER_SELECTED, POD_FUNC_PATTERN_PREV, POD_FUNC_PATTERN_NEXT,
-        POD_FUNC_BACK, POD_FUNC_MIXER, POD_FUNC_FX, POD_FUNC_SEQUENCER,
-        POD_FUNC_PAD_GRID, POD_FUNC_PAD_SOUNDS, POD_FUNC_XTRA_PADS
-    };
-    static const uint8_t absoluteFunctions[] = {
-        POD_FUNC_NONE, POD_FUNC_MASTER_VOLUME, POD_FUNC_SEQ_VOLUME,
-        POD_FUNC_LIVE_VOLUME, POD_FUNC_TEMPO, POD_FUNC_SELECT_PAD,
-        POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX
-    };
-    static const uint8_t encoderFunctions[] = {
-        POD_FUNC_NONE, POD_FUNC_SELECT_PAD, POD_FUNC_TEMPO,
-        POD_FUNC_MASTER_VOLUME, POD_FUNC_SEQ_VOLUME, POD_FUNC_LIVE_VOLUME,
-        POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX, POD_FUNC_PATTERN_NEXT
-    };
-    const uint8_t* list = buttonFunctions;
-    size_t count = sizeof(buttonFunctions);
-    if (row == 2 || row == 3) {
-        list = absoluteFunctions; count = sizeof(absoluteFunctions);
-    } else if (row == 4) {
-        list = encoderFunctions; count = sizeof(encoderFunctions);
-    }
-    for (size_t i = 0; i < count; i++)
-        if (list[i] == current) return list[(i + 1) % count];
-    return list[0];
+static void pod_function_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_pod_function_modal) lv_obj_del(s_pod_function_modal);
+    s_pod_function_modal = NULL;
+    s_pod_function_modal_row = 0xFF;
 }
 
-static void pod_control_cycle_cb(lv_event_t* e) {
-    uint8_t row = static_cast<uint8_t>((intptr_t)lv_event_get_user_data(e));
+static void pod_function_select_cb(lv_event_t* e) {
+    const uint16_t packed = static_cast<uint16_t>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    const uint8_t row = static_cast<uint8_t>(packed >> 8);
+    const uint8_t function = static_cast<uint8_t>(packed & 0xFFu);
+    uint8_t* field = pod_control_config_field(row);
+    if (!field || function >= POD_FUNC_COUNT) return;
+    if (pod_control_function_used_by_other(row, function)) {
+        ui_show_toast("Funcion ya asignada: quitala primero", RED808_WARNING);
+        return;
+    }
+    if (*field != function) {
+        *field = function;
+        pod_send_config();
+        pod_status_modal_refresh();
+    }
+    pod_function_modal_close_cb(NULL);
+}
+
+static void pod_control_modal_open_cb(lv_event_t* e) {
+    const uint8_t row = static_cast<uint8_t>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    if (row >= POD_CONTROL_ROW_COUNT || !s_pod_status_modal) return;
+    if (s_pod_function_modal) pod_function_modal_close_cb(NULL);
     uint8_t* field = pod_control_config_field(row);
     if (!field) return;
-    *field = pod_next_control_function(row, *field);
-    pod_status_modal_refresh();
-    pod_send_config();
+
+    s_pod_function_modal_row = row;
+    s_pod_function_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_pod_function_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_pod_function_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_pod_function_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_pod_function_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_pod_function_modal, 0, 0);
+    lv_obj_clear_flag(s_pod_function_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_pod_function_modal, pod_function_modal_close_cb,
+                        LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_pod_function_modal);
+    lv_obj_set_size(card, 930, 520);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text_fmt(title, "ASIGNAR  %s", POD_CONTROL_TITLES[row]);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 22, 18);
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "Todas las opciones compatibles. IN USE requiere liberar el otro control.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(hint, 22, 50);
+
+    lv_obj_t* close = lv_btn_create(card);
+    lv_obj_set_size(close, 92, 38);
+    lv_obj_set_pos(close, 816, 16);
+    apply_control_button_style(close, RED808_WARNING, false, 9);
+    lv_obj_t* closeLabel = lv_label_create(close);
+    lv_label_set_text(closeLabel, "CANCEL");
+    lv_obj_set_style_text_font(closeLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(closeLabel);
+    lv_obj_add_event_cb(close, [](lv_event_t*) {
+        pod_function_modal_close_cb(NULL);
+    }, LV_EVENT_CLICKED, NULL);
+
+    const uint8_t* functions = NULL;
+    size_t functionCount = 0;
+    pod_control_function_list(row, functions, functionCount);
+    constexpr int columns = 5;
+    constexpr int buttonWidth = 170;
+    constexpr int buttonHeight = 62;
+    constexpr int gapX = 10;
+    constexpr int gapY = 14;
+    for (size_t option = 0; option < functionCount; ++option) {
+        const uint8_t function = functions[option];
+        const bool selected = function == *field;
+        const bool used = !selected
+            && pod_control_function_used_by_other(row, function);
+        const int column = static_cast<int>(option % columns);
+        const int line = static_cast<int>(option / columns);
+        lv_obj_t* button = lv_btn_create(card);
+        lv_obj_set_size(button, buttonWidth, buttonHeight);
+        lv_obj_set_pos(button, 20 + column * (buttonWidth + gapX),
+                       86 + line * (buttonHeight + gapY));
+        apply_control_button_style(button,
+            selected ? RED808_CYAN : RED808_ACCENT2, false, 11);
+        lv_obj_set_style_bg_color(button,
+            selected ? RED808_ACCENT : RED808_SURFACE, 0);
+        lv_obj_set_style_bg_opa(button, selected ? LV_OPA_COVER : LV_OPA_80, 0);
+        if (selected) lv_obj_set_style_border_width(button, 3, 0);
+
+        lv_obj_t* label = lv_label_create(button);
+        lv_label_set_text(label, pod_control_function_name(function));
+        lv_obj_set_width(label, buttonWidth - 14);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, selected ? lv_color_white()
+                                                       : RED808_TEXT, 0);
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, (selected || used) ? -7 : 0);
+
+        if (selected || used) {
+            lv_obj_t* state = lv_label_create(button);
+            lv_label_set_text(state, selected ? "SELECTED" : "IN USE");
+            lv_obj_set_style_text_font(state, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(state,
+                selected ? lv_color_white() : RED808_TEXT_DIM, 0);
+            lv_obj_align(state, LV_ALIGN_BOTTOM_MID, 0, -5);
+        }
+        if (used) {
+            lv_obj_add_state(button, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_opa(button, LV_OPA_30, LV_STATE_DISABLED);
+            lv_obj_set_style_border_color(button, RED808_BORDER,
+                                          LV_STATE_DISABLED);
+        } else {
+            const uint16_t packed = static_cast<uint16_t>(
+                (static_cast<uint16_t>(row) << 8) | function);
+            lv_obj_add_event_cb(button, pod_function_select_cb,
+                                LV_EVENT_CLICKED,
+                                reinterpret_cast<void*>(
+                                    static_cast<uintptr_t>(packed)));
+        }
+    }
 }
 
 static void pod_led_function_cycle_cb(lv_event_t* e) {
@@ -2466,32 +2718,71 @@ static void pod_led_color_cycle_cb(lv_event_t* e) {
 
 static void pod_status_modal_update(void) {
     if (!s_pod_status_modal) return;
+    static uint32_t lastUpdateMs = 0;
+    const uint32_t now = millis();
+    if (lastUpdateMs != 0 && now - lastUpdateMs < 50) return;
+    lastUpdateMs = now;
     const auto& state = daisyUsb.state();
-    if (state.pod_revision != s_pod_seen_revision && state.pod.config.version == 2) {
-        s_pod_seen_revision = state.pod_revision;
+    if (state.pod.revision != s_pod_seen_revision
+        && state.pod.config.version == POD_CONFIG_VERSION) {
+        s_pod_seen_revision = state.pod.revision;
         s_pod_config = state.pod.config;
+        s_pod_config.selectorFunction = POD_FUNC_NONE;
         pod_status_modal_refresh();
     }
     if (s_pod_status_label) {
         uint8_t loaded = 0;
         for (uint8_t i = 0; i < 16; i++) if (state.pod.sampleMask & (1u << i)) loaded++;
-        const char* kit = state.kit_name[0] ? state.kit_name : "--";
+        const uint8_t rotaryMask = i2c_rotaries_detected_mask();
+        const uint8_t addressAckMask = i2c_rotaries_address_ack_mask();
+        const uint8_t muxAddress = i2c_rotaries_mux_address();
+        uint8_t rotaryCount = 0;
+        for (uint8_t i = 0; i < 4; i++)
+            if (rotaryMask & (1u << i)) rotaryCount++;
+        const char* kit = p4.kit_name[0] ? p4.kit_name : "RED 808 KARZ";
+        const char* resetReason = "OTHER";
+        switch (esp_reset_reason()) {
+            case ESP_RST_POWERON:  resetReason = "POWERON"; break;
+            case ESP_RST_EXT:      resetReason = "EXTERNAL"; break;
+            case ESP_RST_SW:       resetReason = "SOFTWARE"; break;
+            case ESP_RST_PANIC:    resetReason = "PANIC"; break;
+            case ESP_RST_INT_WDT:  resetReason = "INT_WDT"; break;
+            case ESP_RST_TASK_WDT: resetReason = "TASK_WDT"; break;
+            case ESP_RST_WDT:      resetReason = "WDT"; break;
+            case ESP_RST_DEEPSLEEP: resetReason = "DEEPSLEEP"; break;
+            case ESP_RST_BROWNOUT: resetReason = "BROWNOUT"; break;
+            case ESP_RST_SDIO:     resetReason = "SDIO"; break;
+            default: break;
+        }
         lv_label_set_text_fmt(s_pod_status_label,
-            "DAISY AUTORIDAD | SD %s M%u/R%u %s C%u R1:%02X T:%02X | WAV %u/16 | KIT %s",
-            state.pod.sdPresent ? "OK" : "--",
-            (unsigned)state.sd_mount_result, (unsigned)state.sd_root_result,
-            sd_diag_stage_name(state.sd_diag_stage),
-            (unsigned)state.sd_last_command,
-            (unsigned)state.sd_last_response,
-            (unsigned)state.sd_last_data_token,
-            loaded, kit);
+            "RESET %s | DAISY AUDIO | WAV %u/16 | KIT %s\n"
+            "I2C2 GPIO3/4 | PCA9548A %s | ADDR 0x%02X | ACK CH 0x%02X | 100k\n"
+            "SEN0502 PID OK %u/4 | R1 %u  R2 %u  R3 %u  R4 %u\n"
+            "STEP/CLICK G1 %u G2 %u G3 %u G4 %u | BTN R1 %lu R2 %lu R3 %lu R4 %lu\n"
+            "FADER DIRECT GPIO20 | %s | ADC %u | VALUE %u/1023\n"
+            "FADER LED DATA GPIO45 | RMT %s",
+            resetReason, loaded, kit,
+            muxAddress ? "SIGNATURE OK" : "NO DETECTADO", muxAddress,
+            addressAckMask, rotaryCount,
+            i2c_rotaries_value(0), i2c_rotaries_value(1),
+            i2c_rotaries_value(2), i2c_rotaries_value(3),
+            i2c_rotaries_gain(0), i2c_rotaries_gain(1),
+            i2c_rotaries_gain(2), i2c_rotaries_gain(3),
+            static_cast<unsigned long>(i2c_rotaries_button_press_count(0)),
+            static_cast<unsigned long>(i2c_rotaries_button_press_count(1)),
+            static_cast<unsigned long>(i2c_rotaries_button_press_count(2)),
+            static_cast<unsigned long>(i2c_rotaries_button_press_count(3)),
+            p4_fader_detected() ? "READY" : "WAIT",
+            p4_fader_raw(), p4_fader_value(),
+            p4_fader_led_driver_ready() ? "READY" : "ERROR");
         lv_obj_set_style_text_color(s_pod_status_label,
-            state.pod.sdPresent ? RED808_SUCCESS : RED808_WARNING, 0);
+            loaded > 0 ? RED808_SUCCESS : RED808_WARNING, 0);
     }
 }
 
 static void pod_status_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_pod_function_modal) pod_function_modal_close_cb(NULL);
     if (s_pod_status_modal) lv_obj_del(s_pod_status_modal);
     s_pod_status_modal = NULL;
     s_pod_status_label = NULL;
@@ -2508,7 +2799,11 @@ static void pod_status_popup_cb(lv_event_t* e) {
         return;
     }
     const auto& state = daisyUsb.state();
-    if (state.pod.config.version == 2) s_pod_config = state.pod.config;
+    if (state.pod.config.version == POD_CONFIG_VERSION) {
+        s_pod_config = state.pod.config;
+        s_pod_config.selectorFunction = POD_FUNC_NONE;
+        s_pod_seen_revision = state.pod.revision;
+    }
     daisyUsb.send(CMD_POD_GET_STATE);
 
     s_pod_status_modal = lv_obj_create(lv_layer_top());
@@ -2521,7 +2816,7 @@ static void pod_status_popup_cb(lv_event_t* e) {
     lv_obj_add_event_cb(s_pod_status_modal, pod_status_modal_close_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(s_pod_status_modal);
-    lv_obj_set_size(card, 930, 530);
+    lv_obj_set_size(card, 960, 550);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
@@ -2534,47 +2829,53 @@ static void pod_status_popup_cb(lv_event_t* e) {
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t* title = lv_label_create(card);
-    lv_label_set_text(title, "DAISYPOD3  /  PHYSICAL CONTROL MAP");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_label_set_text(title, "PHYSICAL CONTROL MAP  /  DAISYPOD3 + P4 CONTROLS");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, RED808_CYAN, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_t* subtitle = lv_label_create(card);
-    lv_label_set_text(subtitle, "Los controles mecanicos mandan; P4 refleja el valor real de Daisy");
-    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_label_set_text(subtitle, "Prioridad: Daisy mecanico > rotary/fader P4 > control digital");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(subtitle, RED808_TEXT_DIM, 0);
     lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 32);
 
-    static const char* controlTitles[6] = {
-        "BUTTON 1", "BUTTON 2", "KNOB 1", "KNOB 2", "ENCODER", "ENC PUSH"
-    };
-    for (uint8_t row = 0; row < 6; row++) {
-        const int col = row % 3, line = row / 3;
-        const int x = 24 + col * 296, y = 78 + line * 92;
+    for (uint8_t row = 0; row < POD_CONTROL_ROW_COUNT; row++) {
+        const int col = row % 4, line = row / 4;
+        const int x = 10 + col * 230, y = 60 + line * 62;
         lv_obj_t* label = lv_label_create(card);
-        lv_label_set_text(label, controlTitles[row]);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_label_set_text(label, POD_CONTROL_TITLES[row]);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
         lv_obj_set_style_text_color(label, RED808_TEXT_DIM, 0);
         lv_obj_set_pos(label, x, y);
-        lv_obj_t* button = lv_btn_create(card);
-        lv_obj_set_size(button, 272, 54);
-        lv_obj_set_pos(button, x, y + 20);
-        apply_control_button_style(button, RED808_ACCENT2, false, 10);
-        s_pod_control_value_labels[row] = lv_label_create(button);
-        lv_obj_set_style_text_font(s_pod_control_value_labels[row], &lv_font_montserrat_16, 0);
+        lv_obj_t* selectButton = lv_btn_create(card);
+        lv_obj_set_size(selectButton, 216, 40);
+        lv_obj_set_pos(selectButton, x, y + 15);
+        apply_control_button_style(selectButton, RED808_ACCENT2, false, 10);
+        lv_obj_set_style_bg_color(selectButton, RED808_SURFACE, 0);
+        s_pod_control_value_labels[row] = lv_label_create(selectButton);
+        lv_obj_set_width(s_pod_control_value_labels[row], 194);
+        lv_obj_set_style_text_align(s_pod_control_value_labels[row],
+                                    LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(s_pod_control_value_labels[row],
+                                   &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_pod_control_value_labels[row],
+                                    RED808_TEXT, 0);
         lv_obj_center(s_pod_control_value_labels[row]);
-        lv_obj_add_event_cb(button, pod_control_cycle_cb, LV_EVENT_CLICKED,
-                            (void*)(intptr_t)row);
+        lv_obj_add_event_cb(selectButton, pod_control_modal_open_cb,
+                            LV_EVENT_CLICKED,
+                            reinterpret_cast<void*>(
+                                static_cast<uintptr_t>(row)));
     }
 
     for (uint8_t led = 0; led < 2; led++) {
-        const int y = 286 + led * 78;
+        const int y = 252 + led * 64;
         lv_obj_t* label = lv_label_create(card);
         lv_label_set_text_fmt(label, "LED %u", led + 1);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(label, led == 0 ? RED808_CYAN : RED808_ACCENT, 0);
         lv_obj_set_pos(label, 24, y + 14);
         lv_obj_t* functionButton = lv_btn_create(card);
-        lv_obj_set_size(functionButton, 470, 54);
+        lv_obj_set_size(functionButton, 490, 44);
         lv_obj_set_pos(functionButton, 110, y);
         apply_control_button_style(functionButton, RED808_INFO, false, 10);
         s_pod_led_function_labels[led] = lv_label_create(functionButton);
@@ -2583,8 +2884,8 @@ static void pod_status_popup_cb(lv_event_t* e) {
         lv_obj_add_event_cb(functionButton, pod_led_function_cycle_cb, LV_EVENT_CLICKED,
                             (void*)(intptr_t)led);
         lv_obj_t* colorButton = lv_btn_create(card);
-        lv_obj_set_size(colorButton, 260, 54);
-        lv_obj_set_pos(colorButton, 600, y);
+        lv_obj_set_size(colorButton, 270, 44);
+        lv_obj_set_pos(colorButton, 620, y);
         apply_control_button_style(colorButton, RED808_ACCENT, false, 10);
         s_pod_led_color_labels[led] = lv_label_create(colorButton);
         lv_obj_set_style_text_font(s_pod_led_color_labels[led], &lv_font_montserrat_16, 0);
@@ -2594,13 +2895,13 @@ static void pod_status_popup_cb(lv_event_t* e) {
     }
 
     s_pod_status_label = lv_label_create(card);
-    lv_obj_set_width(s_pod_status_label, 760);
+    lv_obj_set_width(s_pod_status_label, 780);
     lv_obj_set_style_text_align(s_pod_status_label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_style_text_font(s_pod_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(s_pod_status_label, 24, 460);
+    lv_obj_set_style_text_font(s_pod_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(s_pod_status_label, 18, 382);
     lv_obj_t* close = lv_btn_create(card);
     lv_obj_set_size(close, 100, 42);
-    lv_obj_set_pos(close, 790, 448);
+    lv_obj_set_pos(close, 816, 444);
     apply_control_button_style(close, RED808_WARNING, false, 10);
     lv_obj_t* closeLabel = lv_label_create(close);
     lv_label_set_text(closeLabel, "CLOSE");
@@ -2769,6 +3070,7 @@ static void pod_apply_navigation_action(uint8_t function, uint8_t selected_pad) 
             grid_pad_inst_popup_cb(NULL);
             break;
         case POD_FUNC_XTRA_PADS: ui_navigate_to(6); break;
+        case POD_FUNC_CONTROL_CONFIG: pod_status_popup_cb(NULL); break;
         default: break;
     }
 }
@@ -2777,7 +3079,7 @@ static void pod_process_physical_actions(void) {
     const auto& transport = daisyUsb.state();
     if (transport.pod_revision == s_pod_action_seen_revision) return;
     s_pod_action_seen_revision = transport.pod_revision;
-    if (transport.pod.config.version != 2) return;
+    if (transport.pod.config.version != POD_CONFIG_VERSION) return;
 
     const uint8_t events = transport.pod.buttonPressEvents;
     const uint8_t functions[3] = {
@@ -2932,6 +3234,7 @@ static void create_live_screen(void) {
     apply_control_button_style(grid_play_btn, RED808_ACCENT2, true, 12);
     lv_obj_set_style_bg_color(grid_play_btn, RED808_ACCENT, 0);
     lv_obj_add_event_cb(grid_play_btn, header_play_cb, LV_EVENT_CLICKED, NULL);
+    pod_register_owner_badge(grid_play_btn, POD_FUNC_PLAY_TOGGLE);
     live_home_panels[live_home_panel_count++] = grid_play_btn;
     grid_play_lbl = lv_label_create(grid_play_btn);
     lv_label_set_text(grid_play_lbl, LV_SYMBOL_PLAY "\nPLAY");
@@ -2945,12 +3248,14 @@ static void create_live_screen(void) {
     b = create_ctrl_btn(scr_live, COL_X(5), ROW_Y(0), CW, CH,
                          LV_SYMBOL_LEFT "\nPAT", RED808_WARNING, &lv_font_montserrat_20);
     lv_obj_add_event_cb(b, header_pattern_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
+    pod_register_owner_badge(b, POD_FUNC_PATTERN_PREV);
     live_home_panels[live_home_panel_count++] = b;
 
     // [6,0] PAT +
     b = create_ctrl_btn(scr_live, COL_X(6), ROW_Y(0), CW, CH,
                          "PAT\n" LV_SYMBOL_RIGHT, RED808_WARNING, &lv_font_montserrat_20);
     lv_obj_add_event_cb(b, header_pattern_cb, LV_EVENT_CLICKED, (void*)(intptr_t)1);
+    pod_register_owner_badge(b, POD_FUNC_PATTERN_NEXT);
     live_home_panels[live_home_panel_count++] = b;
 
     // [7,0] Home status cell — pattern + link health
@@ -2958,6 +3263,7 @@ static void create_live_screen(void) {
                                            "STATUS", "P01", RED808_WARNING, &grid_bpm_lbl);
     lv_obj_add_flag(home_cell, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(home_cell, pod_status_popup_cb, LV_EVENT_CLICKED, NULL);
+    pod_register_owner_badge(home_cell, POD_FUNC_CONTROL_CONFIG);
     grid_home_vol_lbl = lv_label_create(home_cell);
     lv_label_set_text(grid_home_vol_lbl, "MASTER --");
     lv_obj_set_style_text_font(grid_home_vol_lbl, &lv_font_montserrat_14, 0);
@@ -2974,6 +3280,22 @@ static void create_live_screen(void) {
         b = create_ctrl_btn(scr_live, COL_X(5 + i), ROW_Y(1), CW, CH,
                              nav_texts[i], nav_colors[i], &lv_font_montserrat_20);
         lv_obj_add_event_cb(b, grid_nav_cb, LV_EVENT_CLICKED, (void*)(intptr_t)nav_screens[i]);
+        if (i == 0) {
+            grid_fx_btn = b;
+            pod_register_owner_badge(b, POD_FUNC_FX);
+            grid_fx_active_badge = lv_label_create(b);
+            lv_label_set_text(grid_fx_active_badge, LV_SYMBOL_AUDIO " ON");
+            lv_obj_set_size(grid_fx_active_badge, 54, 24);
+            lv_obj_align(grid_fx_active_badge, LV_ALIGN_TOP_RIGHT, -6, 6);
+            lv_obj_set_style_radius(grid_fx_active_badge, 12, 0);
+            lv_obj_set_style_bg_color(grid_fx_active_badge, RED808_INFO, 0);
+            lv_obj_set_style_bg_opa(grid_fx_active_badge, LV_OPA_COVER, 0);
+            lv_obj_set_style_text_color(grid_fx_active_badge, RED808_BG, 0);
+            lv_obj_set_style_text_font(grid_fx_active_badge, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_align(grid_fx_active_badge, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_add_flag(grid_fx_active_badge, LV_OBJ_FLAG_HIDDEN);
+        }
+        else if (i == 1) pod_register_owner_badge(b, POD_FUNC_MIXER);
         live_home_panels[live_home_panel_count++] = b;
     }
 
@@ -2982,6 +3304,7 @@ static void create_live_screen(void) {
     b = create_ctrl_btn(scr_live, COL_X(4), ROW_Y(2), CW, CH,
                          "XTRA\nPADS", RED808_INFO, &lv_font_montserrat_20);
     lv_obj_add_event_cb(b, grid_nav_cb, LV_EVENT_CLICKED, (void*)(intptr_t)6);
+    pod_register_owner_badge(b, POD_FUNC_XTRA_PADS);
     live_home_panels[live_home_panel_count++] = b;
 
     // [6,2] PAD GRID — selector de visualización (1/2/4/8/16 pads)
@@ -2991,6 +3314,7 @@ static void create_live_screen(void) {
     lv_obj_set_style_border_color(grid_nr_btn, RED808_ACCENT2, 0);
     grid_nr_lbl = lv_obj_get_child(grid_nr_btn, 0);
     lv_obj_add_event_cb(grid_nr_btn, grid_pad_mode_cb, LV_EVENT_CLICKED, NULL);
+    pod_register_owner_badge(grid_nr_btn, POD_FUNC_PAD_GRID);
     live_home_panels[live_home_panel_count++] = grid_nr_btn;
 
     // [7,2] SYNC PADS ON/OFF
@@ -3019,6 +3343,7 @@ static void create_live_screen(void) {
     lv_obj_set_style_border_color(vol_panel, RED808_BORDER, 0);
     lv_obj_set_style_pad_all(vol_panel, 6, 0);
     lv_obj_clear_flag(vol_panel, LV_OBJ_FLAG_SCROLLABLE);
+    pod_register_owner_badge(vol_panel, POD_FUNC_MASTER_VOLUME);
     live_home_panels[live_home_panel_count++] = vol_panel;
 
     lv_obj_t* vol_title = lv_label_create(vol_panel);
@@ -3072,6 +3397,7 @@ static void create_live_screen(void) {
     lv_obj_clear_flag(step_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(step_panel, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(step_panel, live_step_nav_cb, LV_EVENT_CLICKED, NULL);
+    pod_register_owner_badge(step_panel, POD_FUNC_SEQUENCER);
     live_home_panels[live_home_panel_count++] = step_panel;
 
     // Title doubles as the SEQUENCER nav cue (the whole panel is clickable →
@@ -3125,6 +3451,7 @@ static void create_live_screen(void) {
     lv_obj_clear_flag(inst_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(inst_panel, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(inst_panel, grid_pad_inst_popup_cb, LV_EVENT_CLICKED, NULL);
+    pod_register_owner_badge(inst_panel, POD_FUNC_PAD_SOUNDS);
     live_home_panels[live_home_panel_count++] = inst_panel;
 
     grid_pad_prev_btn = NULL;
@@ -3171,6 +3498,7 @@ static void create_live_screen(void) {
     lv_obj_set_style_border_color(bpm_panel, RED808_BORDER, 0);
     lv_obj_set_style_pad_all(bpm_panel, 6, 0);
     lv_obj_clear_flag(bpm_panel, LV_OBJ_FLAG_SCROLLABLE);
+    pod_register_owner_badge(bpm_panel, POD_FUNC_TEMPO);
     live_home_panels[live_home_panel_count++] = bpm_panel;
 
     lv_obj_t* bpm_title = lv_label_create(bpm_panel);
@@ -3209,6 +3537,14 @@ static void create_live_screen(void) {
     lv_obj_set_style_text_color(grid_pat_lbl, RED808_CYAN, 0);
     lv_obj_align(grid_pat_lbl, LV_ALIGN_CENTER, 0, -12);
 
+    grid_tempo_ref_lbl = lv_label_create(bpm_panel);
+    lv_label_set_text(grid_tempo_ref_lbl, "");
+    lv_obj_set_width(grid_tempo_ref_lbl, CW - 16);
+    lv_obj_set_style_text_font(grid_tempo_ref_lbl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(grid_tempo_ref_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(grid_tempo_ref_lbl, LV_ALIGN_CENTER, 0, 18);
+    lv_obj_add_flag(grid_tempo_ref_lbl, LV_OBJ_FLAG_HIDDEN);
+
     // Floating back button — shown only in FS pad modes (mode 1-5)
     s_pad_back_btn = lv_btn_create(scr_live);
     lv_obj_set_size(s_pad_back_btn, 72, 36);
@@ -3223,6 +3559,7 @@ static void create_live_screen(void) {
     lv_obj_center(back_lbl2);
     lv_obj_add_flag(s_pad_back_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_pad_back_btn, [](lv_event_t*){ apply_pad_layout(0); }, LV_EVENT_CLICKED, NULL);
+    pod_register_owner_badge(s_pad_back_btn, POD_FUNC_BACK);
 
     #undef COL_X
     #undef ROW_Y
@@ -3230,7 +3567,6 @@ static void create_live_screen(void) {
 
 static void update_live_screen(void) {
     unsigned long now = millis();
-    pod_status_modal_update();
 
     // ── MPC-style pad fade: velocity-weighted exponential decay ──
     // Each pad maps its current "brightness" to one of 8 bands (0 = idle,
@@ -3240,7 +3576,9 @@ static void update_live_screen(void) {
     bool step_changed = (p4.current_step != prev_sync_step);
     if (step_changed) prev_sync_step = p4.current_step;
     static uint8_t pad_prev_band[16] = {};
-    static bool pad_prev_muted_for_flash[16] = {};
+    static bool pad_prev_audible_for_flash[16] = {};
+    bool anySolo = false;
+    for (int i = 0; i < 16; ++i) anySolo |= p4.track_solo[i];
     // Theme reload recreates every widget; force-invalidate the dirty caches
     // or recreated pads/labels keep skipping their first style repaint.
     static uint32_t live_gen = 0;
@@ -3249,7 +3587,8 @@ static void update_live_screen(void) {
         live_gen = s_ui_refresh_gen;
         for (int i = 0; i < 16; i++) {
             pad_prev_band[i] = 0xFF;
-            pad_prev_muted_for_flash[i] = p4.track_muted[i];
+            pad_prev_audible_for_flash[i] = !p4.track_muted[i]
+                && (!anySolo || p4.track_solo[i]);
         }
         prev_sync_step = -1;
         step_changed = true;
@@ -3258,15 +3597,16 @@ static void update_live_screen(void) {
         if (!live_pad_btns[i]) continue;
 
         bool muted = p4.track_muted[i];
-        bool muted_changed = (muted != pad_prev_muted_for_flash[i]);
-        if (muted_changed) {
-            pad_prev_muted_for_flash[i] = muted;
+        bool audible = !muted && (!anySolo || p4.track_solo[i]);
+        bool audible_changed = (audible != pad_prev_audible_for_flash[i]);
+        if (audible_changed) {
+            pad_prev_audible_for_flash[i] = audible;
             pad_prev_band[i] = 0xFF;
         }
 
         uint8_t band = 0;
-        uint8_t vel  = muted ? 0 : s_pad_flash_vel[i];
-        if (muted) s_pad_flash_vel[i] = 0;
+        uint8_t vel  = audible ? s_pad_flash_vel[i] : 0;
+        if (!audible) s_pad_flash_vel[i] = 0;
         if (vel) {
             unsigned long el = now - s_pad_flash_start_ms[i];
             if (el >= (unsigned long)FADE_MS) {
@@ -3281,7 +3621,7 @@ static void update_live_screen(void) {
         }
         // Sequencer sync floor: if this pad is active on the current step,
         // render at mid brightness so the groove is always visible.
-        if (!muted && sync_pads_active && p4.is_playing && live_step_hit(i)) {
+        if (audible && sync_pads_active && p4.is_playing && live_step_hit(i)) {
             if (band < 4) band = 4;
         }
         if (band == pad_prev_band[i]) continue;
@@ -3289,7 +3629,7 @@ static void update_live_screen(void) {
 
         lv_color_t tc = ui_track_color(i);
 
-        if (muted) {
+        if (!audible) {
             lv_obj_set_style_bg_color(live_pad_btns[i], RED808_SURFACE, 0);
             lv_obj_set_style_bg_grad_color(live_pad_btns[i], RED808_PANEL, 0);
             lv_obj_set_style_bg_opa(live_pad_btns[i], LV_OPA_70, 0);
@@ -3355,7 +3695,8 @@ static void update_live_screen(void) {
         if (!live_pad_btns[i]) continue;
         bool muted = p4.track_muted[i];
         bool solo = p4.track_solo[i];
-        bool step_lit = !muted && p4.is_playing && live_step_hit(i);
+        bool isolated = anySolo && !solo;
+        bool step_lit = !muted && !isolated && p4.is_playing && live_step_hit(i);
         if (!force_refresh &&
             muted == prev_muted[i] && solo == prev_solo[i] &&
             step_lit == prev_step_lit[i] && p4.is_playing == prev_live_playing) {
@@ -3377,15 +3718,49 @@ static void update_live_screen(void) {
                 lv_label_set_text(live_pad_state_labels[i], "");
             }
         }
-        lv_obj_set_style_border_color(live_pad_btns[i], muted ? RED808_TEXT_DIM : (solo ? RED808_WARNING : tc), 0);
-        lv_obj_set_style_border_opa(live_pad_btns[i], muted ? LV_OPA_50 : LV_OPA_COVER, 0);
-        if (live_pad_labels[i] && muted) lv_obj_set_style_text_color(live_pad_labels[i], RED808_TEXT_DIM, 0);
+        lv_obj_set_style_border_color(live_pad_btns[i],
+            (muted || isolated) ? RED808_TEXT_DIM : (solo ? RED808_WARNING : tc), 0);
+        lv_obj_set_style_border_opa(live_pad_btns[i],
+            (muted || isolated) ? LV_OPA_50 : LV_OPA_COVER, 0);
+        if (live_pad_labels[i] && (muted || isolated))
+            lv_obj_set_style_text_color(live_pad_labels[i], RED808_TEXT_DIM, 0);
         if (live_pad_accent_strips[i]) {
-            lv_obj_set_style_bg_color(live_pad_accent_strips[i], solo ? RED808_WARNING : (muted ? RED808_TEXT_DIM : tc), 0);
-            lv_obj_set_style_bg_opa(live_pad_accent_strips[i], muted ? LV_OPA_40 : LV_OPA_80, 0);
+            lv_obj_set_style_bg_color(live_pad_accent_strips[i], solo ? RED808_WARNING : ((muted || isolated) ? RED808_TEXT_DIM : tc), 0);
+            lv_obj_set_style_bg_opa(live_pad_accent_strips[i],
+                (muted || isolated) ? LV_OPA_40 : LV_OPA_80, 0);
         }
     }
     prev_live_playing = p4.is_playing;
+
+    // HOME reveals active processing before FX LAB is opened. The icon plus
+    // border change is intentionally redundant so state is not color-only.
+    static int8_t prev_home_fx_active = -1;
+    static lv_obj_t* prev_home_fx_badge = NULL;
+    const bool homeFxActive = fx_any_active();
+    if(grid_fx_btn && grid_fx_active_badge
+       && (prev_home_fx_active != static_cast<int8_t>(homeFxActive)
+           || prev_home_fx_badge != grid_fx_active_badge))
+    {
+        prev_home_fx_active = homeFxActive ? 1 : 0;
+        prev_home_fx_badge = grid_fx_active_badge;
+        if(homeFxActive)
+        {
+            lv_obj_clear_flag(grid_fx_active_badge, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_border_width(grid_fx_btn, 3, 0);
+            lv_obj_set_style_border_color(grid_fx_btn, RED808_CYAN, 0);
+            lv_obj_set_style_shadow_width(grid_fx_btn, 12, 0);
+            lv_obj_set_style_shadow_color(grid_fx_btn, RED808_INFO, 0);
+            lv_obj_set_style_shadow_opa(grid_fx_btn, LV_OPA_30, 0);
+        }
+        else
+        {
+            lv_obj_add_flag(grid_fx_active_badge, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_border_width(grid_fx_btn, 2, 0);
+            lv_obj_set_style_border_color(grid_fx_btn, RED808_INFO, 0);
+            lv_obj_set_style_shadow_width(grid_fx_btn, 0, 0);
+            lv_obj_set_style_shadow_opa(grid_fx_btn, LV_OPA_0, 0);
+        }
+    }
 
     // Play button state
     static bool gp_prev_play = false;
@@ -3414,18 +3789,45 @@ static void update_live_screen(void) {
     // function-local caches survive.
     static int8_t gp_prev_mstr_transport = -1;
     static lv_obj_t* gp_prev_mstr_transport_lbl = NULL;
+    static uint16_t gp_prev_protocol_version = 0xFFFFu;
+    static uint32_t gp_prev_link_rtt = UINT32_MAX;
     const bool mstr_on = ui_master_link_display_on();
+    const uint16_t protocolVersion = daisyUsb.state().protocol_version;
+    const bool protocolMismatch = daisyUsb.state().link_ready
+        && protocolVersion != 0 && protocolVersion != RED808_PROTOCOL_VERSION;
     const int8_t mstr_transport = daisyUsb.connected() ? 2
+                                  : protocolMismatch ? 5
                                   : daisyUsb.state().link_ready ? 4 : 0;
+    const uint32_t linkRtt = daisyUsb.state().round_trip_ms;
     if (grid_home_vol_lbl &&
         (mstr_transport != gp_prev_mstr_transport ||
-         grid_home_vol_lbl != gp_prev_mstr_transport_lbl)) {
+         grid_home_vol_lbl != gp_prev_mstr_transport_lbl ||
+         protocolVersion != gp_prev_protocol_version ||
+         linkRtt != gp_prev_link_rtt)) {
         gp_prev_mstr_transport = mstr_transport;
         gp_prev_mstr_transport_lbl = grid_home_vol_lbl;
-        const char* status = mstr_transport == 2 ? "DAISY USB"
-                           : mstr_transport == 4 ? "USB WAIT"
-                                                 : "DAISY --";
-        lv_label_set_text(grid_home_vol_lbl, status);
+        gp_prev_protocol_version = protocolVersion;
+        gp_prev_link_rtt = linkRtt;
+        if (mstr_transport == 2 && protocolVersion != 0) {
+            if (linkRtt == 0) {
+                lv_label_set_text_fmt(grid_home_vol_lbl, "USB %u.%u <1ms",
+                    (protocolVersion >> 8) & 0xFFu,
+                    protocolVersion & 0xFFu);
+            } else {
+                lv_label_set_text_fmt(grid_home_vol_lbl, "USB %u.%u %lums",
+                    (protocolVersion >> 8) & 0xFFu,
+                    protocolVersion & 0xFFu,
+                    static_cast<unsigned long>(linkRtt));
+            }
+        } else if (mstr_transport == 5) {
+            lv_label_set_text_fmt(grid_home_vol_lbl, "UPDATE %u.%u",
+                (protocolVersion >> 8) & 0xFFu, protocolVersion & 0xFFu);
+        } else {
+            const char* status = mstr_transport == 2 ? "DAISY USB"
+                               : mstr_transport == 4 ? "USB WAIT"
+                                                     : "DAISY --";
+            lv_label_set_text(grid_home_vol_lbl, status);
+        }
         lv_obj_set_style_text_color(grid_home_vol_lbl,
             mstr_on ? RED808_SUCCESS : RED808_TEXT_DIM, 0);
     }
@@ -3441,12 +3843,31 @@ static void update_live_screen(void) {
     }
 
     static int gp_prev_home_bpm = -1;
+    static int gp_prev_home_original_bpm = -1;
     static lv_obj_t* gp_prev_home_bpm_lbl = NULL;
-    if (grid_pat_lbl && (p4.bpm_int != gp_prev_home_bpm || grid_pat_lbl != gp_prev_home_bpm_lbl)) {
-        gp_prev_home_bpm = p4.bpm_int;
+    if (grid_pat_lbl && (p4.bpm_int * 10 + p4.bpm_frac != gp_prev_home_bpm
+            || p4.original_bpm_x10 != gp_prev_home_original_bpm
+            || grid_pat_lbl != gp_prev_home_bpm_lbl)) {
+        const int current_x10 = p4.bpm_int * 10 + p4.bpm_frac;
+        gp_prev_home_bpm = current_x10;
+        gp_prev_home_original_bpm = p4.original_bpm_x10;
         gp_prev_home_bpm_lbl = grid_pat_lbl;
-        lv_label_set_text_fmt(grid_pat_lbl, "%d", p4.bpm_int);
+        lv_label_set_text_fmt(grid_pat_lbl, "%d.%d", p4.bpm_int, p4.bpm_frac);
         lv_obj_clear_flag(grid_pat_lbl, LV_OBJ_FLAG_HIDDEN);
+        if (grid_tempo_ref_lbl) {
+            const int delta_x10 = current_x10 - p4.original_bpm_x10;
+            if (p4.original_bpm_x10 > 0 && delta_x10 != 0) {
+                const char* direction = delta_x10 > 0 ? "FAST" : "SLOW";
+                lv_label_set_text_fmt(grid_tempo_ref_lbl, "%s %+.1f | ORIG %.1f",
+                    direction, delta_x10 / 10.0f,
+                    p4.original_bpm_x10 / 10.0f);
+                lv_obj_set_style_text_color(grid_tempo_ref_lbl,
+                    delta_x10 > 0 ? RED808_WARNING : RED808_INFO, 0);
+                lv_obj_clear_flag(grid_tempo_ref_lbl, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(grid_tempo_ref_lbl, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
     }
 
     // Step — only show the running step while playing; show "--" when paused
@@ -3619,6 +4040,7 @@ static lv_obj_t* fx_page_dot[FX_PAGE_DOT_COUNT]= {};
 static lv_obj_t* fx_page_lbl                   = NULL;
 static lv_obj_t* fx_view_btn                   = NULL;
 static lv_obj_t* fx_view_lbl                   = NULL;
+static lv_obj_t* fx_pattern_lbl                = NULL;
 static bool s_fx_ui_syncing = false;
 static uint32_t s_fx_toggle_last_ms[FX_CARD_COUNT] = {};
 static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX buttons
@@ -3637,9 +4059,20 @@ static const uint32_t fx_colors[FX_CARD_COUNT] = {
 };
 
 static const char* fx_src[FX_CARD_COUNT] = {
-    "ENC 1", "ENC 2", "ENC 3", "MACRO", "MACRO", "MACRO",
-    "FILTER", "FILTER", "MASTER", "CRUSH", "CRUSH", "FILTER"
+    "DEPTH", "DRY / WET", "DRY / WET", "INPUT GAIN", "DUAL MACRO", "DEPTH",
+    "FREQUENCY", "Q / RESONANCE", "DRIVE", "RESOLUTION", "HOLD RATE", "MODEL"
 };
+
+static uint8_t fx_card_owner_function(int cell) {
+    static const uint8_t functions[FX_CARD_COUNT] = {
+        POD_FUNC_FLANGER_DEPTH, POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX,
+        POD_FUNC_WAVEFOLDER_GAIN, POD_FUNC_CRUSH_MACRO,
+        POD_FUNC_PHASER_DEPTH, POD_FUNC_FILTER_CUTOFF,
+        POD_FUNC_FILTER_RESONANCE, POD_FUNC_DISTORTION,
+        POD_FUNC_BIT_DEPTH, POD_FUNC_SAMPLE_RATE, POD_FUNC_FILTER_TYPE
+    };
+    return (cell >= 0 && cell < FX_CARD_COUNT) ? functions[cell] : POD_FUNC_NONE;
+}
 
 static lv_color_t fx_safe_text_color(uint32_t hexColor) {
     uint8_t r = (uint8_t)((hexColor >> 16) & 0xFF);
@@ -3659,17 +4092,15 @@ static int fx_card_current_value_u7(int cell) {
         case FX_CARD_DELAY:  return p4.enc_value[1];
         case FX_CARD_REVERB: return p4.enc_value[2];
         case FX_CARD_FOLD:   return p4.pot_value[3];
-        case FX_CARD_CRUSH: {
-            float norm = (float)(16 - constrain(p4.bitcrush_bits, 8, 16)) / 8.0f;
-            return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
-        }
+        case FX_CARD_CRUSH: return p4.pot_value[1];
         case FX_CARD_PHASER: return p4.pot_value[2];
         case FX_CARD_CUTOFF: {
-            float norm = (float)(constrain(p4.cutoff_hz, 20, 20000) - 20) / 19980.0f;
+            float norm = logf((float)constrain(p4.cutoff_hz, 20, 20000) / 20.0f)
+                       / logf(1000.0f);
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
         case FX_CARD_RESO: {
-            float norm = (float)(constrain(p4.resonance_x10, 10, 100) - 10) / 90.0f;
+            float norm = (float)(constrain(p4.resonance_x10, 7, 200) - 7) / 193.0f;
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
         case FX_CARD_DRIVE: {
@@ -3677,17 +4108,17 @@ static int fx_card_current_value_u7(int cell) {
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
         case FX_CARD_BITS: {
-            // Keep UI mapping aligned with CRUSH macro pot#1 command path.
-            float norm = (float)(16 - constrain(p4.bitcrush_bits, 8, 16)) / 8.0f;
+            float norm = (float)(16 - constrain(p4.bitcrush_bits, 4, 16)) / 12.0f;
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
         case FX_CARD_SRATE: {
-            // Keep UI mapping aligned with CRUSH macro pot#1 command path.
-            float norm = (float)(32000 - constrain(p4.sample_rate_hz, 9000, 32000)) / 22000.0f;
+            if (p4.sample_rate_hz <= 0) return 0;
+            float norm = logf((float)constrain(p4.sample_rate_hz, 4000, 42000)
+                              / 42000.0f) / logf(4000.0f / 42000.0f);
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
         case FX_CARD_FILTER: {
-            float norm = (float)constrain(p4.filter_type, 0, 4) / 4.0f;
+            float norm = (float)constrain(p4.filter_type, 0, 14) / 14.0f;
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
     }
@@ -3700,13 +4131,13 @@ static bool fx_card_is_muted(int cell) {
         case FX_CARD_DELAY:  return p4.enc_muted[1];
         case FX_CARD_REVERB: return p4.enc_muted[2];
         case FX_CARD_FOLD:   return p4.pot_muted[0];
-        case FX_CARD_CRUSH:  return p4.bitcrush_bits >= 16;
+        case FX_CARD_CRUSH:  return p4.pot_value[1] == 0;
         case FX_CARD_PHASER: return p4.pot_muted[2];
         case FX_CARD_CUTOFF: return p4.cutoff_hz >= 19950;
-        case FX_CARD_RESO:   return p4.resonance_x10 <= 11;
+        case FX_CARD_RESO:   return p4.resonance_x10 <= 8;
         case FX_CARD_DRIVE:  return p4.distortion_pct <= 0;
         case FX_CARD_BITS:   return p4.bitcrush_bits >= 16;
-        case FX_CARD_SRATE:  return (p4.sample_rate_hz <= 0) || (p4.sample_rate_hz >= 31800);
+        case FX_CARD_SRATE:  return p4.sample_rate_hz <= 0;
         case FX_CARD_FILTER: return p4.filter_type == 0;
     }
     return false;
@@ -3731,6 +4162,9 @@ static int fx_card_neutral_u7(int cell) {
 }
 
 static void fx_card_send_value(int cell, int u7, bool transmit = true) {
+    const uint8_t ownerFunction = fx_card_owner_function(cell);
+    if (ownerFunction != POD_FUNC_NONE
+        && pod_function_has_physical_owner(ownerFunction)) return;
     int neutral_u7 = fx_card_neutral_u7(cell);
     if (u7 != neutral_u7) {
         s_fx_last_active_u7[cell] = (uint8_t)u7;
@@ -3749,21 +4183,23 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
             break;
         case FX_CARD_CRUSH:
             p4.pot_value[1] = (uint8_t)u7;
-            p4.bitcrush_bits = constrain((int)(16.0f - ((float)u7 / 127.0f) * 8.0f + 0.5f), 8, 16);
-            if (transmit && control_available()) control_send_set_bitcrush(p4.bitcrush_bits);
+            if (transmit && control_available())
+                control_send_set_crush_macro((uint8_t)u7);
             break;
         case FX_CARD_PHASER:
             p4.pot_value[2] = (uint8_t)u7;
             if (transmit && control_available()) control_send_fx_pot(2, p4.pot_value[2], p4.pot_muted[2]);
             break;
         case FX_CARD_CUTOFF: {
-            int hz = constrain((int)(20.0f + ((float)u7 / 127.0f) * 19980.0f + 0.5f), 20, 20000);
+            int hz = constrain((int)(20.0f
+                * powf(1000.0f, (float)u7 / 127.0f) + 0.5f), 20, 20000);
             p4.cutoff_hz = hz;
             if (transmit && control_available()) control_send_set_filter_cutoff(hz);
             break;
         }
         case FX_CARD_RESO: {
-            int resonanceX10 = constrain((int)(10.0f + ((float)u7 / 127.0f) * 90.0f + 0.5f), 10, 100);
+            int resonanceX10 = constrain((int)(7.0f
+                + ((float)u7 / 127.0f) * 193.0f + 0.5f), 7, 200);
             p4.resonance_x10 = resonanceX10;
             if (transmit && control_available()) control_send_set_filter_resonance((float)resonanceX10 / 10.0f);
             break;
@@ -3775,22 +4211,23 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
             break;
         }
         case FX_CARD_BITS: {
-            // Match control_send_fx_pot(pot=1): 16..8 bits across u7 range.
-            int bits = constrain((int)(16.0f - ((float)u7 / 127.0f) * 8.0f + 0.5f), 8, 16);
+            int bits = constrain((int)(16.0f
+                - ((float)u7 / 127.0f) * 12.0f + 0.5f), 4, 16);
             p4.bitcrush_bits = bits;
             p4.pot_value[1] = (uint8_t)u7;
             if (transmit && control_available()) control_send_set_bitcrush(bits);
             break;
         }
         case FX_CARD_SRATE: {
-            // Match control_send_fx_pot(pot=1): 32000..9000 Hz across u7 range.
-            int sr = constrain((int)(32000.0f - ((float)u7 / 127.0f) * 22000.0f + 0.5f), 9000, 32000);
+            int sr = u7 == 0 ? 0 : constrain((int)(42000.0f
+                * powf(4000.0f / 42000.0f, (float)u7 / 127.0f) + 0.5f),
+                4000, 42000);
             p4.sample_rate_hz = sr;
             if (transmit && control_available()) control_send_set_sample_rate(sr);
             break;
         }
         case FX_CARD_FILTER: {
-            int type = constrain((int)((float)u7 / 127.0f * 4.0f + 0.5f), 0, 4);
+            int type = constrain((int)((float)u7 / 127.0f * 14.0f + 0.5f), 0, 14);
             p4.filter_type = type;
             if (transmit && control_available()) control_send_set_filter(type);
             break;
@@ -3920,6 +4357,9 @@ static void fx_apply_layout(void) {
 static void fx_toggle_cb(lv_event_t* e) {
     int cell = (int)(intptr_t)lv_event_get_user_data(e);
     if (cell < 0 || cell >= FX_CARD_COUNT) return;
+    const uint8_t ownerFunction = fx_card_owner_function(cell);
+    if (ownerFunction != POD_FUNC_NONE
+        && pod_function_has_physical_owner(ownerFunction)) return;
     uint32_t now = millis();
     // Per-button debounce (700ms) + global cross-button cooldown (200ms).
     // GT911 on P4 with LVGL can fire duplicate CLICKED events within <300ms;
@@ -3940,39 +4380,33 @@ static void fx_toggle_cb(lv_event_t* e) {
                 s_fx_arc_anim[cell] = 48.0f;
             }
             if (control_available()) control_send_fx_enc(cell, p4.enc_value[cell], p4.enc_muted[cell]);
+        } else if (cell == FX_CARD_FOLD || cell == FX_CARD_PHASER) {
+            const int pot_idx = cell == FX_CARD_FOLD ? 0 : 2;
+            const int value_idx = cell == FX_CARD_FOLD ? 3 : 2;
+            const bool unmuting = p4.pot_muted[pot_idx];
+            p4.pot_muted[pot_idx] = !p4.pot_muted[pot_idx];
+            if (unmuting && p4.pot_value[value_idx] == 0) {
+                p4.pot_value[value_idx] = 48;
+                s_fx_arc_anim[cell] = 48.0f;
+            }
+            if (control_available()) {
+                if (pot_idx == 0)
+                    control_send_fx_pot(0, p4.pot_value[3], p4.pot_muted[0]);
+                else
+                    control_send_fx_pot(2, p4.pot_value[2], p4.pot_muted[2]);
+            }
         } else {
-            if (cell < 6) {
-                int pot_idx = cell - 3;
-                p4.pot_muted[pot_idx] = !p4.pot_muted[pot_idx];
-                if (control_available()) {
-                    if (pot_idx == 0) control_send_fx_pot(0, p4.pot_value[3], p4.pot_muted[0]);
-                    else if (pot_idx == 1) {
-                        // CRUSH card in touch UI controls bitcrush only (no chained SRATE/DIST).
-                        if (p4.pot_muted[1]) {
-                            p4.bitcrush_bits = 16;
-                            control_send_set_bitcrush(16);
-                        } else {
-                            if (p4.bitcrush_bits >= 16) p4.bitcrush_bits = 12;
-                            control_send_set_bitcrush(p4.bitcrush_bits);
-                        }
-                    }
-                    else control_send_fx_pot(2, p4.pot_value[2], p4.pot_muted[2]);
-                }
+            const bool muted = fx_card_is_muted(cell);
+            const int neutral_u7 = fx_card_neutral_u7(cell);
+            if (muted) {
+                int value = (int)s_fx_last_active_u7[cell];
+                if (value == neutral_u7)
+                    value = (cell == FX_CARD_CUTOFF) ? 96 : 64;
+                fx_card_send_value(cell, value);
+                s_fx_arc_anim[cell] = (float)value;
             } else {
-                bool muted = fx_card_is_muted(cell);
-                if (muted) {
-                    int val = (int)s_fx_last_active_u7[cell];
-                    int neutral_u7 = fx_card_neutral_u7(cell);
-                    if (val == neutral_u7) {
-                        val = (cell == FX_CARD_CUTOFF) ? 96 : 64;
-                    }
-                    fx_card_send_value(cell, val);
-                    s_fx_arc_anim[cell] = (float)val;
-                } else {
-                    int neutral_u7 = fx_card_neutral_u7(cell);
-                    fx_card_send_value(cell, neutral_u7);
-                    s_fx_arc_anim[cell] = (float)neutral_u7;
-                }
+                fx_card_send_value(cell, neutral_u7);
+                s_fx_arc_anim[cell] = (float)neutral_u7;
             }
         }
     } else {
@@ -4033,6 +4467,19 @@ static void create_fx_screen(void) {
     lv_obj_set_style_text_color(title, RED808_ACCENT, 0);
     lv_obj_set_pos(title, 60, 10);
 
+    fx_pattern_lbl = lv_label_create(scr_fx);
+    lv_label_set_text_fmt(fx_pattern_lbl, "PAT P%03d", p4.current_pattern + 1);
+    lv_obj_set_size(fx_pattern_lbl, 112, 30);
+    lv_obj_set_pos(fx_pattern_lbl, 220, 8);
+    lv_obj_set_style_radius(fx_pattern_lbl, 8, 0);
+    lv_obj_set_style_bg_color(fx_pattern_lbl, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_opa(fx_pattern_lbl, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(fx_pattern_lbl, 1, 0);
+    lv_obj_set_style_border_color(fx_pattern_lbl, RED808_WARNING, 0);
+    lv_obj_set_style_text_color(fx_pattern_lbl, RED808_WARNING, 0);
+    lv_obj_set_style_text_font(fx_pattern_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(fx_pattern_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         // Card container
         lv_obj_t* card = lv_obj_create(scr_fx);
@@ -4062,6 +4509,7 @@ static void create_fx_screen(void) {
         // (see ON/OFF below). Otherwise the arc drag bubbled up into a card
         // click and silently muted the FX.
         lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        pod_register_owner_badge(card, fx_card_owner_function(cell));
 
         // FX Name — top center, neon style
         fx_name_labels[cell] = lv_label_create(card);
@@ -4212,6 +4660,75 @@ static void create_fx_screen(void) {
     fx_apply_layout();
 }
 
+static void fx_format_display_value(int cell, int u7, bool muted,
+                                    char* value, size_t valueSize,
+                                    char* unit, size_t unitSize) {
+    if (!value || valueSize == 0 || !unit || unitSize == 0) return;
+    value[0] = '\0';
+    unit[0] = '\0';
+    if (muted) {
+        snprintf(value, valueSize, "OFF");
+        return;
+    }
+
+    const float normalized = constrain(u7, 0, 127) / 127.0f;
+    switch (cell) {
+        case FX_CARD_FLANGE:
+        case FX_CARD_DELAY:
+        case FX_CARD_REVERB:
+        case FX_CARD_CRUSH:
+        case FX_CARD_PHASER:
+        case FX_CARD_DRIVE:
+            snprintf(value, valueSize, "%d", (int)(normalized * 100.0f + 0.5f));
+            snprintf(unit, unitSize, "%%");
+            break;
+        case FX_CARD_FOLD:
+            snprintf(value, valueSize, "%.1f", 1.0f + normalized * 9.0f);
+            snprintf(unit, unitSize, "GAIN");
+            break;
+        case FX_CARD_CUTOFF: {
+            const float hz = 20.0f * powf(1000.0f, normalized);
+            if (hz >= 1000.0f) {
+                snprintf(value, valueSize, "%.1f", hz / 1000.0f);
+                snprintf(unit, unitSize, "kHz");
+            } else {
+                snprintf(value, valueSize, "%d", (int)(hz + 0.5f));
+                snprintf(unit, unitSize, "Hz");
+            }
+            break;
+        }
+        case FX_CARD_RESO:
+            snprintf(value, valueSize, "%.1f", 0.7f + normalized * 19.3f);
+            snprintf(unit, unitSize, "Q");
+            break;
+        case FX_CARD_BITS:
+            snprintf(value, valueSize, "%d",
+                     constrain((int)(16.0f - normalized * 12.0f + 0.5f), 4, 16));
+            snprintf(unit, unitSize, "BIT");
+            break;
+        case FX_CARD_SRATE: {
+            const float hz = 42000.0f * powf(4000.0f / 42000.0f, normalized);
+            snprintf(value, valueSize, "%.1f", hz / 1000.0f);
+            snprintf(unit, unitSize, "kHz");
+            break;
+        }
+        case FX_CARD_FILTER: {
+            static const char* names[] = {
+                "OFF", "LOWPASS", "HIGHPASS", "BANDPASS", "NOTCH",
+                "ALLPASS", "PEAK", "LOW SHELF", "HIGH SHELF", "RESONANT",
+                "LADDER", "SVF LP", "SVF HP", "SVF BP", "COMB"
+            };
+            const int type = constrain((int)(normalized * 14.0f + 0.5f), 0, 14);
+            snprintf(value, valueSize, "%s", names[type]);
+            break;
+        }
+        default:
+            snprintf(value, valueSize, "%d", (int)(normalized * 100.0f + 0.5f));
+            snprintf(unit, unitSize, "%%");
+            break;
+    }
+}
+
 static void update_fx_screen(void) {
     static uint16_t prev_key[FX_CARD_COUNT];
     static bool prev_init = false;
@@ -4229,6 +4746,16 @@ static void update_fx_screen(void) {
     }
 
     uint32_t now = millis();
+
+    static int prev_fx_pattern = -1;
+    static lv_obj_t* prev_fx_pattern_lbl = NULL;
+    if(fx_pattern_lbl && (prev_fx_pattern != p4.current_pattern
+       || prev_fx_pattern_lbl != fx_pattern_lbl))
+    {
+        prev_fx_pattern = p4.current_pattern;
+        prev_fx_pattern_lbl = fx_pattern_lbl;
+        lv_label_set_text_fmt(fx_pattern_lbl, "PAT P%03d", p4.current_pattern + 1);
+    }
 
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         int val = fx_card_current_value_u7(cell);
@@ -4250,15 +4777,17 @@ static void update_fx_screen(void) {
 
         if (!still_animating && !key_changed) continue;
 
-        int pct = (int)((float)anim_val / 127.0f * 100.0f + 0.5f);
-
         s_fx_ui_syncing = true;
         if (fx_arcs[cell])
             lv_arc_set_value(fx_arcs[cell], anim_val);
         s_fx_ui_syncing = false;
 
-        if (fx_value_labels[cell])
-            lv_label_set_text_fmt(fx_value_labels[cell], "%d", pct);
+        char valueText[16] = {};
+        char unitText[8] = {};
+        fx_format_display_value(cell, anim_val, muted, valueText, sizeof(valueText),
+                                unitText, sizeof(unitText));
+        if (fx_value_labels[cell]) lv_label_set_text(fx_value_labels[cell], valueText);
+        if (fx_pct_labels[cell]) lv_label_set_text(fx_pct_labels[cell], unitText);
 
         // Expensive style ops only when the logical key changes (not every lerp tick)
         if (key_changed) {
@@ -4518,6 +5047,7 @@ static lv_obj_t* seq_status_step_lbl    = NULL; // bottom "STEP 05 / 16"
 static lv_obj_t* seq_status_pat_lbl     = NULL; // bottom "PATTERN 01"
 static lv_obj_t* seq_status_name_lbl    = NULL; // factory-bank name for active slot
 static lv_obj_t* seq_status_bpm_lbl     = NULL; // bottom "BPM 120.0"
+static lv_obj_t* seq_status_mix_lbl     = NULL; // bottom "M 02 · S 01"
 static int        seq_step_x[16]        = {};  // precomputed step column X
 
 static void seq_refresh_track_label(uint8_t track) {
@@ -4559,20 +5089,39 @@ static lv_obj_t*  seq_hdr_pat_lbl       = NULL;
 static lv_obj_t*  seq_hdr_name_lbl      = NULL;
 static lv_obj_t*  seq_hdr_queue_btn     = NULL;
 static lv_obj_t*  seq_hdr_queue_lbl     = NULL;
+static lv_obj_t*  seq_hdr_var_btn       = NULL;
+static lv_obj_t*  seq_variation_modal   = NULL;
 static lv_obj_t*  seq_hdr_mix_btn       = NULL;
 static lv_obj_t*  seq_hdr_mix_lbl       = NULL;
+static lv_obj_t*  seq_hdr_save_btn      = NULL;
+static lv_obj_t*  seq_hdr_save_lbl      = NULL;
 static lv_obj_t*  seq_hdr_group_btns[4] = {};
 static uint8_t    seq_hdr_group_state[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 static bool       seq_club_warm         = false;
 static lv_obj_t*  seq_pattern_list_modal = NULL;
+static bool       seq_pattern_list_save_mode = false;
+static lv_obj_t*  seq_save_confirm_modal = NULL;
+static int        seq_save_confirm_slot = -1;
+static bool       seq_pattern_dirty = false;
 static lv_obj_t*  seq_pattern_modal     = NULL;
 static lv_obj_t*  seq_pattern_modal_lbl = NULL;
 static lv_obj_t*  seq_pattern_modal_spin = NULL;
 static int        seq_pattern_wait_pat  = -1;
 static uint32_t   seq_pattern_wait_ms   = 0;
 static bool       seq_pattern_waiting   = false;
-static uint32_t   seq_pattern_payload_revision = 0;
-static uint32_t   seq_pattern_wait_base_revision = 0;
+
+static void seq_open_midi_library(void);
+
+static void seq_set_pattern_dirty(bool dirty) {
+    seq_pattern_dirty = dirty;
+    if (!seq_hdr_save_btn || !seq_hdr_save_lbl) return;
+    lv_label_set_text(seq_hdr_save_lbl,
+        dirty ? LV_SYMBOL_SAVE " SAVE*" : LV_SYMBOL_SAVE " SAVE");
+    lv_obj_set_style_bg_color(seq_hdr_save_btn,
+        dirty ? RED808_WARNING : RED808_SURFACE, 0);
+    lv_obj_set_style_border_color(seq_hdr_save_btn,
+        dirty ? RED808_ACCENT : RED808_SUCCESS, 0);
+}
 
 /* Slot remains authoritative; unknown slots are deliberately labeled generic
  * so an imported/user bank is never presented as the factory bank. */
@@ -4584,8 +5133,11 @@ static const char* seq_pattern_name(int pattern) {
         "ACID RUN UP", "ACID DORIAN FALL", "ACID OCTAVE", "TOM FILL", "SNARE LIFT",
         "FINAL TRANSCENDENCE"
     };
-    return (pattern >= 0 && pattern < (int)(sizeof(factory) / sizeof(factory[0])))
-        ? factory[pattern] : "USER / IMPORT";
+    if (pattern >= 0 && pattern < (int)(sizeof(factory) / sizeof(factory[0])))
+        return factory[pattern];
+    if (pattern >= 100)
+        return control_user_pattern_is_saved(pattern) ? "USER SAVED" : "USER EMPTY";
+    return "MEMORY / IMPORT";
 }
 
 void ui_pattern_queue_committed(int pattern) {
@@ -4628,24 +5180,126 @@ static void seq_launch_absolute_pattern(int pattern) {
         return;
     }
     seq_queued_pattern = -1;
-    p4.current_pattern = pattern;
-    ui_sequencer_sync_from_current_pattern();
     if (control_available() || control_engine_connected())
         seq_pattern_modal_show(pattern);
-    header_clear_track_isolation();
+    // Pattern selection is authoritative and synchronous in the P4 bank.
+    // Daisy receives the resident-slot upload inside this call, but there is
+    // no pattern_sync response packet to wait for.
     control_send_select_pattern(pattern);
-    control_send_get_pattern(pattern);
+    ui_sequencer_sync_from_current_pattern();
+    if (seq_pattern_modal) seq_pattern_modal_mark_loaded();
+}
+
+static void seq_save_confirm_hide(void) {
+    if (!seq_save_confirm_modal) return;
+    lv_obj_del(seq_save_confirm_modal);
+    seq_save_confirm_modal = NULL;
+    seq_save_confirm_slot = -1;
+}
+
+static void seq_save_user_pattern(int destination) {
+    const int source = p4.current_pattern;
+    const bool saved = control_save_user_pattern(source, destination);
+    seq_save_confirm_hide();
+    seq_pattern_list_hide();
+    if (!saved) {
+        ui_show_toast("No se pudo guardar el patron", RED808_ERROR);
+        return;
+    }
+    char message[64];
+    snprintf(message, sizeof(message), "P%03d guardado desde P%03d",
+             destination + 1, source + 1);
+    seq_set_pattern_dirty(false);
+    seq_launch_absolute_pattern(destination);
+    ui_show_toast(message, RED808_SUCCESS);
+}
+
+static void seq_save_confirm_cb(lv_event_t* e) {
+    const bool accept = (intptr_t)lv_event_get_user_data(e) != 0;
+    const int destination = seq_save_confirm_slot;
+    if (!accept) {
+        seq_save_confirm_hide();
+        return;
+    }
+    if (destination >= 100 && destination < Config::MAX_PATTERNS)
+        seq_save_user_pattern(destination);
+}
+
+static void seq_show_save_confirm(int destination) {
+    seq_save_confirm_hide();
+    seq_save_confirm_slot = destination;
+    seq_save_confirm_modal = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(seq_save_confirm_modal);
+    lv_obj_set_size(seq_save_confirm_modal, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(seq_save_confirm_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(seq_save_confirm_modal, LV_OPA_60, 0);
+    lv_obj_add_flag(seq_save_confirm_modal, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(seq_save_confirm_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* card = lv_obj_create(seq_save_confirm_modal);
+    lv_obj_set_size(card, 540, 220);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_WARNING, 0);
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text_fmt(title, "REEMPLAZAR P%03d?", destination + 1);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_WARNING, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+    lv_obj_t* copy = lv_label_create(card);
+    lv_label_set_text(copy,
+        "Ese slot de usuario ya contiene un patron.\nLa copia anterior sera sustituida.");
+    lv_obj_set_style_text_font(copy, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(copy, RED808_TEXT, 0);
+    lv_obj_set_style_text_align(copy, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(copy, LV_ALIGN_CENTER, 0, -10);
+
+    lv_obj_t* cancel = lv_btn_create(card);
+    lv_obj_set_size(cancel, 190, 48);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 18, -12);
+    apply_control_button_style(cancel, RED808_BORDER, false, 8);
+    lv_obj_add_event_cb(cancel, seq_save_confirm_cb, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)0);
+    lv_obj_t* cancelLabel = lv_label_create(cancel);
+    lv_label_set_text(cancelLabel, LV_SYMBOL_CLOSE "  CANCELAR");
+    lv_obj_center(cancelLabel);
+
+    lv_obj_t* replace = lv_btn_create(card);
+    lv_obj_set_size(replace, 260, 48);
+    lv_obj_align(replace, LV_ALIGN_BOTTOM_RIGHT, -18, -12);
+    apply_control_button_style(replace, RED808_WARNING, true, 8);
+    lv_obj_add_event_cb(replace, seq_save_confirm_cb, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)1);
+    lv_obj_t* replaceLabel = lv_label_create(replace);
+    lv_label_set_text(replaceLabel, LV_SYMBOL_SAVE "  REEMPLAZAR");
+    lv_obj_set_style_text_color(replaceLabel, RED808_BG, 0);
+    lv_obj_center(replaceLabel);
 }
 
 static void seq_pattern_list_pick_cb(lv_event_t* e) {
     const int pattern = (int)(intptr_t)lv_event_get_user_data(e);
+    if (seq_pattern_list_save_mode) {
+        if (control_user_pattern_is_saved(pattern)
+            && pattern != p4.current_pattern) {
+            seq_show_save_confirm(pattern);
+            return;
+        }
+        seq_save_user_pattern(pattern);
+        return;
+    }
     seq_pattern_list_hide();
     seq_launch_absolute_pattern(pattern);
 }
 
-static void seq_pattern_list_show(void) {
+static void seq_pattern_list_show_mode(bool saveMode) {
     seq_pattern_list_hide();
     if (!scr_sequencer) return;
+    seq_pattern_list_save_mode = saveMode;
     seq_pattern_list_modal = lv_obj_create(scr_sequencer);
     lv_obj_set_size(seq_pattern_list_modal, 850, 520);
     lv_obj_align(seq_pattern_list_modal, LV_ALIGN_CENTER, 0, 10);
@@ -4657,24 +5311,25 @@ static void seq_pattern_list_show(void) {
     lv_obj_clear_flag(seq_pattern_list_modal, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t* title = lv_label_create(seq_pattern_list_modal);
-    lv_label_set_text(title, "20 FACTORY · toque = Q 1 BAR");
+    lv_label_set_text(title, saveMode
+        ? "GUARDAR COPIA · P101-P128"
+        : "P1-P20 FACTORY · P101-P128 USER");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, RED808_ACCENT, 0);
     lv_obj_set_pos(title, 16, 10);
 
-    lv_obj_t* demo = lv_btn_create(seq_pattern_list_modal);
-    lv_obj_set_size(demo, 150, 38);
-    lv_obj_set_pos(demo, 620, 5);
-    apply_control_button_style(demo, RED808_WARNING, true, 8);
-    lv_obj_add_event_cb(demo, [](lv_event_t*) {
-        control_send_launch_demo_set();
-        seq_pattern_list_hide();
-        ui_show_toast("DEMO SET: 20 escenas, menos a mas", RED808_WARNING);
+    lv_obj_t* mode = lv_btn_create(seq_pattern_list_modal);
+    lv_obj_set_size(mode, 164, 38);
+    lv_obj_set_pos(mode, 600, 5);
+    apply_control_button_style(mode, saveMode ? RED808_BORDER : RED808_SUCCESS, true, 8);
+    lv_obj_add_event_cb(mode, [](lv_event_t*) {
+        const bool nextMode = !seq_pattern_list_save_mode;
+        seq_pattern_list_show_mode(nextMode);
     }, LV_EVENT_CLICKED, NULL);
-    lv_obj_t* dl = lv_label_create(demo);
-    lv_label_set_text(dl, "DEMO SET");
-    lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
-    lv_obj_center(dl);
+    lv_obj_t* modeLabel = lv_label_create(mode);
+    lv_label_set_text(modeLabel, saveMode ? LV_SYMBOL_LEFT "  LISTA" : LV_SYMBOL_SAVE "  SAVE USER");
+    lv_obj_set_style_text_font(modeLabel, &lv_font_montserrat_14, 0);
+    lv_obj_center(modeLabel);
 
     lv_obj_t* close = lv_btn_create(seq_pattern_list_modal);
     lv_obj_set_size(close, 42, 38);
@@ -4692,25 +5347,37 @@ static void seq_pattern_list_show(void) {
     lv_obj_set_style_bg_opa(list, LV_OPA_60, 0);
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_pad_all(list, 6, 0);
-    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
 
-    for (int p = 0; p < Config::MAX_PATTERNS; ++p) {
-        const int col = p & 1;
-        const int row = p >> 1;
+    const int firstPattern = saveMode ? 100 : 0;
+    for (int p = firstPattern; p < Config::MAX_PATTERNS; ++p) {
+        const int visibleIndex = p - firstPattern;
+        const int col = visibleIndex & 1;
+        const int row = visibleIndex >> 1;
         lv_obj_t* btn = lv_btn_create(list);
-        lv_obj_set_size(btn, 394, 39);
-        lv_obj_set_pos(btn, col * 402, row * 43);
+        lv_obj_set_size(btn, 394, 42);
+        lv_obj_set_pos(btn, col * 402, row * 46);
         const bool current = (p == p4.current_pattern);
-        apply_control_button_style(btn, current ? RED808_ACCENT : RED808_BORDER, current, 7);
+        const bool occupied = control_user_pattern_is_saved(p);
+        const lv_color_t slotColor = current ? RED808_ACCENT
+            : (saveMode ? (occupied ? RED808_WARNING : RED808_SUCCESS)
+                        : RED808_BORDER);
+        apply_control_button_style(btn, slotColor, current, 7);
         lv_obj_add_event_cb(btn, seq_pattern_list_pick_cb, LV_EVENT_CLICKED,
                             (void*)(intptr_t)p);
         lv_obj_t* label = lv_label_create(btn);
-        lv_label_set_text_fmt(label, "P%02d  %s", p + 1, seq_pattern_name(p));
+        lv_label_set_text_fmt(label, "P%03d  %s", p + 1, seq_pattern_name(p));
         lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(label, current ? lv_color_white() : RED808_TEXT, 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
     }
     lv_obj_move_foreground(seq_pattern_list_modal);
+}
+
+static void seq_pattern_list_show(void) {
+    seq_pattern_list_show_mode(false);
 }
 
 static uint16_t seq_group_mask(int group) {
@@ -4737,12 +5404,12 @@ static void seq_group_mute_cb(lv_event_t* e) {
     for (int t = 0; t < 16; ++t) {
         if (groupMask & (1u << t)) {
             p4.track_muted[t] = mute;
-            p4.track_solo[t] = false;
-            local_apply_message(MSG_TRACK, TRK_MUTE_BIT | (t & 0x0F), mute ? 1 : 0);
         }
         if (p4.track_muted[t]) fullMask |= (uint16_t)(1u << t);
     }
-    if (ui_control_available()) control_send_mute_mask(fullMask);
+    if (ui_control_available()) enqueue_mute_mask_control(fullMask);
+    ui_show_toast(mute ? "Grupo en MUTE" : "Grupo activo",
+                  mute ? RED808_ERROR : RED808_SUCCESS);
 }
 
 static void seq_fill_cb(lv_event_t* /*e*/) {
@@ -4754,13 +5421,169 @@ static void seq_fill_cb(lv_event_t* /*e*/) {
     ui_show_toast("FILL: 1 compas + retorno", RED808_ACCENT);
 }
 
-static void seq_var_cb(lv_event_t* /*e*/) {
-    if (!p4.is_playing) {
-        ui_show_toast("VAR necesita PLAY", RED808_WARNING);
+struct SequencerVariationOption {
+    uint8_t id;
+    const char* name;
+    const char* detail;
+};
+
+static const SequencerVariationOption SEQ_VARIATION_OPTIONS[] = {
+    {SEQ_VAR_NEON_BREAK,    "NEON BREAK",    "Corte sincopado y remate final"},
+    {SEQ_VAR_RATCHET_STORM, "RATCHET STORM", "Hi-hats en rafagas 2x / 4x"},
+    {SEQ_VAR_GHOST_GROOVE,  "GHOST GROOVE",  "Golpes fantasma con probabilidad"},
+    {SEQ_VAR_POLYRHYTHM,    "POLYRHYTHM 3x5", "Capas cruzadas 3, 5 y 7"},
+    {SEQ_VAR_HALF_TIME,     "HALF-TIME DROP", "Peso en mitad de tiempo"},
+    {SEQ_VAR_MIRROR,        "MIRROR BEAT",    "Invierte el pulso del compas"},
+    {SEQ_VAR_TOM_CASCADE,   "TOM CASCADE",    "Descenso de toms al cierre"},
+    {SEQ_VAR_ACID_SWITCH,   "ACID SWITCH",    "Secuencia acida en pistas synth"},
+    {SEQ_VAR_HAT_LIFT,      "HAT LIFT",       "Subida de hats con ratchets"},
+    {SEQ_VAR_SPARSE_SPACE,  "SPARSE SPACE",   "Abre huecos sin perder el kick"},
+    {SEQ_VAR_UNDO,          "UNDO LAST VAR",  "Restaura el estado anterior"},
+};
+
+static void seq_variation_modal_hide(lv_event_t* e = NULL) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (seq_variation_modal) lv_obj_del(seq_variation_modal);
+    seq_variation_modal = NULL;
+}
+
+static void seq_variation_select_cb(lv_event_t* e) {
+    static uint32_t lastApplyMs = 0;
+    const uint32_t now = millis();
+    if (lastApplyMs != 0 && now - lastApplyMs < 180u) return;
+    lastApplyMs = now;
+
+    const uint8_t selected = static_cast<uint8_t>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    if (selected < SEQ_VAR_NEON_BREAK || selected > SEQ_VAR_UNDO) return;
+    if (selected == SEQ_VAR_UNDO && !control_variation_can_undo()) {
+        ui_show_toast("No hay una variacion anterior para restaurar",
+                      RED808_WARNING);
         return;
     }
-    control_send_variation();
-    ui_show_toast("VAR 808/505 segura", RED808_CYAN);
+
+    const bool changed = control_apply_sequencer_variation(selected);
+    if (!changed) {
+        ui_show_toast("La variacion no cambia este patron", RED808_WARNING);
+        return;
+    }
+
+    const int base = seq_page * 16;
+    for (int track = 0; track < 16; ++track)
+        for (int step = 0; step < 16; ++step)
+            if (base + step < 64)
+                seq_raw_grid[track][base + step] = p4.steps[track][step];
+    seq_force_refresh_cells = true;
+    seq_set_pattern_dirty(true);
+
+    // Never perform a multi-packet upload from the LVGL callback. The loop
+    // drains this flag and sends one coherent pattern snapshot to Daisy.
+    s_ctrl_pattern_sync_pending.store(true, std::memory_order_release);
+    const char* feedback = "VAR APLICADA";
+    for (const auto& option : SEQ_VARIATION_OPTIONS)
+        if (option.id == selected) { feedback = option.name; break; }
+    seq_variation_modal_hide();
+    ui_show_toast(feedback,
+                  selected == SEQ_VAR_UNDO ? RED808_SUCCESS : RED808_CYAN);
+}
+
+static void seq_variation_modal_show(lv_event_t* /*e*/) {
+    if (seq_variation_modal) return;
+
+    seq_variation_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(seq_variation_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(seq_variation_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(seq_variation_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(seq_variation_modal, 0, 0);
+    lv_obj_set_style_pad_all(seq_variation_modal, 0, 0);
+    lv_obj_clear_flag(seq_variation_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(seq_variation_modal, seq_variation_modal_hide,
+                        LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(seq_variation_modal);
+    lv_obj_set_size(card, 950, 540);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "VARIATIONS  /  PATTERN TRANSFORM");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 24, 18);
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "Aplica sobre el patron actual. UNDO recupera la ultima version.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(hint, 24, 50);
+
+    lv_obj_t* close = lv_btn_create(card);
+    lv_obj_set_size(close, 92, 38);
+    lv_obj_set_pos(close, 834, 16);
+    apply_control_button_style(close, RED808_WARNING, false, 9);
+    lv_obj_add_event_cb(close, [](lv_event_t*) { seq_variation_modal_hide(); },
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLabel = lv_label_create(close);
+    lv_label_set_text(closeLabel, "CANCEL");
+    lv_obj_set_style_text_font(closeLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(closeLabel);
+
+    constexpr int columns = 4;
+    constexpr int buttonWidth = 216;
+    constexpr int buttonHeight = 116;
+    constexpr int gapX = 10;
+    constexpr int gapY = 12;
+    const bool canUndo = control_variation_can_undo();
+    for (size_t index = 0;
+         index < sizeof(SEQ_VARIATION_OPTIONS) / sizeof(SEQ_VARIATION_OPTIONS[0]);
+         ++index) {
+        const auto& option = SEQ_VARIATION_OPTIONS[index];
+        const bool undoDisabled = option.id == SEQ_VAR_UNDO && !canUndo;
+        const int column = static_cast<int>(index % columns);
+        const int row = static_cast<int>(index / columns);
+        lv_obj_t* button = lv_btn_create(card);
+        lv_obj_set_size(button, buttonWidth, buttonHeight);
+        lv_obj_set_pos(button, 24 + column * (buttonWidth + gapX),
+                       88 + row * (buttonHeight + gapY));
+        apply_control_button_style(button,
+            option.id == SEQ_VAR_UNDO ? RED808_SUCCESS : RED808_ACCENT2,
+            false, 12);
+        lv_obj_set_style_bg_color(button, RED808_SURFACE, 0);
+
+        lv_obj_t* name = lv_label_create(button);
+        lv_label_set_text(name, option.name);
+        lv_obj_set_width(name, buttonWidth - 20);
+        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name, RED808_TEXT, 0);
+        lv_obj_align(name, LV_ALIGN_CENTER, 0, -15);
+
+        lv_obj_t* detail = lv_label_create(button);
+        lv_label_set_text(detail, undoDisabled ? "Nada que restaurar" : option.detail);
+        lv_obj_set_width(detail, buttonWidth - 18);
+        lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(detail, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(detail, RED808_TEXT_DIM, 0);
+        lv_obj_align(detail, LV_ALIGN_CENTER, 0, 17);
+
+        if (undoDisabled) {
+            lv_obj_add_state(button, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_opa(button, LV_OPA_30, LV_STATE_DISABLED);
+            lv_obj_set_style_border_color(button, RED808_BORDER,
+                                          LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_event_cb(button, seq_variation_select_cb,
+                                LV_EVENT_CLICKED,
+                                reinterpret_cast<void*>(
+                                    static_cast<uintptr_t>(option.id)));
+        }
+    }
 }
 
 static void seq_build4_cb(lv_event_t* /*e*/) {
@@ -4815,7 +5638,6 @@ static void seq_pattern_modal_hide(void) {
     seq_pattern_wait_pat = -1;
     seq_pattern_wait_ms = 0;
     seq_pattern_waiting = false;
-    seq_pattern_wait_base_revision = 0;
 }
 
 static void seq_pattern_modal_show(int pattern) {
@@ -4848,7 +5670,7 @@ static void seq_pattern_modal_show(int pattern) {
     lv_obj_align(t, LV_ALIGN_TOP_LEFT, 50, 8);
 
     seq_pattern_modal_lbl = lv_label_create(seq_pattern_modal);
-    lv_label_set_text(seq_pattern_modal_lbl, "Esperando pattern_sync...");
+    lv_label_set_text(seq_pattern_modal_lbl, "Leyendo banco local P4...");
     lv_obj_set_style_text_font(seq_pattern_modal_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(seq_pattern_modal_lbl, RED808_TEXT_DIM, 0);
     lv_obj_align(seq_pattern_modal_lbl, LV_ALIGN_TOP_LEFT, 50, 40);
@@ -4856,7 +5678,6 @@ static void seq_pattern_modal_show(int pattern) {
     seq_pattern_wait_pat = pattern;
     seq_pattern_wait_ms = millis();
     seq_pattern_waiting = true;
-    seq_pattern_wait_base_revision = seq_pattern_payload_revision;
 }
 
 static void seq_pattern_modal_mark_loaded(void) {
@@ -4865,12 +5686,13 @@ static void seq_pattern_modal_mark_loaded(void) {
         lv_obj_add_flag(seq_pattern_modal_spin, LV_OBJ_FLAG_HIDDEN);
     }
     if (seq_pattern_modal_lbl) {
-        lv_label_set_text(seq_pattern_modal_lbl, "Pattern cargado");
+        lv_label_set_text(seq_pattern_modal_lbl,
+            ui_control_available() ? "P4 cargado / sync USB enviada"
+                                   : "Pattern cargado en P4");
         lv_obj_set_style_text_color(seq_pattern_modal_lbl, RED808_SUCCESS, 0);
     }
     lv_obj_set_style_border_color(seq_pattern_modal, RED808_SUCCESS, 0);
     seq_pattern_waiting = false;
-    seq_pattern_wait_base_revision = 0;
     seq_pattern_wait_ms = millis();
 }
 
@@ -4899,12 +5721,13 @@ static void seq_step_cb(lv_event_t* e) {
     if (track < 16 && step < 16) {
         bool next = !p4.steps[track][step];
         p4.steps[track][step] = next;
-        if (ui_control_available()) control_send_set_step(track, step, next);
-        // Push updated pattern to S3 (so S3 pad-sync sees the change)
-        local_push_pattern(p4.current_pattern, p4.steps);
+        // Always update the resident P4 pattern so SAVE works offline too;
+        // the transport safely drops the packet when Daisy is unavailable.
+        control_send_set_step(track, step, next);
         // Mirror into raw multi-bar grid so manual edits persist across pages.
         int idx = seq_page * 16 + step;
         if (idx < 64) seq_raw_grid[track][idx] = next;
+        seq_set_pattern_dirty(true);
     }
 }
 
@@ -4935,15 +5758,8 @@ static void seq_mute_cb(lv_event_t* e) {
                  track + 1, next ? "ON" : "OFF");
         ui_show_toast(tb, next ? RED808_ERROR : RED808_SUCCESS);
         if (ui_control_available()) enqueue_mute_control((uint8_t)track, next);
-        // Relay mute to S3 so the sequencer trigger engine honors it.
-        local_apply_message(MSG_TRACK, TRK_MUTE_BIT | (track & 0x0F), next ? 1 : 0);
     }
 }
-
-// Saved mute state before a solo was engaged — restored on un-solo so the
-// user's prior mute selections aren't lost.
-static bool seq_saved_mute[16] = {};
-static bool seq_solo_engaged   = false;
 
 static void seq_solo_cb(lv_event_t* e) {
     int track = (int)(intptr_t)lv_event_get_user_data(e);
@@ -4969,45 +5785,12 @@ static void seq_solo_cb(lv_event_t* e) {
              track + 1, wasSolo ? "OFF" : "ON");
     ui_show_toast(toastBuf, wasSolo ? RED808_BORDER : RED808_ACCENT);
 
-    if (wasSolo) {
-        // Un-solo: clear solo flag and UNMUTE ALL tracks so the user can
-        // hear the full pattern again with one tap. (Previous behaviour
-        // restored a "saved" mute state, but the master used to auto-mute
-        // tracks on engine assignment, leaving phantom mutes after solo.)
-        p4.track_solo[track] = false;
-        seq_solo_engaged = false;
-        for (int t = 0; t < 16; t++) {
-            p4.track_muted[t] = false;
-            seq_saved_mute[t] = false;
-            local_apply_message(MSG_TRACK, TRK_MUTE_BIT | (t & 0x0F), 0);
-        }
-        // Single binary command — no flicker from partial state changes.
-        if (ui_control_available()) {
-            enqueue_mute_mask_control(0);
-            enqueue_solo_mask_control(0);
-        }
-    } else {
-        // Engage solo: if first time, remember current mute state.
-        if (!seq_solo_engaged) {
-            for (int t = 0; t < 16; t++) seq_saved_mute[t] = p4.track_muted[t];
-            seq_solo_engaged = true;
-        }
-        // Exclusive: clear other solos, mute all non-solo tracks.
-        for (int i = 0; i < 16; i++) p4.track_solo[i] = false;
-        p4.track_solo[track] = true;
-        uint16_t muteMask = 0;
-        for (int t = 0; t < 16; t++) {
-            bool shouldMute = (t != track);
-            p4.track_muted[t] = shouldMute;
-            if (shouldMute) muteMask |= (1u << t);
-            local_apply_message(MSG_TRACK, TRK_MUTE_BIT | (t & 0x0F),
-                            shouldMute ? 1 : 0);
-        }
-        if (ui_control_available()) {
-            enqueue_mute_mask_control(muteMask);
-            enqueue_solo_mask_control((uint16_t)(1u << track));
-        }
-    }
+    // Solo is an independent mixer layer. It must never rewrite the user's
+    // mute selection: Daisy already applies trackSolo after trackMute.
+    const uint16_t soloMask = wasSolo ? 0u : (uint16_t)(1u << track);
+    for (int t = 0; t < 16; ++t)
+        p4.track_solo[t] = (soloMask & (1u << t)) != 0;
+    if (ui_control_available()) enqueue_solo_mask_control(soloMask);
 }
 
 // ── Pagination helpers ─────────────────────────────────────────────────────
@@ -5023,12 +5806,13 @@ static void seq_copy_page_to_p4(int page) {
         for (int s = 0; s < 16; s++)
             p4.steps[t][s] = seq_raw_grid[t][base + s];
     seq_page = page;
-    // Page changes cannot be applied atomically by the current Master
-    // protocol. Stop first; the deferred push resumes playback only after the
-    // complete 16-step snapshot has been transmitted.
-    if (p4.is_playing && ui_control_available()) control_send_stop();
+    // Page changes replace a complete 16-step snapshot. Pause while uploading
+    // it, then restore the prior transport state.
+    const bool resume = p4.is_playing && ui_control_available();
+    if (resume) control_send_stop();
     local_stage_pattern((uint8_t)p4.current_pattern, p4.steps);
-    local_push_pattern(p4.current_pattern, p4.steps);
+    if (resume) control_send_start();
+    seq_set_pattern_dirty(true);
 }
 
 // Refresh page button highlighting + enable/disable based on seq_raw_len.
@@ -5074,8 +5858,13 @@ static void seq_install_raw_and_show_page0(int raw_len) {
 void ui_sequencer_sync_from_current_pattern(void) {
     seq_raw_len = 16;
     seq_page = 0;
+    for (int t = 0; t < 16; ++t) {
+        for (int s = 0; s < 16; ++s) seq_raw_grid[t][s] = p4.steps[t][s];
+        for (int s = 16; s < 64; ++s) seq_raw_grid[t][s] = false;
+    }
     seq_force_refresh_cells = true;
     seq_page_styles_dirty = true;
+    seq_pattern_dirty = false;
 }
 
 void ui_sequencer_load_external_pattern(const bool steps[16][64], int raw_len) {
@@ -5091,7 +5880,7 @@ void ui_sequencer_load_external_pattern(const bool steps[16][64], int raw_len) {
     }
     seq_force_refresh_cells = true;  // force full cell repaint — prev_cell_key may be stale
     seq_page_styles_dirty = true;
-    seq_pattern_payload_revision++;
+    seq_pattern_dirty = true;
 }
 
 static void create_sequencer_screen(void) {
@@ -5115,6 +5904,7 @@ static void create_sequencer_screen(void) {
         lv_obj_set_style_bg_color(seq_hdr_play_btn,
             p4.is_playing ? RED808_SUCCESS : RED808_ACCENT, 0);
         lv_obj_add_event_cb(seq_hdr_play_btn, header_play_cb, LV_EVENT_CLICKED, NULL);
+        pod_register_owner_badge(seq_hdr_play_btn, POD_FUNC_PLAY_TOGGLE);
         seq_hdr_play_lbl = lv_label_create(seq_hdr_play_btn);
         lv_label_set_text(seq_hdr_play_lbl, p4.is_playing ? "PAUSE" : "PLAY");
         lv_obj_set_style_text_font(seq_hdr_play_lbl, &lv_font_montserrat_16, 0);
@@ -5128,6 +5918,7 @@ static void create_sequencer_screen(void) {
         lv_obj_set_pos(pm, hx, HY);
         apply_control_button_style(pm, RED808_WARNING, false, 8);
         lv_obj_add_event_cb(pm, header_pattern_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
+        pod_register_owner_badge(pm, POD_FUNC_PATTERN_PREV);
         lv_obj_t* pml = lv_label_create(pm);
         lv_label_set_text(pml, LV_SYMBOL_MINUS);
         lv_obj_set_style_text_font(pml, &lv_font_montserrat_16, 0);
@@ -5162,6 +5953,7 @@ static void create_sequencer_screen(void) {
         lv_obj_set_pos(pp, hx, HY);
         apply_control_button_style(pp, RED808_WARNING, false, 8);
         lv_obj_add_event_cb(pp, header_pattern_cb, LV_EVENT_CLICKED, (void*)(intptr_t)1);
+        pod_register_owner_badge(pp, POD_FUNC_PATTERN_NEXT);
         lv_obj_t* ppl = lv_label_create(pp);
         lv_label_set_text(ppl, LV_SYMBOL_PLUS);
         lv_obj_set_style_text_font(ppl, &lv_font_montserrat_16, 0);
@@ -5195,8 +5987,8 @@ static void create_sequencer_screen(void) {
             lv_obj_set_style_bg_color(seq_hdr_queue_btn, RED808_ERROR, 0);
             lv_obj_set_style_border_color(seq_hdr_queue_btn, RED808_WARNING, 0);
         }
-        makeHeaderButton(50, "FILL", RED808_ACCENT, seq_fill_cb);
-        makeHeaderButton(44, "VAR", RED808_CYAN, seq_var_cb);
+        seq_hdr_var_btn = makeHeaderButton(64, "VAR", RED808_CYAN,
+                                           seq_variation_modal_show);
 
         static const char* const groupNames[4] = {"DRUMS", "BASS", "SYNTH", "XTRA"};
         for (int g = 0; g < 4; ++g) {
@@ -5211,9 +6003,15 @@ static void create_sequencer_screen(void) {
         seq_hdr_mix_btn = makeHeaderButton(88, seq_club_warm ? "CLUB WARM" : "DRY",
                                            RED808_WARNING, seq_mix_preset_cb);
         seq_hdr_mix_lbl = lv_obj_get_child(seq_hdr_mix_btn, 0);
-        makeHeaderButton(50, "LIST", RED808_ACCENT, [](lv_event_t*) { seq_pattern_list_show(); });
-        makeHeaderButton(58, "BUILD 4", RED808_WARNING, seq_build4_cb);
-        makeHeaderButton(48, "DROP", RED808_ACCENT, seq_drop_cb);
+        makeHeaderButton(52, "LIST", RED808_ACCENT,
+            [](lv_event_t*) { seq_pattern_list_show(); });
+        makeHeaderButton(56, LV_SYMBOL_DOWNLOAD " MIDI", RED808_CYAN,
+            [](lv_event_t*) { seq_open_midi_library(); });
+        seq_hdr_save_btn = makeHeaderButton(68, LV_SYMBOL_SAVE " SAVE",
+            RED808_SUCCESS,
+            [](lv_event_t*) { seq_pattern_list_show_mode(true); });
+        seq_hdr_save_lbl = lv_obj_get_child(seq_hdr_save_btn, 0);
+        seq_set_pattern_dirty(seq_pattern_dirty);
     }
 
     // ── Precompute step X positions ──
@@ -5432,11 +6230,21 @@ static void create_sequencer_screen(void) {
         lv_obj_set_style_text_align(seq_status_step_lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_pos(seq_status_step_lbl, 500, SEQ_STATUS_Y + 2);
 
+        seq_status_mix_lbl = lv_label_create(scr_sequencer);
+        lv_label_set_text(seq_status_mix_lbl, "M 00  S 00");
+        lv_obj_set_style_text_font(seq_status_mix_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(seq_status_mix_lbl, RED808_TEXT_DIM, 0);
+        lv_obj_set_width(seq_status_mix_lbl, 160);
+        lv_obj_set_style_text_align(seq_status_mix_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(seq_status_mix_lbl, 635, SEQ_STATUS_Y + 2);
+
         lv_obj_t* bpm_lbl = lv_label_create(scr_sequencer);
         lv_label_set_text_fmt(bpm_lbl, "BPM %d.%d", p4.bpm_int, p4.bpm_frac);
         lv_obj_set_style_text_font(bpm_lbl, &lv_font_montserrat_10, 0);
         lv_obj_set_style_text_color(bpm_lbl, RED808_INFO, 0);
-        lv_obj_set_pos(bpm_lbl, LCD_H_RES - 90, SEQ_STATUS_Y + 2);
+        lv_obj_set_width(bpm_lbl, 205);
+        lv_obj_set_style_text_align(bpm_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_pos(bpm_lbl, LCD_H_RES - 215, SEQ_STATUS_Y + 2);
         seq_status_bpm_lbl = bpm_lbl;
     }
 
@@ -5447,50 +6255,29 @@ static void update_sequencer_screen(void) {
     bool playing = p4.is_playing;
     unsigned long now = millis();
 
-    // Pattern loading modal lifecycle: waiting -> loaded or timeout.
+    // Pattern loading modal lifecycle. P4 owns the bank, so completion is the
+    // actual selected local slot. Daisy sync is an outbound upload and has no
+    // pattern_sync response packet.
     if (seq_pattern_modal) {
         if (seq_pattern_waiting) {
-            if (seq_pattern_payload_revision != seq_pattern_wait_base_revision) {
+            if (p4.current_pattern == seq_pattern_wait_pat) {
                 seq_pattern_modal_mark_loaded();
-            } else if ((now - seq_pattern_wait_ms) > 3500) {
+            } else if ((now - seq_pattern_wait_ms) > 1000) {
                 if (seq_pattern_modal_spin) {
                     lv_obj_add_flag(seq_pattern_modal_spin, LV_OBJ_FLAG_HIDDEN);
                 }
                 if (seq_pattern_modal_lbl) {
-                    lv_label_set_text(seq_pattern_modal_lbl, "Timeout: no llego pattern_sync");
+                    lv_label_set_text(seq_pattern_modal_lbl,
+                        "No se pudo seleccionar el slot P4");
                     lv_obj_set_style_text_color(seq_pattern_modal_lbl, RED808_ERROR, 0);
                 }
                 lv_obj_set_style_border_color(seq_pattern_modal, RED808_ERROR, 0);
                 seq_pattern_waiting = false;
                 seq_pattern_wait_ms = now;
-                seq_pattern_wait_base_revision = 0;
             }
         } else if ((now - seq_pattern_wait_ms) > 700) {
             seq_pattern_modal_hide();
         }
-    }
-
-    // Recovery probe: re-request current pattern only when we changed
-    // pattern locally and have not yet received a payload for it. This
-    // avoids hammering the master when the new pattern is genuinely empty.
-    // Capped: a master that never answers (empty slot, no echo) would
-    // otherwise be probed at 2 Hz for as long as this screen stays open.
-    static unsigned long last_probe_ms      = 0;
-    static int           last_probe_pattern = -1;
-    static uint32_t      last_probe_rev     = 0;
-    static int           probe_attempts     = 0;
-    if (last_probe_pattern != p4.current_pattern) {
-        last_probe_pattern = p4.current_pattern;
-        last_probe_rev     = seq_pattern_payload_revision;
-        last_probe_ms      = now - 400;  // probe almost immediately
-        probe_attempts     = 0;
-    }
-    if (seq_pattern_payload_revision == last_probe_rev &&
-        probe_attempts < 6 &&
-        (now - last_probe_ms >= 500)) {
-        last_probe_ms = now;
-        probe_attempts++;
-        control_send_get_pattern(p4.current_pattern);
     }
 
     // ── Dirty tracking state (persistent across calls) ──
@@ -5559,11 +6346,52 @@ static void update_sequencer_screen(void) {
         if (seq_status_name_lbl) lv_label_set_text(seq_status_name_lbl, seq_pattern_name(p4.current_pattern));
     }
     static int prev_stp_bpm_int = -1, prev_stp_bpm_frac = -1;
+    static int prev_stp_original_bpm = -1;
+    static lv_obj_t* prev_stp_bpm_lbl = NULL;
     if (seq_status_bpm_lbl &&
-            (p4.bpm_int != prev_stp_bpm_int || p4.bpm_frac != prev_stp_bpm_frac)) {
+            (p4.bpm_int != prev_stp_bpm_int || p4.bpm_frac != prev_stp_bpm_frac
+             || p4.original_bpm_x10 != prev_stp_original_bpm
+             || seq_status_bpm_lbl != prev_stp_bpm_lbl)) {
         prev_stp_bpm_int  = p4.bpm_int;
         prev_stp_bpm_frac = p4.bpm_frac;
-        lv_label_set_text_fmt(seq_status_bpm_lbl, "BPM %d.%d", p4.bpm_int, p4.bpm_frac);
+        prev_stp_original_bpm = p4.original_bpm_x10;
+        prev_stp_bpm_lbl = seq_status_bpm_lbl;
+        const int current_x10 = p4.bpm_int * 10 + p4.bpm_frac;
+        const int delta_x10 = current_x10 - p4.original_bpm_x10;
+        if (p4.original_bpm_x10 > 0 && delta_x10 != 0) {
+            const char* direction = delta_x10 > 0 ? "FAST" : "SLOW";
+            lv_label_set_text_fmt(seq_status_bpm_lbl,
+                "BPM %d.%d  %s %+.1f / ORIG %.1f",
+                p4.bpm_int, p4.bpm_frac, direction,
+                delta_x10 / 10.0f, p4.original_bpm_x10 / 10.0f);
+            lv_obj_set_style_text_color(seq_status_bpm_lbl,
+                delta_x10 > 0 ? RED808_WARNING : RED808_INFO, 0);
+        } else {
+            lv_label_set_text_fmt(seq_status_bpm_lbl,
+                "BPM %d.%d", p4.bpm_int, p4.bpm_frac);
+            lv_obj_set_style_text_color(seq_status_bpm_lbl, RED808_INFO, 0);
+        }
+    }
+
+    static uint16_t prev_status_mute_mask = 0xFFFFu;
+    static uint16_t prev_status_solo_mask = 0xFFFFu;
+    uint16_t statusMuteMask = 0;
+    uint16_t statusSoloMask = 0;
+    for (int t = 0; t < 16; ++t) {
+        if (p4.track_muted[t]) statusMuteMask |= (uint16_t)(1u << t);
+        if (p4.track_solo[t]) statusSoloMask |= (uint16_t)(1u << t);
+    }
+    if (seq_status_mix_lbl &&
+        (statusMuteMask != prev_status_mute_mask
+         || statusSoloMask != prev_status_solo_mask)) {
+        prev_status_mute_mask = statusMuteMask;
+        prev_status_solo_mask = statusSoloMask;
+        lv_label_set_text_fmt(seq_status_mix_lbl, "M %02u  S %02u",
+            (unsigned)__builtin_popcount((unsigned)statusMuteMask),
+            (unsigned)__builtin_popcount((unsigned)statusSoloMask));
+        lv_obj_set_style_text_color(seq_status_mix_lbl,
+            statusSoloMask ? RED808_WARNING
+                           : (statusMuteMask ? RED808_ERROR : RED808_TEXT_DIM), 0);
     }
 
     // ── Sequencer header play/pause + pattern — only when changed ──
@@ -5596,6 +6424,12 @@ static void update_sequencer_screen(void) {
         else
             lv_label_set_text(seq_hdr_queue_lbl, "Q 1 BAR");
     }
+    static int8_t prev_hdr_dirty = -1;
+    if (seq_hdr_save_btn && seq_hdr_save_lbl
+        && prev_hdr_dirty != (seq_pattern_dirty ? 1 : 0)) {
+        prev_hdr_dirty = seq_pattern_dirty ? 1 : 0;
+        seq_set_pattern_dirty(seq_pattern_dirty);
+    }
 
     for (int g = 0; g < 4; ++g) {
         const uint16_t mask = seq_group_mask(g);
@@ -5617,10 +6451,14 @@ static void update_sequencer_screen(void) {
     // During playback the cursor column changes every step (16 cells update).
     // Static patterns: only toggled cells update (1 cell per tap).
     // This reduces 1280 style-calls/frame → ~2-32 calls/frame typical.
+    bool anySolo = false;
+    for (int t = 0; t < 16; ++t) anySolo |= p4.track_solo[t];
     for (int t = 0; t < 16; t++) {
         bool muted  = p4.track_muted[t];
         bool soloed = p4.track_solo[t];
-        uint8_t trk_key = (uint8_t)((soloed ? 2 : 0) | (muted ? 1 : 0));
+        bool isolated = anySolo && !soloed;
+        uint8_t trk_key = (uint8_t)((isolated ? 4 : 0) | (soloed ? 2 : 0)
+                                    | (muted ? 1 : 0));
         lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[t]);
 
         if (trk_key != prev_trk_key[t]) {
@@ -5631,6 +6469,10 @@ static void update_sequencer_screen(void) {
                     lv_obj_set_style_bg_color(seq_mute_btns[t], RED808_ERROR, 0);
                     lv_obj_set_style_bg_opa(seq_mute_btns[t], LV_OPA_90, 0);
                     lv_obj_set_style_border_color(seq_mute_btns[t], RED808_ERROR, 0);
+                } else if (isolated) {
+                    lv_obj_set_style_bg_color(seq_mute_btns[t], RED808_SURFACE, 0);
+                    lv_obj_set_style_bg_opa(seq_mute_btns[t], LV_OPA_30, 0);
+                    lv_obj_set_style_border_color(seq_mute_btns[t], RED808_TEXT_DIM, 0);
                 } else {
                     lv_obj_set_style_bg_color(seq_mute_btns[t], RED808_SURFACE, 0);
                     lv_obj_set_style_bg_opa(seq_mute_btns[t], LV_OPA_50, 0);
@@ -5639,7 +6481,7 @@ static void update_sequencer_screen(void) {
             }
             if (seq_track_labels[t]) {
                 lv_obj_set_style_text_color(seq_track_labels[t],
-                    muted ? lv_color_white() : tc, 0);
+                    muted ? lv_color_white() : (isolated ? RED808_TEXT_DIM : tc), 0);
             }
             if (seq_solo_btns[t]) {
                 lv_obj_set_style_bg_color(seq_solo_btns[t], soloed ? tc : RED808_SURFACE, 0);
@@ -5659,8 +6501,10 @@ static void update_sequencer_screen(void) {
         for (int s = 0; s < 16; s++) {
             if (!seq_step_btns[t][s]) continue;
             bool active = p4.steps[t][s];
-            bool is_cur = !muted && playing && (step == s);
-            uint8_t cell_key = (uint8_t)((active ? 4 : 0) | (is_cur ? 2 : 0) | (muted ? 1 : 0));
+            bool silenced = muted || isolated;
+            bool is_cur = !silenced && playing && (step == s);
+            uint8_t cell_key = (uint8_t)((isolated ? 8 : 0) | (active ? 4 : 0)
+                                         | (is_cur ? 2 : 0) | (muted ? 1 : 0));
             if (cell_key == prev_cell_key[t][s]) continue;
             prev_cell_key[t][s] = cell_key;
 
@@ -5681,9 +6525,9 @@ static void update_sequencer_screen(void) {
                 shadow_w = 0;
             } else if (active) {
                 bg = tc;
-                opa = muted ? LV_OPA_20 : LV_OPA_80;
+                opa = silenced ? LV_OPA_20 : LV_OPA_80;
                 border = tc;
-                shadow_w = muted ? 0 : 8;
+                shadow_w = silenced ? 0 : 8;
             } else {
                 bg = RED808_SURFACE;
                 opa = LV_OPA_40;
@@ -5732,6 +6576,18 @@ static void mix_global_slider_cb(lv_event_t* e) {
                         lv_event_get_code(e) == LV_EVENT_PRESS_LOST);
     bool transmit = final_value || last_tx_ms[which & 3] == 0 ||
                     (uint32_t)(now - last_tx_ms[which & 3]) >= 30;
+    const uint8_t functions[4] = {
+        POD_FUNC_MASTER_VOLUME, POD_FUNC_SEQ_VOLUME,
+        POD_FUNC_LIVE_VOLUME, POD_FUNC_TEMPO
+    };
+    if (which >= 0 && which < 4
+        && i2c_rotaries_owns_function(functions[which])) {
+        const int canonical[4] = {
+            p4.master_volume, p4.seq_volume, p4.live_volume, p4.bpm_int
+        };
+        lv_slider_set_value(slider, canonical[which], LV_ANIM_OFF);
+        return;
+    }
     switch (which) {
         case 0:
             p4.master_volume = val;
@@ -6195,6 +7051,7 @@ static void create_volumes_screen(void) {
         lv_obj_set_style_text_font(mlbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(mlbl, lv_color_white(), 0);
         lv_obj_center(mlbl);
+
     }
 }
 
@@ -6212,7 +7069,9 @@ static void update_volumes_screen(void) {
         prev_init = false;
         prev_master = -1;
         prev_bpm = -1;
-        for (int i = 0; i < 16; i++) prev_volume[i] = -1;
+        for (int i = 0; i < 16; i++) {
+            prev_volume[i] = -1;
+        }
     }
 
     if (mix_master_slider && p4.master_volume != prev_master) {
@@ -6271,17 +7130,21 @@ static void update_volumes_screen(void) {
     // compases laten igual que el resto de pantallas sincronizadas por pads.
     static uint8_t beat_glow[16] = {};
     static int prev_beat_step = -1;
+    bool anySoloMix = false;
+    for (int i = 0; i < 16; ++i) anySoloMix |= p4.track_solo[i];
     int raw_step_now = control_current_step_raw();
     if (p4.is_playing && raw_step_now != prev_beat_step) {
         prev_beat_step = raw_step_now;
         for (int i = 0; i < 16; i++) {
-            if (!p4.track_muted[i] && live_step_hit(i)) beat_glow[i] = 255;
+            const bool audible = !p4.track_muted[i]
+                && (!anySoloMix || p4.track_solo[i]);
+            if (audible && live_step_hit(i)) beat_glow[i] = 255;
         }
     }
     if (!p4.is_playing) prev_beat_step = -1;
     for (int i = 0; i < 16; i++) {
         if (!vol_strip_panels[i] || beat_glow[i] == 0) continue;
-        if (p4.track_muted[i]) {
+        if (p4.track_muted[i] || (anySoloMix && !p4.track_solo[i])) {
             beat_glow[i] = 0;
             lv_obj_set_style_shadow_width(vol_strip_panels[i], 0, 0);
             continue;  // mute pinta su propio estado
@@ -6325,9 +7188,10 @@ static lv_obj_t* sd_wav_section       = NULL;
 static lv_obj_t* sd_midi_section      = NULL;
 static lv_obj_t* sd_midi_pat_btns[10] = {};
 static lv_obj_t* sd_midi_load_btn     = NULL;
+static lv_obj_t* sd_midi_song_btn     = NULL;
 static lv_obj_t* sd_midi_info_lbl     = NULL;
 static lv_obj_t* sd_midi_status_lbl   = NULL;
-static int        sd_midi_target_slot  = 6;   // default: P07
+static int        sd_midi_target_slot  = 0;   // default: P01
 static bool       sd_is_midi_mode      = false;
 // 0 = PRO (merge all channels, dense drum sequencer feel)
 // 1 = STD (GM drum channel 9 only, closer to a standard MIDI player)
@@ -6340,6 +7204,8 @@ static void sd_refresh_ui(void);
 static void sd_switch_panel_mode(bool midi_mode);
 static void sd_midi_pat_btn_cb(lv_event_t* e);
 static void sd_midi_load_btn_cb(lv_event_t* e);
+static void sd_midi_song_btn_cb(lv_event_t* e);
+static void sd_midi_begin_load(bool song_mode);
 static void sd_refresh_source(void);
 static void show_midi_load_summary(const char* title, int slot,
                                    int steps, int raw_len, float bpm,
@@ -6586,6 +7452,8 @@ static void sd_mem_file_btn_cb(lv_event_t* e) {
     sd_mem_selected = idx;
     if (sd_midi_info_lbl) lv_label_set_text(sd_midi_info_lbl, sd_mem_files[idx]);
     if (sd_midi_load_btn) lv_obj_clear_state(sd_midi_load_btn, LV_STATE_DISABLED);
+    if (sd_midi_song_btn) lv_obj_clear_state(sd_midi_song_btn, LV_STATE_DISABLED);
+    if (sd_midi_song_btn) lv_obj_clear_state(sd_midi_song_btn, LV_STATE_DISABLED);
     if (sd_midi_status_lbl) lv_label_set_text(sd_midi_status_lbl, "");
     sd_refresh_ui();
 }
@@ -6609,6 +7477,7 @@ static void sd_source_btn_cb(lv_event_t* e) {
     if (sd_midi_info_lbl) lv_label_set_text(sd_midi_info_lbl, "");
     if (sd_midi_status_lbl) lv_label_set_text(sd_midi_status_lbl, "");
     if (sd_midi_load_btn) lv_obj_add_state(sd_midi_load_btn, LV_STATE_DISABLED);
+    if (sd_midi_song_btn) lv_obj_add_state(sd_midi_song_btn, LV_STATE_DISABLED);
     if (src == 1) {
         sd_mem_refresh_list();
         sd_switch_panel_mode(true);   // MEM is MIDI-only
@@ -6647,6 +7516,22 @@ static void sd_switch_panel_mode(bool midi_mode) {
     }
 }
 
+static void seq_open_midi_library(void) {
+    s_sd_for_xtra = false;
+    sd_source = 0;  // P4 SD is the authoritative MIDI/song source.
+    sd_mem_selected = -1;
+    sd_local_reset_selection();
+    if (p4sd.path[0] == '\0') strcpy(p4sd.path, "/");
+    ui_navigate_to(9);
+    sd_switch_panel_mode(true);
+    if (sd_src_sd_btn)
+        lv_obj_set_style_bg_color(sd_src_sd_btn, RED808_CYAN, 0);
+    if (sd_src_mem_btn)
+        lv_obj_set_style_bg_color(sd_src_mem_btn, lv_color_hex(0x1A2A3A), 0);
+    sd_local_refresh_listing(false);
+    sd_refresh_ui();
+}
+
 static void sd_file_btn_cb(lv_event_t* e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= p4sd.entry_count) return;
@@ -6660,6 +7545,9 @@ static void sd_file_btn_cb(lv_event_t* e) {
         }
         if (entry.is_midi && sd_midi_load_btn) {
             lv_obj_clear_state(sd_midi_load_btn, LV_STATE_DISABLED);
+        }
+        if (entry.is_midi && sd_midi_song_btn) {
+            lv_obj_clear_state(sd_midi_song_btn, LV_STATE_DISABLED);
         }
         if (entry.is_midi && sd_midi_status_lbl) {
             lv_label_set_text(sd_midi_status_lbl, "");
@@ -6730,6 +7618,80 @@ static void sd_midi_pat_btn_cb(lv_event_t* e) {
 // Shown after a successful MEM-MIDI load. Displays filename, BPM, step count
 // and unique tracks. OK button dismisses and navigates to the sequencer.
 static lv_obj_t* midi_summary_modal = NULL;
+static lv_obj_t* midi_song_confirm_modal = NULL;
+
+static void midi_song_confirm_close(void) {
+    if (!midi_song_confirm_modal) return;
+    lv_obj_del(midi_song_confirm_modal);
+    midi_song_confirm_modal = NULL;
+}
+
+static void midi_song_confirm_cb(lv_event_t* e) {
+    const bool accept = (bool)(intptr_t)lv_event_get_user_data(e);
+    midi_song_confirm_close();
+    if (accept) sd_midi_begin_load(true);
+}
+
+static void sd_midi_song_btn_cb(lv_event_t* e) {
+    (void)e;
+    if (sd_midi_load_in_flight() || midi_song_confirm_modal) return;
+
+    midi_song_confirm_modal = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(midi_song_confirm_modal);
+    lv_obj_set_size(midi_song_confirm_modal, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(midi_song_confirm_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(midi_song_confirm_modal, LV_OPA_60, 0);
+    lv_obj_add_flag(midi_song_confirm_modal, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(midi_song_confirm_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* card = lv_obj_create(midi_song_confirm_modal);
+    lv_obj_set_size(card, 540, 300);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_color(card, RED808_WARNING, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* heading = lv_label_create(card);
+    lv_label_set_text(heading, LV_SYMBOL_WARNING "  IMPORT FULL MIDI SONG");
+    lv_obj_set_style_text_font(heading, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(heading, RED808_WARNING, 0);
+    lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 10);
+
+    lv_obj_t* copy = lv_label_create(card);
+    lv_label_set_text(copy,
+        "La cancion se convertira en escenas P101-P120.\n"
+        "Esos patrones de usuario se sustituiran y guardaran.\n\n"
+        "Se conservan velocity, silencios y compases repetidos.");
+    lv_obj_set_width(copy, 480);
+    lv_obj_set_style_text_align(copy, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(copy, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(copy, RED808_TEXT, 0);
+    lv_obj_align(copy, LV_ALIGN_TOP_MID, 0, 62);
+
+    lv_obj_t* cancel = lv_btn_create(card);
+    lv_obj_set_size(cancel, 190, 52);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 22, -18);
+    apply_control_button_style(cancel, RED808_BORDER, false, 8);
+    lv_obj_add_event_cb(cancel, midi_song_confirm_cb, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)false);
+    lv_obj_t* cancel_label = lv_label_create(cancel);
+    lv_label_set_text(cancel_label, LV_SYMBOL_CLOSE "  CANCEL");
+    lv_obj_set_style_text_color(cancel_label, RED808_TEXT, 0);
+    lv_obj_center(cancel_label);
+
+    lv_obj_t* import_btn = lv_btn_create(card);
+    lv_obj_set_size(import_btn, 250, 52);
+    lv_obj_align(import_btn, LV_ALIGN_BOTTOM_RIGHT, -22, -18);
+    apply_control_button_style(import_btn, RED808_WARNING, true, 8);
+    lv_obj_add_event_cb(import_btn, midi_song_confirm_cb, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)true);
+    lv_obj_t* import_label = lv_label_create(import_btn);
+    lv_label_set_text(import_label, LV_SYMBOL_DOWNLOAD "  IMPORT & SAVE");
+    lv_obj_set_style_text_color(import_label, RED808_BG, 0);
+    lv_obj_center(import_label);
+}
 
 static void midi_summary_ok_cb(lv_event_t* e) {
     (void)e;
@@ -6817,6 +7779,99 @@ static void show_midi_load_summary(const char* title, int slot,
     lv_obj_center(okl);
 }
 
+static void show_midi_song_summary(const char* title,
+                                   const mem_midi::MidiSongData& song) {
+    snprintf(seq_last_midi_name, sizeof(seq_last_midi_name), "%s",
+             title ? title : "(unknown)");
+    seq_last_midi_slot = 101;
+    seq_last_midi_steps = (int)song.hits;
+    seq_last_midi_raw_len = (int)song.imported_bars * 16;
+    seq_last_midi_bpm = song.bpm;
+    seq_last_midi_tracks = song.tracks_used;
+    seq_last_midi_valid = true;
+
+    if (midi_summary_modal) {
+        lv_obj_del(midi_summary_modal);
+        midi_summary_modal = NULL;
+    }
+    midi_summary_modal = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(midi_summary_modal);
+    lv_obj_set_size(midi_summary_modal, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(midi_summary_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(midi_summary_modal, LV_OPA_60, 0);
+    lv_obj_add_flag(midi_summary_modal, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(midi_summary_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* card = lv_obj_create(midi_summary_modal);
+    lv_obj_set_size(card, 590, 392);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_color(card,
+        song.truncated ? RED808_WARNING : RED808_SUCCESS, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* heading = lv_label_create(card);
+    lv_label_set_text(heading, song.truncated
+        ? LV_SYMBOL_WARNING "  MIDI SONG · PARTIAL"
+        : LV_SYMBOL_OK "  MIDI SONG READY");
+    lv_obj_set_style_text_color(heading,
+        song.truncated ? RED808_WARNING : RED808_SUCCESS, 0);
+    lv_obj_set_style_text_font(heading, &lv_font_montserrat_24, 0);
+    lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t* filename = lv_label_create(card);
+    lv_label_set_text_fmt(filename, "File: %s", title ? title : "(unknown)");
+    lv_obj_set_width(filename, 540);
+    lv_label_set_long_mode(filename, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(filename, RED808_TEXT, 0);
+    lv_obj_set_style_text_font(filename, &lv_font_montserrat_16, 0);
+    lv_obj_align(filename, LV_ALIGN_TOP_LEFT, 10, 52);
+
+    lv_obj_t* details = lv_label_create(card);
+    char info[420];
+    char tempo_text[28];
+    if (song.bpm > 0.0f)
+        snprintf(tempo_text, sizeof(tempo_text), "%.1f BPM", song.bpm);
+    else
+        snprintf(tempo_text, sizeof(tempo_text), "not defined");
+    const int last_slot = 100 + song.pattern_count;
+    snprintf(info, sizeof(info),
+        "Tempo original:   %s\n"
+        "Arrangement:      %u / %u bars\n"
+        "Resident scenes:  %u / %d  -> P101-P%03d\n"
+        "Song sections:    %u / %d\n"
+        "Hits / tracks:    %lu / %u\n"
+        "Dynamics:         MIDI velocity preserved\n"
+        "Tempo events:     %u%s\n"
+        "Storage:          %s",
+        tempo_text,
+        (unsigned)song.imported_bars, (unsigned)song.total_bars,
+        (unsigned)song.pattern_count, mem_midi::MIDI_SONG_MAX_PATTERNS,
+        last_slot, (unsigned)song.chain_count, mem_midi::MIDI_SONG_MAX_CHAIN,
+        (unsigned long)song.hits, (unsigned)song.tracks_used,
+        (unsigned)song.tempo_events,
+        song.tempo_events > 1 ? " (initial tempo is reference)" : "",
+        control_midi_song_persisted() ? "saved in user patterns" : "RAM only · check SPIFFS");
+    lv_label_set_text(details, info);
+    lv_obj_set_style_text_color(details, RED808_TEXT, 0);
+    lv_obj_set_style_text_font(details, &lv_font_montserrat_16, 0);
+    lv_obj_align(details, LV_ALIGN_TOP_LEFT, 10, 82);
+
+    lv_obj_t* ok = lv_btn_create(card);
+    lv_obj_set_size(ok, 330, 54);
+    lv_obj_align(ok, LV_ALIGN_BOTTOM_MID, 0, -14);
+    apply_control_button_style(ok, RED808_CYAN, true, 8);
+    lv_obj_set_style_bg_color(ok, RED808_ACCENT, 0);
+    lv_obj_add_event_cb(ok, midi_summary_ok_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* label = lv_label_create(ok);
+    lv_label_set_text(label, LV_SYMBOL_PLAY "  SEQUENCER · PLAY SONG");
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_18, 0);
+    lv_obj_center(label);
+}
+
 // ── Async MIDI parser ───────────────────────────────────────────────────────
 // Parsing can legitimately take seconds on a dense or malformed SMF. Keep it
 // off the LVGL task and publish the complete grid only after the worker exits.
@@ -6824,6 +7879,7 @@ struct SdMidiLoadJob {
     uint8_t source;              // 0 = SD_MMC, 1 = SPIFFS
     int mode;
     int target_slot;
+    bool song_mode;
     char path[192];
     char display_name[64];
     char parsed_name[16];
@@ -6832,6 +7888,8 @@ struct SdMidiLoadJob {
     int raw_len;
     float bpm;
     bool ok;
+    bool installed;
+    mem_midi::MidiSongData song;
 };
 static SdMidiLoadJob s_sd_midi_job;
 // 0 = idle, 1 = parsing, 2 = completed and waiting for LVGL consumption.
@@ -6847,7 +7905,13 @@ static void sd_midi_load_task(void* arg) {
     job.steps_found = 0;
     job.raw_len = 0;
     job.bpm = 0.0f;
-    if (job.source == 1) {
+    job.installed = false;
+    if (job.song_mode) {
+        job.ok = job.source == 1
+            ? mem_midi::load_song(job.path, &job.song, job.mode)
+            : mem_midi::load_song_from_fs(SD_MMC, job.path, &job.song, job.mode);
+        if (job.ok) job.installed = control_install_midi_song(job.song);
+    } else if (job.source == 1) {
         job.ok = mem_midi::load_pattern_raw(job.path, job.grid,
                                              job.parsed_name, sizeof(job.parsed_name),
                                              &job.steps_found, &job.bpm, &job.raw_len,
@@ -6877,14 +7941,44 @@ static void sd_midi_load_consume_result(void) {
         return;
     }
 
+    if (job.song_mode) {
+        if (!job.installed) {
+            if (sd_midi_status_lbl) {
+                lv_label_set_text(sd_midi_status_lbl,
+                    "MIDI valido, pero no se pudo instalar la cancion");
+                lv_obj_set_style_text_color(sd_midi_status_lbl, RED808_ERROR, 0);
+            }
+            s_sd_midi_state.store(0, std::memory_order_release);
+            return;
+        }
+        ui_sequencer_sync_from_current_pattern();
+        if (sd_midi_status_lbl) {
+            lv_label_set_text_fmt(sd_midi_status_lbl,
+                "%s · %u/%u compases · %u escenas",
+                job.song.truncated ? "PARCIAL" : "SONG READY",
+                (unsigned)job.song.imported_bars,
+                (unsigned)job.song.total_bars,
+                (unsigned)job.song.pattern_count);
+            lv_obj_set_style_text_color(sd_midi_status_lbl,
+                job.song.truncated ? RED808_WARNING : RED808_SUCCESS, 0);
+        }
+        show_midi_song_summary(job.display_name, job.song);
+        s_sd_midi_state.store(0, std::memory_order_release);
+        return;
+    }
+
     for (int t = 0; t < 16; t++)
         for (int s = 0; s < 64; s++)
             seq_raw_grid[t][s] = job.grid[t][s];
 
     p4.current_pattern = job.target_slot;
     seq_install_raw_and_show_page0(job.raw_len);
+    control_set_pattern_source_tempo(job.target_slot, job.bpm,
+                                     job.parsed_name[0] ? job.parsed_name
+                                                        : job.display_name);
 
-    if (job.bpm >= 40.0f && job.bpm <= 240.0f) {
+    if (job.bpm >= 40.0f && job.bpm <= 240.0f
+        && !i2c_rotaries_owns_function(POD_FUNC_TEMPO)) {
         p4.bpm_int  = (int)job.bpm;
         p4.bpm_frac = (int)((job.bpm - p4.bpm_int) * 10.0f);
         local_lock_tempo(3000);
@@ -6907,8 +8001,7 @@ static void sd_midi_load_consume_result(void) {
     s_sd_midi_state.store(0, std::memory_order_release);
 }
 
-static void sd_midi_load_btn_cb(lv_event_t* e) {
-    (void)e;
+static void sd_midi_begin_load(bool song_mode) {
     if (sd_midi_load_in_flight()) return;
 
     SdMidiLoadJob& job = s_sd_midi_job;
@@ -6916,6 +8009,7 @@ static void sd_midi_load_btn_cb(lv_event_t* e) {
     job.source = (uint8_t)sd_source;
     job.mode = sd_midi_import_mode;
     job.target_slot = sd_midi_target_slot;
+    job.song_mode = song_mode;
 
     if (sd_source == 1) {
         if (sd_mem_selected < 0 || sd_mem_selected >= sd_mem_count) return;
@@ -6935,18 +8029,26 @@ static void sd_midi_load_btn_cb(lv_event_t* e) {
     }
 
     if (sd_midi_status_lbl) {
-        lv_label_set_text(sd_midi_status_lbl, "Analizando MIDI...");
+        lv_label_set_text(sd_midi_status_lbl,
+            song_mode ? "Analizando arrangement completo..." : "Analizando patron MIDI...");
         lv_obj_set_style_text_color(sd_midi_status_lbl, RED808_WARNING, 0);
     }
     if (sd_midi_load_btn) lv_obj_add_state(sd_midi_load_btn, LV_STATE_DISABLED);
+    if (sd_midi_song_btn) lv_obj_add_state(sd_midi_song_btn, LV_STATE_DISABLED);
 
     s_sd_midi_state.store(1, std::memory_order_release);
-    if (xTaskCreatePinnedToCore(sd_midi_load_task, "midiparse", 8192,
+    if (xTaskCreatePinnedToCore(sd_midi_load_task, "midiparse", 12288,
                                 NULL, 1, NULL, 1) != pdPASS) {
         s_sd_midi_state.store(0, std::memory_order_release);
         if (sd_midi_load_btn) lv_obj_clear_state(sd_midi_load_btn, LV_STATE_DISABLED);
+        if (sd_midi_song_btn) lv_obj_clear_state(sd_midi_song_btn, LV_STATE_DISABLED);
         ui_show_toast("No se pudo iniciar el parser MIDI", RED808_WARNING);
     }
+}
+
+static void sd_midi_load_btn_cb(lv_event_t* e) {
+    (void)e;
+    sd_midi_begin_load(false);
 }
 
 // ── Async WAV upload ────────────────────────────────────────────────────
@@ -6993,6 +8095,28 @@ static SdUploadJob s_sd_upload_job;
 // 0 = idle, 1 = running, 2 = done (result pending consumption)
 static std::atomic<uint8_t> s_sd_upload_state{0};
 static std::atomic<uint8_t> s_sd_upload_progress{0};
+
+// Default-kit authority is the P4 SD. Daisy is only the audio destination.
+enum FactoryKitState : uint8_t {
+    FACTORY_KIT_WAIT_LINK = 0,
+    FACTORY_KIT_SCANNING,
+    FACTORY_KIT_READY,
+    FACTORY_KIT_UPLOADING,
+    FACTORY_KIT_COMPLETE,
+    FACTORY_KIT_ERROR,
+};
+struct FactoryKitFile {
+    char path[192];
+    char name[64];
+};
+static FactoryKitFile s_factory_kit_files[16] = {};
+static std::atomic<uint8_t> s_factory_kit_state{FACTORY_KIT_WAIT_LINK};
+static uint8_t s_factory_kit_cursor = 0;
+static uint8_t s_factory_kit_loaded = 0;
+static uint8_t s_factory_kit_failures = 0;
+static uint32_t s_factory_link_since_ms = 0;
+static bool s_factory_link_seen = false;
+static bool s_factory_result_announced = false;
 
 static uint16_t wav_le16(const uint8_t* p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -7138,6 +8262,17 @@ static bool sd_usb_send_with_retry(uint8_t command, const void* payload,
     return false;
 }
 
+static bool fx_any_active(void) {
+    if((!p4.enc_muted[0] && p4.enc_value[0] > 0)
+       || (!p4.enc_muted[1] && p4.enc_value[1] > 0)
+       || (!p4.enc_muted[2] && p4.enc_value[2] > 0)
+       || (!p4.pot_muted[0] && p4.pot_value[3] > 0)
+       || (!p4.pot_muted[2] && p4.pot_value[2] > 0))
+        return true;
+    return p4.filter_type != 0 || p4.distortion_pct > 0
+        || p4.bitcrush_bits < 16 || p4.sample_rate_hz > 0;
+}
+
 static void sd_upload_task(void* arg) {
     (void)arg;
     SdUploadJob& job = s_sd_upload_job;
@@ -7276,6 +8411,200 @@ static void sd_upload_task(void* arg) {
                                std::memory_order_release);
     s_sd_upload_state.store(2, std::memory_order_release);
     vTaskDelete(NULL);
+}
+
+static bool factory_wav_name(const char* name) {
+    if (!name) return false;
+    const size_t len = strlen(name);
+    return len > 4 && strcasecmp(name + len - 4, ".wav") == 0;
+}
+
+static int factory_pad_from_filename(const char* name) {
+    if (!name) return -1;
+    // Exact RED 808 KARZ identities. HH is the kit's closed-hat name and maps
+    // to the canonical CH pad used by the sequencer and the S3 project.
+    struct Mapping { const char* prefix; uint8_t pad; };
+    static const Mapping map[] = {
+        {"808 BD", 0}, {"808 SD", 1}, {"808 HH", 2}, {"808 CH", 2},
+        {"808 OH", 3}, {"808 CY", 4}, {"808 CP", 5}, {"808 RS", 6},
+        {"808 COW", 7}, {"808 CB", 7}, {"808 LT", 8}, {"808 MT", 9},
+        {"808 HT", 10}, {"808 MA", 11}, {"808 CL", 12}, {"808 HC", 13},
+        {"808 MC", 14}, {"808 LC", 15},
+    };
+    for (const Mapping& item : map) {
+        const size_t prefixLen = strlen(item.prefix);
+        if (strncasecmp(name, item.prefix, prefixLen) == 0)
+            return item.pad;
+    }
+    return -1;
+}
+
+static void factory_kit_scan_task(void*) {
+    memset(s_factory_kit_files, 0, sizeof(s_factory_kit_files));
+    s_factory_kit_loaded = 0;
+    s_factory_kit_failures = 0;
+    s_factory_kit_cursor = 0;
+
+    bool ok = sd_local_try_mount();
+    p4sd.mounted = ok;
+    File dir;
+    if (ok) dir = SD_MMC.open("/data/RED 808 KARZ");
+    if (!dir || !dir.isDirectory()) ok = false;
+
+    if (ok) {
+        File entry = dir.openNextFile();
+        while (entry) {
+            if (!entry.isDirectory()) {
+                const char* base = sd_basename(entry.name());
+                const int pad = factory_pad_from_filename(base);
+                if (pad >= 0 && pad < 16 && factory_wav_name(base)) {
+                    FactoryKitFile& selected = s_factory_kit_files[pad];
+                    // The S3 asset generator sorted filenames and took the
+                    // first variant for every instrument. Do the same here so
+                    // the kit sounds identical across FAT directory layouts.
+                    if (!selected.name[0] || strcasecmp(base, selected.name) < 0) {
+                        snprintf(selected.path, sizeof(selected.path),
+                                 "/data/RED 808 KARZ/%s", base);
+                        snprintf(selected.name, sizeof(selected.name), "%s", base);
+                    }
+                }
+            }
+            entry.close();
+            entry = dir.openNextFile();
+        }
+        dir.close();
+        uint8_t found = 0;
+        for (const FactoryKitFile& file : s_factory_kit_files)
+            if (file.path[0]) ++found;
+        ok = found > 0;
+    }
+
+    s_sd_scan_state.store(0, std::memory_order_release);
+    s_factory_kit_state.store(ok ? FACTORY_KIT_READY : FACTORY_KIT_ERROR,
+                              std::memory_order_release);
+    p4sd.needs_refresh.store(true, std::memory_order_release);
+    vTaskDelete(NULL);
+}
+
+// Called only from the LVGL task. Returns true while the factory loader owns
+// the shared upload result slot, so the normal one-file UI consumer leaves it
+// alone. Manual SD uploads can still run between factory samples.
+static bool sd_factory_autoload_tick(void) {
+    const bool connected = daisyUsb.connected();
+    if (!connected) {
+        s_factory_link_seen = false;
+        if (s_sd_upload_state.load(std::memory_order_acquire) == 0)
+            s_factory_kit_state.store(FACTORY_KIT_WAIT_LINK,
+                                      std::memory_order_release);
+        return s_factory_kit_state.load(std::memory_order_acquire)
+            == FACTORY_KIT_UPLOADING;
+    }
+
+    if (!s_factory_link_seen) {
+        s_factory_link_seen = true;
+        s_factory_link_since_ms = millis();
+        s_factory_result_announced = false;
+        if (s_factory_kit_state.load(std::memory_order_acquire)
+            >= FACTORY_KIT_COMPLETE)
+            s_factory_kit_state.store(FACTORY_KIT_WAIT_LINK,
+                                      std::memory_order_release);
+    }
+
+    uint8_t state = s_factory_kit_state.load(std::memory_order_acquire);
+    if (state == FACTORY_KIT_WAIT_LINK) {
+        // Initial pattern/performance sync gets the USB queue first.
+        if (millis() - s_factory_link_since_ms < 1200u) return false;
+        if (s_sd_scan_state.load(std::memory_order_acquire) != 0
+            || sd_midi_load_in_flight() || sd_upload_in_flight())
+            return false;
+        s_sd_scan_state.store(1, std::memory_order_release);
+        s_factory_kit_state.store(FACTORY_KIT_SCANNING,
+                                  std::memory_order_release);
+        if (xTaskCreatePinnedToCore(factory_kit_scan_task, "factorykit", 6144,
+                                    NULL, 1, NULL, 1) != pdPASS) {
+            s_sd_scan_state.store(0, std::memory_order_release);
+            s_factory_kit_state.store(FACTORY_KIT_ERROR,
+                                      std::memory_order_release);
+        }
+        return true;
+    }
+    if (state == FACTORY_KIT_SCANNING) return true;
+
+    if (state == FACTORY_KIT_READY) {
+        // A manual preview/load already owns the worker: let its normal result
+        // consumer finish, then continue the default kit on the next tick.
+        if (s_sd_upload_state.load(std::memory_order_acquire) != 0) return false;
+        while (s_factory_kit_cursor < 16
+               && !s_factory_kit_files[s_factory_kit_cursor].path[0]) {
+            ++s_factory_kit_failures;
+            ++s_factory_kit_cursor;
+        }
+        if (s_factory_kit_cursor >= 16) {
+            s_factory_kit_state.store(FACTORY_KIT_COMPLETE,
+                                      std::memory_order_release);
+            state = FACTORY_KIT_COMPLETE;
+        } else {
+            const uint8_t pad = s_factory_kit_cursor;
+            const FactoryKitFile& source = s_factory_kit_files[pad];
+            SdUploadJob& job = s_sd_upload_job;
+            memset(&job, 0, sizeof(job));
+            snprintf(job.path, sizeof(job.path), "%s", source.path);
+            snprintf(job.filename, sizeof(job.filename), "%s", source.name);
+            job.pad = pad;
+            job.xtra_slot = -1;
+            job.close_after = false;
+            job.trigger_after = false;
+            s_sd_upload_progress.store(0, std::memory_order_release);
+            s_sd_upload_state.store(1, std::memory_order_release);
+            s_factory_kit_state.store(FACTORY_KIT_UPLOADING,
+                                      std::memory_order_release);
+            if (xTaskCreatePinnedToCore(sd_upload_task, "kitupload", 8192,
+                                        NULL, 1, NULL, 1) != pdPASS) {
+                s_sd_upload_state.store(0, std::memory_order_release);
+                ++s_factory_kit_failures;
+                ++s_factory_kit_cursor;
+                s_factory_kit_state.store(FACTORY_KIT_READY,
+                                          std::memory_order_release);
+            }
+            p4sd.needs_refresh.store(true, std::memory_order_release);
+            return true;
+        }
+    }
+
+    if (state == FACTORY_KIT_UPLOADING) {
+        const uint8_t uploadState = s_sd_upload_state.load(std::memory_order_acquire);
+        if (uploadState != 2) return true;
+        const SdUploadJob result = s_sd_upload_job;
+        s_sd_upload_state.store(0, std::memory_order_release);
+        if (result.result == SD_UP_OK) {
+            ++s_factory_kit_loaded;
+            if (control_pattern_track_uses_sampler(p4.current_pattern,
+                                                   s_factory_kit_cursor))
+                control_send_set_track_engine(s_factory_kit_cursor, -1);
+        } else {
+            ++s_factory_kit_failures;
+        }
+        ++s_factory_kit_cursor;
+        s_factory_kit_state.store(FACTORY_KIT_READY,
+                                  std::memory_order_release);
+        p4sd.needs_refresh.store(true, std::memory_order_release);
+        return true;
+    }
+
+    if (state == FACTORY_KIT_COMPLETE && !s_factory_result_announced) {
+        s_factory_result_announced = true;
+        snprintf(p4.kit_name, sizeof(p4.kit_name), "RED 808 KARZ");
+        daisyUsb.send(CMD_GET_STATUS);
+        char message[80];
+        snprintf(message, sizeof(message), "P4 SD: RED 808 KARZ %u/16 cargados",
+                 (unsigned)s_factory_kit_loaded);
+        ui_show_toast(message, s_factory_kit_loaded > 0
+                               ? RED808_SUCCESS : RED808_WARNING);
+    } else if (state == FACTORY_KIT_ERROR && !s_factory_result_announced) {
+        s_factory_result_announced = true;
+        ui_show_toast("P4 SD: falta /data/RED 808 KARZ", RED808_WARNING);
+    }
+    return false;
 }
 
 // LVGL task: validate, snapshot the request and launch the worker.
@@ -7506,6 +8835,12 @@ static void sd_refresh_ui(void) {
             else
                 lv_obj_add_state(sd_midi_load_btn, LV_STATE_DISABLED);
         }
+        if (sd_midi_song_btn) {
+            if (sd_mem_selected >= 0)
+                lv_obj_clear_state(sd_midi_song_btn, LV_STATE_DISABLED);
+            else
+                lv_obj_add_state(sd_midi_song_btn, LV_STATE_DISABLED);
+        }
 
         if (sd_mem_count <= 0) {
             lv_obj_t* lbl = lv_label_create(sd_file_list);
@@ -7648,9 +8983,28 @@ static void sd_refresh_ui(void) {
     // ── SD branch (local P4 SD_MMC) ─────────────────────────────────────
     // Update status
     if (sd_status_lbl) {
-        lv_label_set_text(sd_status_lbl, p4sd.mounted ? "READY" : "NO SD CARD");
-        lv_obj_set_style_text_color(sd_status_lbl,
-            p4sd.mounted ? RED808_SUCCESS : RED808_WARNING, 0);
+        const uint8_t kitState = s_factory_kit_state.load(std::memory_order_acquire);
+        if (kitState == FACTORY_KIT_SCANNING) {
+            lv_label_set_text(sd_status_lbl, "P4 KIT SCAN...");
+            lv_obj_set_style_text_color(sd_status_lbl, RED808_CYAN, 0);
+        } else if (kitState == FACTORY_KIT_UPLOADING) {
+            lv_label_set_text_fmt(sd_status_lbl, "KIT %u/16 %u%%",
+                (unsigned)(s_factory_kit_cursor + 1u),
+                (unsigned)s_sd_upload_progress.load(std::memory_order_acquire));
+            lv_obj_set_style_text_color(sd_status_lbl, RED808_CYAN, 0);
+        } else if (kitState == FACTORY_KIT_COMPLETE) {
+            lv_label_set_text_fmt(sd_status_lbl, "P4 KIT READY %u/16",
+                                  (unsigned)s_factory_kit_loaded);
+            lv_obj_set_style_text_color(sd_status_lbl,
+                s_factory_kit_loaded > 0 ? RED808_SUCCESS : RED808_WARNING, 0);
+        } else if (kitState == FACTORY_KIT_ERROR) {
+            lv_label_set_text(sd_status_lbl, "P4 KIT PATH ERROR");
+            lv_obj_set_style_text_color(sd_status_lbl, RED808_WARNING, 0);
+        } else {
+            lv_label_set_text(sd_status_lbl, p4sd.mounted ? "P4 SD READY" : "NO P4 SD");
+            lv_obj_set_style_text_color(sd_status_lbl,
+                p4sd.mounted ? RED808_SUCCESS : RED808_WARNING, 0);
+        }
     }
     // Update path
     if (sd_path_lbl) lv_label_set_text(sd_path_lbl, p4sd.path);
@@ -7674,6 +9028,12 @@ static void sd_refresh_ui(void) {
             lv_obj_clear_state(sd_midi_load_btn, LV_STATE_DISABLED);
         else
             lv_obj_add_state(sd_midi_load_btn, LV_STATE_DISABLED);
+    }
+    if (sd_midi_song_btn) {
+        if (p4sd.selected_file[0] && p4sd.selected_is_midi)
+            lv_obj_clear_state(sd_midi_song_btn, LV_STATE_DISABLED);
+        else
+            lv_obj_add_state(sd_midi_song_btn, LV_STATE_DISABLED);
     }
     if (!p4sd.mounted) {
         lv_obj_t* lbl = lv_label_create(sd_file_list);
@@ -7773,7 +9133,7 @@ static void create_sdcard_screen(void) {
     lv_obj_set_style_text_color(title_lbl, RED808_CYAN, 0);
     lv_obj_set_pos(title_lbl, 8, 4);
 
-    // Source toggle: [P4 SD] [MEM] [DAISY]
+    // Source toggle: [P4 SD] [MEM]. Daisy no longer owns storage.
     {
         int btn_w = 70, btn_h = 28;
         int bx = 240, by = 4;
@@ -7809,21 +9169,7 @@ static void create_sdcard_screen(void) {
         lv_obj_add_event_cb(sd_src_mem_btn, sd_source_btn_cb,
                             LV_EVENT_CLICKED, (void*)(intptr_t)1);
 
-        sd_src_daisy_btn = lv_btn_create(sd_left_panel);
-        lv_obj_set_size(sd_src_daisy_btn, 88, btn_h);
-        lv_obj_set_pos(sd_src_daisy_btn, bx + 2 * (btn_w + 6), by);
-        lv_obj_set_style_bg_color(sd_src_daisy_btn,
-            sd_source == 2 ? RED808_SUCCESS : lv_color_hex(0x1A2A3A), 0);
-        lv_obj_set_style_radius(sd_src_daisy_btn, 6, 0);
-        lv_obj_set_style_border_width(sd_src_daisy_btn, 1, 0);
-        lv_obj_set_style_border_color(sd_src_daisy_btn, lv_color_hex(0x334455), 0);
-        lv_obj_t* l3 = lv_label_create(sd_src_daisy_btn);
-        lv_label_set_text(l3, "DAISY");
-        lv_obj_set_style_text_font(l3, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(l3, RED808_SUCCESS, 0);
-        lv_obj_center(l3);
-        lv_obj_add_event_cb(sd_src_daisy_btn, sd_source_btn_cb,
-                            LV_EVENT_CLICKED, (void*)(intptr_t)2);
+        sd_src_daisy_btn = NULL;
     }
 
     // Status label
@@ -7966,7 +9312,7 @@ static void create_sdcard_screen(void) {
 
     // MIDI title
     lv_obj_t* midi_title = lv_label_create(sd_midi_section);
-    lv_label_set_text(midi_title, LV_SYMBOL_AUDIO "  LOAD MIDI TO PATTERN");
+    lv_label_set_text(midi_title, LV_SYMBOL_AUDIO "  MIDI IMPORT · PATTERN / SONG");
     lv_obj_set_style_text_font(midi_title, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(midi_title, RED808_WARNING, 0);
     lv_obj_set_pos(midi_title, 8, 4);
@@ -8091,9 +9437,11 @@ static void create_sdcard_screen(void) {
         }, LV_EVENT_CLICKED, NULL);
     }
 
-    // LOAD MIDI PATTERN button
+    // Pattern and full-arrangement actions. SONG is deliberately separated:
+    // it replaces persisted user scenes and therefore opens a confirmation.
+    const int midi_action_w = (RIGHT_W - 24 - 8) / 2;
     sd_midi_load_btn = lv_btn_create(sd_midi_section);
-    lv_obj_set_size(sd_midi_load_btn, RIGHT_W - 24, 56);
+    lv_obj_set_size(sd_midi_load_btn, midi_action_w, 56);
     lv_obj_set_pos(sd_midi_load_btn, 8, 362);
     lv_obj_set_style_bg_color(sd_midi_load_btn, RED808_WARNING, 0);
     lv_obj_set_style_bg_color(sd_midi_load_btn, lv_color_hex(0x554400), LV_STATE_DISABLED);
@@ -8102,10 +9450,25 @@ static void create_sdcard_screen(void) {
     lv_obj_add_event_cb(sd_midi_load_btn, sd_midi_load_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* midi_load_lbl = lv_label_create(sd_midi_load_btn);
-    lv_label_set_text(midi_load_lbl, LV_SYMBOL_DOWNLOAD "  LOAD MIDI PATTERN");
-    lv_obj_set_style_text_font(midi_load_lbl, &lv_font_montserrat_18, 0);
+    lv_label_set_text(midi_load_lbl, LV_SYMBOL_DOWNLOAD "  PATTERN");
+    lv_obj_set_style_text_font(midi_load_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(midi_load_lbl, lv_color_black(), 0);
     lv_obj_center(midi_load_lbl);
+
+    sd_midi_song_btn = lv_btn_create(sd_midi_section);
+    lv_obj_set_size(sd_midi_song_btn, midi_action_w, 56);
+    lv_obj_set_pos(sd_midi_song_btn, 8 + midi_action_w + 8, 362);
+    lv_obj_set_style_bg_color(sd_midi_song_btn, RED808_CYAN, 0);
+    lv_obj_set_style_bg_color(sd_midi_song_btn, lv_color_hex(0x17343A), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(sd_midi_song_btn, 10, 0);
+    lv_obj_add_state(sd_midi_song_btn, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(sd_midi_song_btn, sd_midi_song_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* midi_song_lbl = lv_label_create(sd_midi_song_btn);
+    lv_label_set_text(midi_song_lbl, LV_SYMBOL_LIST "  FULL SONG");
+    lv_obj_set_style_text_font(midi_song_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(midi_song_lbl, RED808_BG, 0);
+    lv_obj_center(midi_song_lbl);
 
     // Status label
     sd_midi_status_lbl = lv_label_create(sd_midi_section);
@@ -10464,6 +11827,9 @@ static void create_performance_screen(void) {
 void ui_create_all_screens(void) {
     // Keep boot fast and runtime heap low. Heavy editors (the sequencer alone
     // owns hundreds of LVGL objects) are created on first navigation.
+    s_pod_owner_badge_count = 0;
+    memset(s_pod_owner_badges, 0, sizeof(s_pod_owner_badges));
+    pod_config_store_load(s_pod_config);
     create_boot_screen();
     create_live_screen();
 
@@ -10523,6 +11889,8 @@ static void ui_reload_themed_screens(void) {
     // Invalidate the prev_* dirty caches in the update functions — the
     // recreated widgets need a full first repaint (see s_ui_refresh_gen).
     s_ui_refresh_gen++;
+    s_pod_owner_badge_count = 0;
+    memset(s_pod_owner_badges, 0, sizeof(s_pod_owner_badges));
 
     // Modals live on lv_layer_top(), which SURVIVES the screen deletions
     // below. They must be deleted for real here — just nulling the pointers
@@ -10531,6 +11899,9 @@ static void ui_reload_themed_screens(void) {
     pod_status_modal_close_cb(NULL);
     if (s_pad_mode_modal) { lv_obj_del(s_pad_mode_modal); s_pad_mode_modal = NULL; }
     if (midi_summary_modal) { lv_obj_del(midi_summary_modal); midi_summary_modal = NULL; }
+    midi_song_confirm_close();
+    seq_save_confirm_hide();
+    seq_variation_modal_hide();
 
     // The toast is a child of whichever screen was active — it dies with the
     // screen below. Drop the references so ui_toast_update()/ui_show_toast()
@@ -10569,8 +11940,11 @@ static void ui_reload_themed_screens(void) {
         grid_step_dots[i] = NULL;
     }
     memset(live_home_panels, 0, sizeof(live_home_panels));
+    grid_fx_btn = NULL;
+    grid_fx_active_badge = NULL;
     s_pad_back_btn = NULL;
     grid_play_btn = NULL; grid_play_lbl = NULL; grid_bpm_lbl = NULL;
+    grid_tempo_ref_lbl = NULL;
     grid_pat_lbl = NULL; grid_step_lbl = NULL;
     grid_nr_btn = NULL; grid_nr_lbl = NULL;
     grid_16l_btn = NULL; grid_16l_lbl = NULL;
@@ -10613,6 +11987,7 @@ static void ui_reload_themed_screens(void) {
     fx_page_lbl = NULL;
     fx_view_btn = NULL;
     fx_view_lbl = NULL;
+    fx_pattern_lbl = NULL;
     fx_page = 0;
     fx_view_mode = 0;
     for (int i = 0; i < 16; i++) {
@@ -10631,6 +12006,7 @@ static void ui_reload_themed_screens(void) {
     seq_status_pat_lbl = NULL;
     seq_status_name_lbl = NULL;
     seq_status_bpm_lbl = NULL;
+    seq_status_mix_lbl = NULL;
     memset(seq_page_btns, 0, sizeof(seq_page_btns));
     memset(seq_page_lbls, 0, sizeof(seq_page_lbls));
     seq_hdr_play_btn = NULL;
@@ -10639,9 +12015,15 @@ static void ui_reload_themed_screens(void) {
     seq_hdr_name_lbl = NULL;
     seq_hdr_queue_btn = NULL;
     seq_hdr_queue_lbl = NULL;
+    seq_hdr_var_btn = NULL;
+    seq_variation_modal = NULL;
     seq_hdr_mix_btn = NULL;
     seq_hdr_mix_lbl = NULL;
+    seq_hdr_save_btn = NULL;
+    seq_hdr_save_lbl = NULL;
     seq_pattern_list_modal = NULL;
+    seq_save_confirm_modal = NULL;
+    seq_save_confirm_slot = -1;
     memset(seq_hdr_group_btns, 0, sizeof(seq_hdr_group_btns));
     memset(seq_hdr_group_state, 0xFF, sizeof(seq_hdr_group_state));
     seq_pattern_modal = NULL;
@@ -10669,6 +12051,7 @@ static void ui_reload_themed_screens(void) {
     for (int i = 0; i < 16; i++) sd_pad_btns[i] = NULL;
     sd_wav_section = NULL; sd_midi_section = NULL;
     sd_midi_info_lbl = NULL; sd_midi_status_lbl = NULL; sd_midi_load_btn = NULL;
+    sd_midi_song_btn = NULL;
     memset(sd_midi_pat_btns, 0, sizeof(sd_midi_pat_btns));
     sd_midi_mode_pro_btn = NULL; sd_midi_mode_std_btn = NULL;
     sd_src_sd_btn = NULL; sd_src_mem_btn = NULL; sd_src_daisy_btn = NULL;
@@ -10773,6 +12156,11 @@ void ui_navigate_to(int screen_id) {
             piano_sync_active_engine_state();
         }
         if (screen_id != 9) s_sd_for_xtra = false;
+        if (screen_id != 3) {
+            seq_save_confirm_hide();
+            seq_pattern_list_hide();
+            seq_variation_modal_hide();
+        }
         // Entering the XY pad: re-place the dot from the live FX state (the
         // master may have moved cutoff/reso since the screen was created).
         if (screen_id == 13) fxxy_sync_from_state();
@@ -10814,6 +12202,10 @@ static int8_t   s_pad_noteoff_engine[16] = {-1, -1, -1, -1, -1, -1, -1, -1,
                                            -1, -1, -1, -1, -1, -1, -1, -1};
 
 void ui_process_control_queue(void) {
+    if (s_ctrl_pattern_sync_pending.exchange(false, std::memory_order_acquire)) {
+        control_sync_current_pattern();
+    }
+
     if (s_ctrl_mute_mask_pending.exchange(false, std::memory_order_acquire)) {
         uint16_t mask = s_ctrl_mute_mask.load(std::memory_order_acquire);
         control_send_mute_mask(mask);
@@ -11106,9 +12498,9 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
 }
 
 // =============================================================================
-// LOCAL STATUS SCREENSAVER — shown after 60 seconds without touch.
+// LOCAL STATUS SCREENSAVER — shown after 5 minutes without touch.
 // =============================================================================
-static const uint32_t SCREENSAVER_TIMEOUT_MS = 60000;   // 1 minuto
+static const uint32_t SCREENSAVER_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 static bool     s_screensaver_active = false;
 static int      s_screensaver_return = 2;               // pantalla a restaurar
 
@@ -11162,6 +12554,7 @@ void ui_update_current_screen(void) {
     ui_live_consume_sync_p4();
     pad_inst_consume_engine_sync();
     pod_process_physical_actions();
+    pod_owner_badges_update();
 
     // Melody state published by the local controller. Snapshot
     // before clearing pending so a concurrent re-latch is never half-read.
@@ -11179,18 +12572,26 @@ void ui_update_current_screen(void) {
 
     // Results from the async SD upload / Daisy unload workers.
     sd_midi_load_consume_result();
-    sd_upload_consume_result();
+    const bool factoryKitOwnsUpload = sd_factory_autoload_tick();
+    if (!factoryKitOwnsUpload) sd_upload_consume_result();
     pad_inst_unload_consume_result();
 
-    // Boot terminal: lines reveal in sequence while USB enumerates DaisyPod3.
+    // Boot terminal: every status comes from a real setup result or from the
+    // live USB protocol state. Timing only controls presentation; it never
+    // turns a failed check into OK.
     if (active_screen == 0) {
         if (boot_enter_ms == 0) boot_enter_ms = now;
         uint32_t elapsed = now - boot_enter_ms;
-        // Listo cuando hay enlace (o timeout): el POST queda en pantalla y el
-        // operador entra al LIVE con el botón CONTINUE — ya no salta solo.
-        bool ready = p4.master_connected || elapsed > 5000UL;
-        int progress = (int)constrain((int)(elapsed / 50U), 4, 96);
-        if (ready) progress = 100;
+        const auto& transport = daisyUsb.state();
+        const bool localReady = p4boot.display_ready && p4boot.lvgl_ready
+            && p4boot.ui_ready && p4boot.patterns_ready && p4boot.dsp_ready
+            && p4boot.usb_host_ready;
+        const bool protocolReady = transport.engine_responding
+            && transport.protocol_version == RED808_PROTOCOL_VERSION;
+        const bool scanFinished = protocolReady || elapsed >= 5000u;
+        int progress = p4boot.setup_complete ? 88 : 8;
+        if (transport.link_ready) progress = 94;
+        if (scanFinished) progress = 100;
         if (s_boot_progress) lv_bar_set_value(s_boot_progress, progress, LV_ANIM_ON);
 
         // Cada línea aparece a su tiempo, como un POST de BIOS.
@@ -11204,30 +12605,95 @@ void ui_update_current_screen(void) {
                 lastVisible = i;
             }
         }
-        // Contenido (las estáticas solo se pintan una vez; las de red, al cambiar)
-        static int8_t prevUsb = -1, prevMaster = -1;
-        static bool textInit = false;
-        if (!textInit && s_boot_term[0]) {
-            textInit = true;
-            lv_label_set_text(s_boot_term[0], "> CPU  ESP32-P4 RISC-V DUAL ........ OK");
-            lv_label_set_text(s_boot_term[1], "> MEM  PSRAM 32MB .................. OK");
-            lv_label_set_text(s_boot_term[2], "> GFX  LVGL 1024x600 ............... OK");
-            lv_label_set_text(s_boot_term[3], "> SND  RED808 DRUM ENGINE .......... OK");
-            lv_label_set_text(s_boot_term[4], "> PAD  20 TRACKS / 128 PATTERNS .... OK");
-            lv_label_set_text(s_boot_term[7], "> SYS  WAITING FOR LINK ............ [....]");
-        }
-        const bool usbMaster = daisyUsb.state().link_ready;
-        if (s_boot_term[5] && (int8_t)usbMaster != prevUsb) {
-            prevUsb = (int8_t)usbMaster;
-            lv_label_set_text(s_boot_term[5], usbMaster
-                ? "> USB  DAISYPOD3 ENUMERATED ......... OK"
-                : "> USB  WAITING FOR DAISYPOD3 ........ [SCAN..]");
-        }
-        if (s_boot_term[6] && (int8_t)p4.master_connected != prevMaster) {
-            prevMaster = (int8_t)p4.master_connected;
-            lv_label_set_text(s_boot_term[6], p4.master_connected
-                ? "> LNK  RED808 ENGINE ............... OK"
-                : "> LNK  RED808 ENGINE ............... [SYNC..]");
+        static uint32_t lastBootPaintMs = 0;
+        if (lastBootPaintMs == 0 || now - lastBootPaintMs >= 100u) {
+            lastBootPaintMs = now;
+            auto setBootLine = [](int line, lv_color_t color,
+                                  const char* text) {
+                if (!s_boot_term[line]) return;
+                lv_label_set_text(s_boot_term[line], text);
+                lv_obj_set_style_text_color(s_boot_term[line], color, 0);
+            };
+            char line[96];
+            setBootLine(0, p4boot.display_ready ? boot_phosphor() : RED808_ERROR,
+                p4boot.display_ready
+                    ? "> GFX  MIPI DISPLAY 1024x600 ........ OK"
+                    : "> GFX  MIPI DISPLAY ................. ERROR");
+            setBootLine(1,
+                (p4boot.lvgl_ready && p4boot.ui_ready)
+                    ? boot_phosphor() : RED808_ERROR,
+                (p4boot.lvgl_ready && p4boot.ui_ready)
+                    ? "> UI   LVGL + GT911 TASKS ........... OK"
+                    : "> UI   LVGL / TOUCH TASKS ........... ERROR");
+
+            const uint32_t psramTotalMb
+                = (p4boot.psram_total_bytes + 524288u) / 1048576u;
+            const uint32_t psramFreeMb
+                = (p4boot.psram_free_bytes + 524288u) / 1048576u;
+            snprintf(line, sizeof(line),
+                "> MEM  PSRAM %luMB / FREE %luMB ....... %s",
+                static_cast<unsigned long>(psramTotalMb),
+                static_cast<unsigned long>(psramFreeMb),
+                p4boot.psram_total_bytes > 0 ? "OK" : "WARN");
+            setBootLine(2, p4boot.psram_total_bytes > 0
+                ? boot_phosphor() : RED808_WARNING, line);
+
+            if (p4boot.spiffs_mounted) {
+                snprintf(line, sizeof(line),
+                    "> FS   SPIFFS %lu/%luKB ............... OK",
+                    static_cast<unsigned long>(p4boot.spiffs_used_bytes / 1024u),
+                    static_cast<unsigned long>(p4boot.spiffs_total_bytes / 1024u));
+                setBootLine(3, boot_phosphor(), line);
+            } else {
+                setBootLine(3, RED808_WARNING,
+                    "> FS   SPIFFS NOT MOUNTED ............ WARN");
+            }
+
+            snprintf(line, sizeof(line),
+                "> SEQ  FACTORY PATTERNS %u/%u ........ %s",
+                static_cast<unsigned>(p4boot.factory_patterns_found),
+                static_cast<unsigned>(p4boot.factory_patterns_expected),
+                p4boot.patterns_ready ? "OK" : "ERROR");
+            setBootLine(4, p4boot.patterns_ready
+                ? boot_phosphor() : RED808_ERROR, line);
+            setBootLine(5, p4boot.dsp_ready ? boot_phosphor() : RED808_ERROR,
+                p4boot.dsp_ready
+                    ? "> DSP  SPECTRUM WORKER TASK .......... OK"
+                    : "> DSP  SPECTRUM WORKER TASK .......... ERROR");
+            setBootLine(6,
+                p4boot.usb_host_ready ? boot_phosphor() : RED808_ERROR,
+                p4boot.usb_host_ready
+                    ? "> USB  HOST + CDC DRIVER ............. OK"
+                    : "> USB  HOST / CDC DRIVER ............. ERROR");
+
+            uint8_t loadedSamples = 0;
+            for (uint8_t pad = 0; pad < 16; ++pad)
+                if (transport.sample_mask & (1u << pad)) loadedSamples++;
+            if (!p4boot.usb_host_ready) {
+                setBootLine(7, RED808_ERROR,
+                    "> LNK  DAISYPOD3 UNAVAILABLE ......... ERROR");
+            } else if (!transport.link_ready) {
+                setBootLine(7, RED808_WARNING,
+                    "> LNK  DAISYPOD3 USB DEVICE .......... WAIT");
+            } else if (!protocolReady) {
+                if (transport.protocol_version == 0) {
+                    setBootLine(7, RED808_CYAN,
+                        "> LNK  USB ENUMERATED / PING ......... SYNC");
+                } else {
+                    snprintf(line, sizeof(line),
+                        "> LNK  PROTOCOL %u.%u (NEED 2.3) ..... ERROR",
+                        static_cast<unsigned>(transport.protocol_version >> 8),
+                        static_cast<unsigned>(transport.protocol_version & 0xFFu));
+                    setBootLine(7, RED808_ERROR, line);
+                }
+            } else {
+                snprintf(line, sizeof(line),
+                    "> LNK  DAISY P2.3 / WAV %u/16 ......... %s",
+                    static_cast<unsigned>(loadedSamples),
+                    loadedSamples > 0 ? "OK" : "WAIT");
+                setBootLine(7, loadedSamples > 0
+                    ? boot_phosphor() : RED808_WARNING, line);
+            }
         }
         // Cursor de bloque parpadeante bajo la última línea visible
         if (s_boot_cursor) {
@@ -11237,18 +12703,33 @@ void ui_update_current_screen(void) {
             lv_obj_set_style_opa(s_boot_cursor, on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
         }
 
-        // Self-test completo: cerrar el POST y revelar el botón CONTINUE.
-        // Se espera a que la secuencia de líneas termine (revealMs[7]) para
-        // que el botón no aparezca con el terminal a medio escribir.
+        // Reveal CONTINUE only when the local POST has been read and either
+        // Daisy negotiated the exact protocol or the bounded device scan ended.
         static bool readyShown = false;
-        if (ready && !readyShown && elapsed >= revealMs[BOOT_TERM_LINES - 1] + 200) {
+        if ((protocolReady || scanFinished || !localReady) && !readyShown
+            && elapsed >= revealMs[BOOT_TERM_LINES - 1] + 200) {
             readyShown = true;
-            if (s_boot_term[7])
-                lv_label_set_text(s_boot_term[7], "> SYS  SELF-TEST COMPLETE .......... OK");
-            if (s_boot_status_lbl)
-                lv_label_set_text(s_boot_status_lbl, "SYSTEM READY - PRESS CONTINUE");
             if (s_boot_continue_btn)
                 lv_obj_clear_flag(s_boot_continue_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_boot_status_lbl) {
+            if (!localReady) {
+                lv_label_set_text(s_boot_status_lbl,
+                    "LOCAL INIT ERROR - REVIEW THE FAILED CHECK");
+                lv_obj_set_style_text_color(s_boot_status_lbl, RED808_ERROR, 0);
+            } else if (protocolReady) {
+                lv_label_set_text(s_boot_status_lbl,
+                    "P4 + DAISYPOD3 READY - PRESS CONTINUE");
+                lv_obj_set_style_text_color(s_boot_status_lbl, boot_phosphor(), 0);
+            } else if (scanFinished) {
+                lv_label_set_text(s_boot_status_lbl,
+                    "P4 READY / DAISYPOD3 OFFLINE - PRESS CONTINUE");
+                lv_obj_set_style_text_color(s_boot_status_lbl, RED808_WARNING, 0);
+            } else {
+                lv_label_set_text(s_boot_status_lbl,
+                    "LOCAL INIT OK - NEGOTIATING DAISYPOD3 ...");
+                lv_obj_set_style_text_color(s_boot_status_lbl, boot_phosphor_dim(), 0);
+            }
         }
         // Parpadeo suave del borde del botón mientras espera al operador
         if (readyShown && s_boot_continue_btn) {
@@ -11282,10 +12763,13 @@ void ui_update_current_screen(void) {
         }
     }
 
-    // Status screensaver: show after 60s idle, dismiss on the next touch.
+    // Status screensaver: show after 5 minutes idle, dismiss on next touch.
     screensaver_tick();
 
     ui_update_header();
+    // STATUS is a global overlay and may be opened from any screen. Keep its
+    // hardware values live regardless of the active per-screen updater.
+    pod_status_modal_update();
 
     // Force fx_screen repaint immediately after a local/USB FX change.
     // Must be BEFORE the period throttle so dirty updates aren't delayed up to 33ms.

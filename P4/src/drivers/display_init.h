@@ -14,3 +14,5 @@ esp_lcd_panel_handle_t display_get_panel(void);
 
 // Backlight control
 void display_backlight(bool on);
+void display_set_brightness(uint8_t percent);
+uint8_t display_get_brightness(void);

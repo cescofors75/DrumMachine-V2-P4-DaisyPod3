@@ -6,6 +6,7 @@
 
 #include "lvgl_port.h"
 #include "display_init.h"
+#include "i2c_rotaries.h"
 #include "../include/config.h"
 #include "../ui/ui_screens.h"
 #include <Arduino.h>
@@ -157,6 +158,7 @@ static void touch_release_if_stale(void) {
 
 static void gt911_init(void) {
     Wire.begin(TOUCH_I2C_SDA, TOUCH_I2C_SCL, 400000);
+    i2c_rotaries_init();
 
     pinMode(TOUCH_INT_GPIO, OUTPUT);
     pinMode(TOUCH_RST_GPIO, OUTPUT);
@@ -398,7 +400,7 @@ static void lvgl_task(void* arg) {
 // =============================================================================
 // INIT
 // =============================================================================
-void lvgl_port_init(void) {
+bool lvgl_port_init(void) {
     P4_LOG_PRINTLN("[LVGL] Initializing (zero-copy + vsync + dual-task)...");
 
     lvgl_mutex    = xSemaphoreCreateMutex();
@@ -406,7 +408,7 @@ void lvgl_port_init(void) {
     sem_gui_ready = xSemaphoreCreateBinary();
     if (!lvgl_mutex || !sem_vsync_end || !sem_gui_ready) {
         P4_LOG_PRINTLN("[LVGL] Failed to create synchronization primitives");
-        return;
+        return false;
     }
 
     lv_init();
@@ -466,6 +468,7 @@ void lvgl_port_init(void) {
 
     P4_LOG_PRINTF("[LVGL] Ready: %dx%d, zero-copy, vsync, touch+lvgl@Core0, usb@Core1\n",
                   LCD_H_RES, LCD_V_RES);
+    return touch_ok == pdPASS && lvgl_ok == pdPASS;
 }
 
 void lvgl_port_update(void) {

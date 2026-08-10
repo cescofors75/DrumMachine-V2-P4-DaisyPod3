@@ -8,7 +8,9 @@
 
 // Initialize LVGL display driver + touch input device.
 // Call after display_init() returns successfully.
-void lvgl_port_init(void);
+// Returns true only when the synchronization primitives plus touch/render
+// tasks were actually created.
+bool lvgl_port_init(void);
 
 // No-op (LVGL now runs in dedicated FreeRTOS task)
 void lvgl_port_update(void);

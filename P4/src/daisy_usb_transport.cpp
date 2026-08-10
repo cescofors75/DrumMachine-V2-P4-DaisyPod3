@@ -11,6 +11,8 @@ namespace
 constexpr uint32_t kEngineTimeoutMs = 3000;
 constexpr uint32_t kPingIntervalMs = 1000;
 constexpr uint32_t kPositionIntervalMs = 40;
+constexpr uint32_t kQueryTimeoutMs = 400;
+constexpr size_t kTelemetryBacklogLimit = 8;
 }
 
 uint16_t DaisyUsbTransport::crc16(const uint8_t* data, uint16_t length)
@@ -39,10 +41,21 @@ void DaisyUsbTransport::begin()
     sample_end_ack_accepted_.store(false, std::memory_order_relaxed);
     rx_length_ = 0;
     rx_target_ = 0;
+    pending_query_ = false;
+    pending_query_command_ = 0;
+    pending_query_sequence_ = 0;
+    pending_query_since_ms_ = 0;
 }
 
 bool DaisyUsbTransport::send(uint8_t command, const void* payload,
                              uint16_t payload_length)
+{
+    return sendPacket(command, payload, payload_length, nullptr);
+}
+
+bool DaisyUsbTransport::sendPacket(uint8_t command, const void* payload,
+                                   uint16_t payload_length,
+                                   uint16_t* assigned_sequence)
 {
     if(payload_length > SPI_MAX_PAYLOAD || !usb_cdc_connected())
     {
@@ -70,6 +83,19 @@ bool DaisyUsbTransport::send(uint8_t command, const void* payload,
         return false;
     }
     state_.tx_packets++;
+    if(assigned_sequence != nullptr) *assigned_sequence = header.sequence;
+    return true;
+}
+
+bool DaisyUsbTransport::sendQuery(uint8_t command, const void* payload,
+                                  uint16_t payload_length)
+{
+    uint16_t sequence = 0;
+    if(!sendPacket(command, payload, payload_length, &sequence)) return false;
+    pending_query_ = true;
+    pending_query_command_ = command;
+    pending_query_sequence_ = sequence;
+    pending_query_since_ms_ = millis();
     return true;
 }
 
@@ -149,6 +175,24 @@ void DaisyUsbTransport::setTrackSolo(uint8_t track, bool soloed)
     send(CMD_TRACK_SOLO, payload, sizeof(payload));
 }
 
+void DaisyUsbTransport::setTrackMuteMask(uint16_t mask)
+{
+    const uint8_t payload[2] = {
+        static_cast<uint8_t>(mask & 0xFFu),
+        static_cast<uint8_t>(mask >> 8)
+    };
+    send(CMD_TRACK_MUTE_MASK, payload, sizeof(payload));
+}
+
+void DaisyUsbTransport::setTrackSoloMask(uint16_t mask)
+{
+    const uint8_t payload[2] = {
+        static_cast<uint8_t>(mask & 0xFFu),
+        static_cast<uint8_t>(mask >> 8)
+    };
+    send(CMD_TRACK_SOLO_MASK, payload, sizeof(payload));
+}
+
 void DaisyUsbTransport::setTrackVolume(uint8_t track, uint8_t volume)
 {
     const uint8_t payload[2] = {track, volume};
@@ -196,6 +240,27 @@ void DaisyUsbTransport::synthPreset(uint8_t engine, uint8_t preset)
 {
     const uint8_t payload[2] = {engine, preset};
     send(CMD_SYNTH_PRESET, payload, sizeof(payload));
+}
+
+bool DaisyUsbTransport::uploadSong(const SongEntry* entries, uint8_t count)
+{
+    if(entries == nullptr || count == 0) return false;
+    if(count > SONG_MAX_ENTRIES) count = SONG_MAX_ENTRIES;
+    uint8_t payload[1 + SONG_MAX_ENTRIES * 2] = {};
+    payload[0] = count;
+    for(uint8_t i = 0; i < count; ++i)
+    {
+        payload[1 + i * 2] = entries[i].pattern;
+        payload[2 + i * 2] = entries[i].repeats == 0
+            ? 1u : entries[i].repeats;
+    }
+    return send(CMD_SONG_UPLOAD, payload, static_cast<uint16_t>(1 + count * 2));
+}
+
+bool DaisyUsbTransport::controlSong(uint8_t action)
+{
+    if(action > 2u) return false;
+    return sendU8(CMD_SONG_CONTROL, action);
 }
 
 void DaisyUsbTransport::parseByte(uint8_t byte)
@@ -256,9 +321,46 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
 
     state_.rx_packets++;
     state_.last_response_ms = millis();
-    state_.engine_responding = true;
+    // Do not declare the audio engine ready until PING has negotiated the
+    // exact wire layout. A 2.2 Daisy can answer position/status queries, but
+    // its shorter PodStatePayload is not safe for a 2.3 P4.
+    if(state_.protocol_version == RED808_PROTOCOL_VERSION)
+        state_.engine_responding = true;
 
-    if(header->cmd == CMD_DSQ_GET_POS && header->length >= 3)
+    const bool is_query_response = header->cmd == CMD_PING
+        || header->cmd == CMD_DSQ_GET_POS || header->cmd == CMD_GET_STATUS
+        || header->cmd == CMD_POD_GET_STATE;
+    if(pending_query_ && is_query_response)
+    {
+        if(header->cmd == pending_query_command_
+           && header->sequence == pending_query_sequence_)
+        {
+            pending_query_ = false;
+        }
+        else if(header->cmd == pending_query_command_)
+        {
+            state_.stale_responses++;
+        }
+    }
+
+    if(header->cmd == CMD_PING && header->length >= 8)
+    {
+        uint32_t echo_ms = 0;
+        memcpy(&echo_ms, payload, sizeof(echo_ms));
+        state_.round_trip_ms = millis() - echo_ms;
+        if(header->length >= sizeof(LinkHealthResponse))
+        {
+            LinkHealthResponse health = {};
+            memcpy(&health, payload, sizeof(health));
+            state_.protocol_version = health.protocolVersion;
+            state_.engine_responding =
+                health.protocolVersion == RED808_PROTOCOL_VERSION;
+            state_.capability_flags = health.capabilityFlags;
+            state_.daisy_rx_drops = health.rxDrops;
+            state_.daisy_protocol_errors = health.protocolErrors;
+        }
+    }
+    else if(header->cmd == CMD_DSQ_GET_POS && header->length >= 3)
     {
         state_.step = payload[0];
         state_.pattern = payload[1];
@@ -355,28 +457,35 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
 void DaisyUsbTransport::poll()
 {
     const uint32_t now = millis();
+    if(pending_query_)
+    {
+        if(now - pending_query_since_ms_ < kQueryTimeoutMs) return;
+        pending_query_ = false;
+        state_.query_timeouts++;
+    }
+
+    // Telemetry is expendable; live pad hits, transport and FX control are not.
+    // Do not add polling packets while the USB worker is draining a burst.
+    if(usb_cdc_tx_pending() > kTelemetryBacklogLimit) return;
+
     if(now - last_ping_ms_ >= kPingIntervalMs)
     {
-        last_ping_ms_ = now;
-        send(CMD_PING, &now, sizeof(now));
+        if(sendQuery(CMD_PING, &now, sizeof(now))) last_ping_ms_ = now;
         return;
     }
     if(now - last_position_ms_ >= kPositionIntervalMs)
     {
-        last_position_ms_ = now;
-        send(CMD_DSQ_GET_POS);
+        if(sendQuery(CMD_DSQ_GET_POS)) last_position_ms_ = now;
         return;
     }
     if(now - last_status_ms_ >= 1000u)
     {
-        last_status_ms_ = now;
-        send(CMD_GET_STATUS);
+        if(sendQuery(CMD_GET_STATUS)) last_status_ms_ = now;
         return;
     }
     if(now - last_pod_state_ms_ >= 100u)
     {
-        last_pod_state_ms_ = now;
-        send(CMD_POD_GET_STATE);
+        if(sendQuery(CMD_POD_GET_STATE)) last_pod_state_ms_ = now;
         return;
     }
 }
@@ -394,8 +503,11 @@ void DaisyUsbTransport::process()
     if(!state_.link_ready)
     {
         state_.engine_responding = false;
+        state_.protocol_version = 0;
+        state_.capability_flags = 0;
         rx_length_ = 0;
         rx_target_ = 0;
+        pending_query_ = false;
         return;
     }
     if(state_.last_response_ms != 0

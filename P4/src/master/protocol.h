@@ -159,6 +159,8 @@ typedef struct __attribute__((packed)) {
 #define CMD_TRACK_EQ_HIGH     0x65  // Per-track 3-band EQ high (-12..+12 dB)
 #define CMD_TRACK_FX_ROUTE    0x66  // Per-track FX routing: [track(1), connected(1)]
 #define CMD_TRACK_LFO_CONFIG  0x67  // Per-track LFO config (7 bytes)
+#define CMD_TRACK_MUTE_MASK   0x68  // Atomic 16-track mute mask (uint16 LE)
+#define CMD_TRACK_SOLO_MASK   0x69  // Atomic 16-track solo mask (uint16 LE)
 
 // ═══════════════════════════════════════════════════════
 // COMMANDS: PER-PAD FX (0x70 - 0x7F)
@@ -464,6 +466,21 @@ typedef struct __attribute__((packed)) {
 #define CMD_PING              0xEE  // Ping/Pong
 #define CMD_RESET             0xEF  // Full DSP reset
 
+// Extended PONG is additive: legacy receivers may keep reading only the first
+// 8 bytes (echo + uptime), while V2 peers also negotiate diagnostics here.
+#define RED808_PROTOCOL_VERSION       0x0203u
+#define RED808_CAP_EXTENDED_PONG      0x0001u
+#define RED808_CAP_USB_RX_DIAGNOSTICS 0x0002u
+
+typedef struct __attribute__((packed)) {
+    uint32_t echoMs;
+    uint32_t uptimeMs;
+    uint16_t protocolVersion;
+    uint16_t capabilityFlags;
+    uint32_t rxDrops;
+    uint32_t protocolErrors;
+} LinkHealthResponse;
+
 // ═══════════════════════════════════════════════════════
 // COMMANDS: BULK (0xF0 - 0xFF)
 // ═══════════════════════════════════════════════════════
@@ -500,6 +517,18 @@ enum PodControlFunction : uint8_t {
     POD_FUNC_XTRA_PADS,
     POD_FUNC_DELAY_MIX,
     POD_FUNC_REVERB_MIX,
+    POD_FUNC_CONTROL_CONFIG,
+    POD_FUNC_SCREEN_BRIGHTNESS,
+    POD_FUNC_FLANGER_DEPTH,
+    POD_FUNC_WAVEFOLDER_GAIN,
+    POD_FUNC_CRUSH_MACRO,
+    POD_FUNC_PHASER_DEPTH,
+    POD_FUNC_FILTER_CUTOFF,
+    POD_FUNC_FILTER_RESONANCE,
+    POD_FUNC_DISTORTION,
+    POD_FUNC_BIT_DEPTH,
+    POD_FUNC_SAMPLE_RATE,
+    POD_FUNC_FILTER_TYPE,
     POD_FUNC_COUNT
 };
 
@@ -513,6 +542,8 @@ enum PodLedFunction : uint8_t {
     POD_LED_COUNT
 };
 
+static constexpr uint8_t POD_CONFIG_VERSION = 7;
+
 typedef struct __attribute__((packed)) {
     uint8_t version;
     uint8_t button1Function;
@@ -521,6 +552,11 @@ typedef struct __attribute__((packed)) {
     uint8_t knob2Function;
     uint8_t encoderFunction;
     uint8_t encoderButtonFunction;
+    uint8_t rotary1Function;
+    uint8_t rotary2Function;
+    uint8_t rotary3Function;
+    uint8_t rotary4Function;
+    uint8_t selectorFunction;
     uint8_t led1Function;
     uint8_t led1R;
     uint8_t led1G;
@@ -529,8 +565,11 @@ typedef struct __attribute__((packed)) {
     uint8_t led2R;
     uint8_t led2G;
     uint8_t led2B;
-    uint8_t reserved;
+    uint8_t faderFunction;
 } PodConfigPayload;
+
+static_assert(sizeof(PodConfigPayload) == 21,
+              "P4/Daisy PodConfigPayload wire layout changed");
 
 typedef struct __attribute__((packed)) {
     PodConfigPayload config;
@@ -551,13 +590,27 @@ typedef struct __attribute__((packed)) {
     uint8_t liveVolume;
     uint8_t delayMixValue;   // canonical Daisy 0..127
     uint8_t reverbMixValue;  // canonical Daisy 0..127
-    uint8_t fxActiveBits;    // bit0=delay, bit1=reverb
+    uint8_t fxActiveBits;    // delay,reverb,flanger,phaser,fold,crush,filter,drive
+    uint8_t flangerDepthValue;
+    uint8_t phaserDepthValue;
+    uint8_t wavefolderValue;
+    uint8_t crushValue;
+    uint8_t filterType;
+    uint8_t bitDepth;
+    uint8_t distortionPct;
+    uint8_t reservedFx;
+    uint16_t cutoffHz;
+    uint16_t resonanceX10;
+    uint16_t sampleRateHz;
     uint16_t bpmX10;
     uint8_t playing;
     uint8_t sdPresent;
     uint16_t sampleMask;
     uint32_t revision;
 } PodStatePayload;
+
+static_assert(sizeof(PodStatePayload) == 66,
+              "P4/Daisy PodStatePayload wire layout changed");
 
 // --- Triggers ---
 typedef struct __attribute__((packed)) {
@@ -1085,7 +1138,7 @@ typedef struct __attribute__((packed)) {
 } ChokeGroupPayload;
 
 // CMD_SONG_UPLOAD (0xF2)
-#define SONG_MAX_ENTRIES  32
+#define SONG_MAX_ENTRIES  128
 typedef struct __attribute__((packed)) {
     uint8_t  pattern;    // 0-15
     uint8_t  repeats;    // 1-255 (0 treated as 1)
