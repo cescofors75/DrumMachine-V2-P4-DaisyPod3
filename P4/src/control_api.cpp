@@ -40,10 +40,18 @@ uint8_t activeDaisyPattern = 0;
 uint8_t queuedDaisyPattern = 0xFF;
 uint8_t expectedDaisyPattern = 0xFF;
 uint32_t expectedDaisyPatternSinceMs = 0;
+// `midiSongPrepared` means an arrangement is resident in RAM (and in the user
+// pattern slots). `midiSongEngaged` means SONG mode is actually driving the
+// transport. Keeping the two apart is what lets the user step out to a single
+// pattern and back into the arrangement without re-importing the MIDI file.
 std::atomic<bool> midiSongPrepared{false};
+std::atomic<bool> midiSongEngaged{false};
+std::atomic<bool> midiSongLoop{true};
 std::atomic<bool> midiSongPersisted{false};
 uint8_t midiSongPatternCount = 0;
 uint8_t midiSongChainCount = 0;
+uint8_t midiSongIndex = 0;
+uint8_t midiSongRepeat = 0;
 uint8_t midiSongLogicalPattern[mem_midi::MIDI_SONG_MAX_PATTERNS] = {};
 SongEntry midiSongDaisyChain[mem_midi::MIDI_SONG_MAX_CHAIN] = {};
 
@@ -205,10 +213,12 @@ bool UploadPreparedMidiSong()
         daisyUsb.setTrackEngine(track, -1);
 
     if(!daisyUsb.uploadSong(midiSongDaisyChain, midiSongChainCount)) return false;
-    daisyUsb.controlSong(2);
+    daisyUsb.controlSong(2, midiSongLoop.load(std::memory_order_acquire));
     activeDaisyPattern = 0;
     expectedDaisyPattern = 0;
     expectedDaisyPatternSinceMs = millis();
+    midiSongIndex = 0;
+    midiSongRepeat = 0;
     daisyUsb.selectPattern(0);
     return true;
 }
@@ -267,7 +277,7 @@ void SendCurrentState()
             track, static_cast<uint8_t>(Clamp(p4.track_volume[track], 0, 150)));
         SequencerInstance().muteTrack(track, p4.track_muted[track]);
     }
-    if(midiSongPrepared && midiSongPatternCount > 0)
+    if(midiSongEngaged && midiSongPatternCount > 0)
     {
         const int firstPattern = midiSongLogicalPattern[0];
         SequencerInstance().selectPattern(firstPattern);
@@ -283,7 +293,8 @@ void SendCurrentState()
         }
         daisyUsb.setTrackMuteMask(muteMask);
         daisyUsb.setTrackSoloMask(soloMask);
-        if(p4.is_playing) daisyUsb.controlSong(1);
+        if(p4.is_playing)
+            daisyUsb.controlSong(1, midiSongLoop.load(std::memory_order_acquire));
         else daisyUsb.stop();
         return;
     }
@@ -326,9 +337,13 @@ void control_init()
     expectedDaisyPattern = 0xFF;
     expectedDaisyPatternSinceMs = 0;
     midiSongPrepared = false;
+    midiSongEngaged = false;
+    midiSongLoop = true;
     midiSongPersisted = false;
     midiSongPatternCount = 0;
     midiSongChainCount = 0;
+    midiSongIndex = 0;
+    midiSongRepeat = 0;
     LoadPatternToUi(0);
     factoryPatternsFound = 0;
     for(int pattern = 0; pattern < FACTORY_PATTERN_COUNT; ++pattern)
@@ -413,11 +428,23 @@ void control_process()
             expectedDaisyPattern = 0xFF;
     }
 
-    if(midiSongPrepared && transport.engine_responding
+    if(midiSongEngaged && transport.engine_responding
        && transport.pattern < midiSongPatternCount)
     {
+        // Daisy owns the arrangement clock; P4 follows whichever scene it is
+        // playing so the grid on screen is always the bar you are hearing.
         activeDaisyPattern = transport.pattern;
         expectedDaisyPattern = 0xFF;
+        midiSongIndex = transport.pod.songIndex;
+        midiSongRepeat = transport.pod.songRepeat;
+        // The engine drops out of song mode by itself when a non-looping
+        // arrangement reaches its last bar. Follow it instead of leaving the
+        // header claiming SONG is still running.
+        if(transport.pod.config.version == POD_CONFIG_VERSION
+           && transport.pod.songLength > 0
+           && (transport.pod.songFlags & 0x01u) == 0
+           && !transport.playing)
+            midiSongEngaged = false;
         const int logicalPattern = midiSongLogicalPattern[transport.pattern];
         if(p4.current_pattern != logicalPattern)
         {
@@ -439,7 +466,7 @@ void control_process()
         queuedDaisyPattern = 0xFF;
         expectedDaisyPattern = 0xFF;
     }
-    else if(!midiSongPrepared && transport.engine_responding && engineWasConnected
+    else if(!midiSongEngaged && transport.engine_responding && engineWasConnected
             && queuedLogicalPattern < 0
             && expectedDaisyPattern == 0xFF
             && transport.pattern != activeDaisyPattern)
@@ -492,10 +519,10 @@ void control_send_trigger(uint8_t pad, uint8_t velocity)
 
 void control_send_start()
 {
-    if(midiSongPrepared)
+    if(midiSongEngaged)
     {
         SequencerInstance().songChainPlay();
-        daisyUsb.controlSong(1);
+        daisyUsb.controlSong(1, midiSongLoop.load(std::memory_order_acquire));
     }
     else
     {
@@ -508,7 +535,7 @@ void control_send_start()
 void control_send_stop()
 {
     SequencerInstance().stop();
-    if(midiSongPrepared)
+    if(midiSongEngaged)
     {
         SequencerInstance().songChainStop();
         daisyUsb.controlSong(0);
@@ -531,7 +558,10 @@ void control_send_tempo(float bpm)
 
 void control_send_select_pattern(int index)
 {
-    if(midiSongPrepared) control_cancel_midi_song();
+    // Stepping out to a single pattern used to destroy the whole imported
+    // arrangement, so SONG could only ever be used once per import. Leave song
+    // mode instead; the chain stays resident and SONG re-arms it.
+    control_song_set_engaged(false);
     index = Clamp(index, 0, MAX_PATTERNS - 1);
     SequencerInstance().selectPattern(index);
     LoadPatternToUi(index);
@@ -547,7 +577,7 @@ void control_send_select_pattern(int index)
 
 void control_send_queue_pattern(int index)
 {
-    if(midiSongPrepared) control_cancel_midi_song();
+    control_song_set_engaged(false);
     queuedLogicalPattern = Clamp(index, 0, MAX_PATTERNS - 1);
     queuedDaisyPattern = static_cast<uint8_t>((activeDaisyPattern + 1u) % 20u);
     UploadPattern(queuedDaisyPattern, queuedLogicalPattern);
@@ -578,7 +608,7 @@ void control_send_variation()
 
 bool control_apply_sequencer_variation(uint8_t variation)
 {
-    if(variation < SEQ_VAR_NEON_BREAK || variation > SEQ_VAR_UNDO)
+    if(variation < SEQ_VAR_FIRST || variation > SEQ_VAR_UNDO)
         return false;
 
     Sequencer& sequencer = SequencerInstance();
@@ -618,8 +648,23 @@ bool control_apply_sequencer_variation(uint8_t variation)
         memcpy(variationBackup.probability, probability, sizeof(probability));
         memcpy(variationBackup.ratchet, ratchet, sizeof(ratchet));
 
-        auto hit = [&](int track, int step, uint8_t vel = 104,
-                       uint8_t prob = 100, uint8_t rats = 1)
+        // Every variation below is a transformation of whatever the pattern
+        // already contains. The previous set stamped fixed hits onto fixed
+        // track numbers, so applying one to an imported or user-built pattern
+        // overwrote the groove with somebody else's beat and produced the same
+        // result no matter what was underneath.
+        //
+        // Track roles follow the canonical RED808 layout that both the factory
+        // bank and the MIDI importer target.
+        constexpr int TRK_BD = 0, TRK_SD = 1, TRK_CH = 2, TRK_OH = 3;
+
+        auto clearStep = [&](int track, int step)
+        {
+            active[track][step] = false;
+        };
+
+        auto placeHit = [&](int track, int step, uint8_t vel,
+                            uint8_t prob, uint8_t rats)
         {
             if(track < 0 || track >= 16 || step < 0 || step >= 16) return;
             active[track][step] = true;
@@ -627,112 +672,355 @@ bool control_apply_sequencer_variation(uint8_t variation)
             probability[track][step] = Clamp<uint8_t>(prob, 1, 100);
             ratchet[track][step] = Clamp<uint8_t>(rats, 1, 4);
         };
-        auto rest = [&](int track, int step)
+
+        auto trackHitCount = [&](int track)
         {
-            if(track >= 0 && track < 16 && step >= 0 && step < 16)
-                active[track][step] = false;
+            int count = 0;
+            for(int step = 0; step < 16; ++step) if(active[track][step]) ++count;
+            return count;
+        };
+
+        // Typical velocity of a track, used so generated hits sit at the same
+        // level as the material around them instead of a hardcoded 104.
+        auto trackVelocity = [&](int track, uint8_t fallback)
+        {
+            int total = 0, count = 0;
+            for(int step = 0; step < 16; ++step)
+                if(active[track][step] && velocity[track][step] > 0)
+                {
+                    total += velocity[track][step];
+                    ++count;
+                }
+            return count > 0 ? static_cast<uint8_t>(total / count) : fallback;
+        };
+
+        // The busiest percussion track: the one a hat-style transform should
+        // act on, whatever the kit assignment happens to be.
+        auto busiestPercussionTrack = [&]()
+        {
+            int best = -1, bestCount = 0;
+            for(int track = TRK_CH; track < 16; ++track)
+            {
+                const int count = trackHitCount(track);
+                if(count > bestCount) { bestCount = count; best = track; }
+            }
+            return bestCount >= 4 ? best : -1;
+        };
+
+        auto rotateTrack = [&](int track, int by)
+        {
+            bool a[16]; uint8_t v[16], pr[16], rt[16];
+            for(int step = 0; step < 16; ++step)
+            {
+                const int src = ((step - by) % 16 + 16) % 16;
+                a[step] = active[track][src];
+                v[step] = velocity[track][src];
+                pr[step] = probability[track][src];
+                rt[step] = ratchet[track][src];
+            }
+            for(int step = 0; step < 16; ++step)
+            {
+                active[track][step] = a[step];
+                velocity[track][step] = v[step];
+                probability[track][step] = pr[step];
+                ratchet[track][step] = rt[step];
+            }
+        };
+
+        auto swapSteps = [&](int track, int a, int b)
+        {
+            bool ta = active[track][a];
+            active[track][a] = active[track][b];
+            active[track][b] = ta;
+            uint8_t tv = velocity[track][a];
+            velocity[track][a] = velocity[track][b];
+            velocity[track][b] = tv;
+            uint8_t tp = probability[track][a];
+            probability[track][a] = probability[track][b];
+            probability[track][b] = tp;
+            uint8_t tr = ratchet[track][a];
+            ratchet[track][a] = ratchet[track][b];
+            ratchet[track][b] = tr;
+        };
+
+        // Bjorklund-style Euclidean distribution of `pulses` over 16 steps.
+        auto euclidHasPulse = [](int pulses, int step)
+        {
+            if(pulses <= 0) return false;
+            if(pulses >= 16) return true;
+            return ((step * pulses) % 16) < pulses;
+        };
+
+        // Deterministic per-pattern jitter: applying the same variation to the
+        // same pattern twice must produce the same result, and UNDO has to be
+        // able to reverse exactly one application.
+        uint32_t rngState = 0x9E3779B9u ^ (static_cast<uint32_t>(pattern) * 2654435761u)
+                          ^ (static_cast<uint32_t>(variation) * 40503u);
+        auto nextRandom = [&](int modulo)
+        {
+            rngState ^= rngState << 13;
+            rngState ^= rngState >> 17;
+            rngState ^= rngState << 5;
+            return modulo > 0 ? static_cast<int>(rngState % static_cast<uint32_t>(modulo)) : 0;
         };
 
         switch(variation)
         {
-            case SEQ_VAR_NEON_BREAK:
-                for(int track = 2; track <= 7; ++track)
-                    for(int step = 0; step < 4; ++step) rest(track, step);
-                for(int step : {3, 7, 11, 15}) hit(3, step, step == 15 ? 118 : 92);
-                for(int step : {6, 14}) hit(5, step, 106, 100, step == 14 ? 2 : 1);
-                for(int step : {5, 13}) hit(6, step, 78, 78);
-                hit(8, 11, 94); hit(9, 13, 104, 100, 2); hit(10, 15, 122, 100, 3);
-                break;
-
-            case SEQ_VAR_RATCHET_STORM:
-                for(int step = 0; step < 16; ++step) rest(2, step);
-                for(int step = 0; step < 16; step += 2)
-                    hit(2, step, (step % 4 == 0) ? 112 : 82, 100,
-                        step >= 12 ? 4 : 2);
-                hit(3, 7, 92); hit(3, 15, 120, 100, 2);
-                break;
-
             case SEQ_VAR_GHOST_GROOVE:
-                for(int step : {3, 7, 11, 15}) hit(1, step, 42, 68);
-                for(int step : {2, 6, 10, 14}) hit(5, step, 58, 76);
-                hit(11, 5, 64, 62); hit(11, 13, 72, 70);
-                break;
-
-            case SEQ_VAR_POLYRHYTHM:
-                for(int step = 0; step < 16; step += 3) hit(6, step, 82, 86);
-                for(int step = 1; step < 16; step += 5) hit(7, step, 76, 78);
-                for(int step = 2; step < 16; step += 7) hit(12, step, 70, 72, 2);
-                break;
-
-            case SEQ_VAR_HALF_TIME:
-                for(int step = 0; step < 16; ++step) {
-                    rest(1, step); rest(5, step);
-                    if((step & 3) != 0) rest(2, step);
-                }
-                hit(0, 0, 124); hit(0, 10, 112);
-                hit(1, 8, 124); hit(5, 8, 92);
-                hit(3, 15, 112, 100, 2);
-                break;
-
-            case SEQ_VAR_MIRROR:
-                for(int track = 2; track < 16; ++track)
+            {
+                // Add quiet, low-probability notes in the gaps of the tracks
+                // that already carry the groove. Nothing existing is removed.
+                for(int track = TRK_SD; track < 16; ++track)
                 {
-                    for(int step = 0; step < 8; ++step)
+                    const int hits = trackHitCount(track);
+                    if(hits == 0 || hits > 10) continue;
+                    const uint8_t base = trackVelocity(track, 96);
+                    for(int step = 0; step < 16; ++step)
                     {
-                        const int other = 15 - step;
-                        bool a = active[track][step];
-                        active[track][step] = active[track][other];
-                        active[track][other] = a;
-                        uint8_t v = velocity[track][step];
-                        velocity[track][step] = velocity[track][other];
-                        velocity[track][other] = v;
-                        uint8_t p = probability[track][step];
-                        probability[track][step] = probability[track][other];
-                        probability[track][other] = p;
-                        uint8_t r = ratchet[track][step];
-                        ratchet[track][step] = ratchet[track][other];
-                        ratchet[track][other] = r;
+                        if(active[track][step]) continue;
+                        // Only in the sixteenth right before an existing hit:
+                        // that is where a ghost note reads as a flam and not
+                        // as a new part.
+                        const int nextStep = (step + 1) & 15;
+                        if(!active[track][nextStep]) continue;
+                        if((step & 1) == 0) continue;
+                        placeHit(track, step,
+                                 static_cast<uint8_t>(Clamp<int>(base / 3, 8, 55)),
+                                 static_cast<uint8_t>(55 + nextRandom(25)), 1);
                     }
                 }
                 break;
+            }
 
-            case SEQ_VAR_TOM_CASCADE:
-                for(int track = 8; track <= 10; ++track)
-                    for(int step = 0; step < 16; ++step) rest(track, step);
-                hit(8, 8, 90); hit(8, 11, 98);
-                hit(9, 10, 102); hit(9, 13, 108, 100, 2);
-                hit(10, 12, 112); hit(10, 14, 118, 100, 2);
-                hit(10, 15, 127, 100, 4);
+            case SEQ_VAR_ROTATE:
+            {
+                // Push every percussion track three sixteenths later while the
+                // kick and snare stay put, so the backbeat survives but the
+                // pattern lands somewhere new.
+                for(int track = TRK_CH; track < 16; ++track)
+                    if(trackHitCount(track) > 0) rotateTrack(track, 3);
                 break;
+            }
 
-            case SEQ_VAR_ACID_SWITCH:
-                for(int track = 11; track < 16; ++track)
-                    for(int step = 0; step < 16; ++step) rest(track, step);
-                for(int step = 0; step < 16; ++step)
+            case SEQ_VAR_HALF_TIME:
+            {
+                // Stretch the first eight steps over the whole bar. That is the
+                // actual definition of half time, and it keeps the source
+                // material recognisable.
+                for(int track = 0; track < 16; ++track)
                 {
-                    if((step % 3) == 0) hit(11, step, 104, 94);
-                    if((step % 5) == 1) hit(12, step, 92, 82);
-                    if((step & 3) == 3) hit(13 + ((step >> 2) % 3), step,
-                                              98, 88, step >= 12 ? 2 : 1);
-                }
-                break;
-
-            case SEQ_VAR_HAT_LIFT:
-                for(int step = 0; step < 16; ++step) {
-                    rest(2, step); rest(3, step);
-                }
-                for(int step = 0; step < 16; step += 2)
-                    hit(2, step, (step % 4 == 0) ? 112 : 76, 100,
-                        step == 14 ? 3 : 1);
-                hit(3, 7, 94); hit(3, 15, 122, 100, 2);
-                break;
-
-            case SEQ_VAR_SPARSE_SPACE:
-                for(int track = 2; track < 16; ++track)
+                    bool a[16] = {}; uint8_t v[16] = {}, pr[16] = {}, rt[16] = {};
+                    for(int step = 0; step < 8; ++step)
+                    {
+                        a[step * 2] = active[track][step];
+                        v[step * 2] = velocity[track][step];
+                        pr[step * 2] = probability[track][step];
+                        rt[step * 2] = ratchet[track][step];
+                    }
                     for(int step = 0; step < 16; ++step)
-                        if(((track * 5 + step * 3) % 7) < 5) rest(track, step);
-                hit(3, 15, 94, 86);
+                    {
+                        active[track][step] = a[step];
+                        velocity[track][step] = v[step] ? v[step] : 100u;
+                        probability[track][step] = pr[step] ? pr[step] : 100u;
+                        ratchet[track][step] = rt[step] ? rt[step] : 1u;
+                    }
+                }
                 break;
+            }
+
+            case SEQ_VAR_DOUBLE_TIME:
+            {
+                // The inverse: fold the bar in half and play it twice.
+                for(int track = 0; track < 16; ++track)
+                {
+                    bool a[16] = {}; uint8_t v[16] = {}, pr[16] = {}, rt[16] = {};
+                    for(int step = 0; step < 16; ++step)
+                    {
+                        const int src = (step % 8) * 2;
+                        a[step] = active[track][src];
+                        v[step] = velocity[track][src];
+                        pr[step] = probability[track][src];
+                        rt[step] = ratchet[track][src];
+                    }
+                    for(int step = 0; step < 16; ++step)
+                    {
+                        active[track][step] = a[step];
+                        velocity[track][step] = v[step] ? v[step] : 100u;
+                        probability[track][step] = pr[step] ? pr[step] : 100u;
+                        ratchet[track][step] = rt[step] ? rt[step] : 1u;
+                    }
+                }
+                break;
+            }
+
+            case SEQ_VAR_SWAP_HALVES:
+            {
+                // Swap beats 1-2 with beats 3-4 on the percussion layer. The
+                // old MIRROR reflected the bar around its centre, which moved
+                // the downbeat to step 15 and destroyed the pulse.
+                for(int track = TRK_CH; track < 16; ++track)
+                    for(int step = 0; step < 8; ++step)
+                        swapSteps(track, step, step + 8);
+                break;
+            }
+
+            case SEQ_VAR_EUCLID:
+            {
+                // Redistribute each track's own hit count evenly across the
+                // bar. The density of the pattern is preserved; only the
+                // placement changes.
+                for(int track = TRK_CH; track < 16; ++track)
+                {
+                    const int hits = trackHitCount(track);
+                    if(hits < 2 || hits > 12) continue;
+                    const uint8_t vel = trackVelocity(track, 100);
+                    const uint8_t prob = probability[track][0] ? probability[track][0] : 100u;
+                    for(int step = 0; step < 16; ++step) clearStep(track, step);
+                    for(int step = 0; step < 16; ++step)
+                        if(euclidHasPulse(hits, step))
+                            placeHit(track, step,
+                                     (step % 4) == 0
+                                        ? static_cast<uint8_t>(Clamp<int>(vel + 14, 1, 127))
+                                        : vel,
+                                     prob, 1);
+                }
+                break;
+            }
+
+            case SEQ_VAR_ACCENT_GROOVE:
+            {
+                // Re-articulate the dynamics of what is already there: strong
+                // downbeats, softer offbeats, and a lift into the next bar.
+                for(int track = 0; track < 16; ++track)
+                {
+                    for(int step = 0; step < 16; ++step)
+                    {
+                        if(!active[track][step]) continue;
+                        const uint8_t base = velocity[track][step]
+                                           ? velocity[track][step] : 100u;
+                        int shaped = base;
+                        if((step & 3) == 0)      shaped = base + 16;   // beat
+                        else if((step & 1) == 0) shaped = base - 4;    // eighth
+                        else                     shaped = base - 18;   // sixteenth
+                        if(step == 15) shaped = base + 10;             // pickup
+                        velocity[track][step] =
+                            static_cast<uint8_t>(Clamp<int>(shaped, 12, 127));
+                    }
+                }
+                break;
+            }
+
+            case SEQ_VAR_RATCHET_STORM:
+            {
+                // Turn the hits that already fall in the last beat into rolls,
+                // building towards the bar line, instead of replacing the hats
+                // with a generated pattern.
+                for(int track = TRK_CH; track < 16; ++track)
+                {
+                    for(int step = 12; step < 16; ++step)
+                    {
+                        if(!active[track][step]) continue;
+                        ratchet[track][step] =
+                            static_cast<uint8_t>(Clamp<int>(step - 10, 2, 4));
+                    }
+                }
+                // If nothing lived in the last beat there is nothing to roll,
+                // so seed the busiest percussion track with one.
+                bool anyRatchet = false;
+                for(int track = TRK_CH; track < 16 && !anyRatchet; ++track)
+                    for(int step = 12; step < 16; ++step)
+                        if(active[track][step] && ratchet[track][step] > 1)
+                        { anyRatchet = true; break; }
+                if(!anyRatchet)
+                {
+                    const int track = busiestPercussionTrack();
+                    if(track >= 0)
+                        placeHit(track, 15, trackVelocity(track, 104), 100, 3);
+                }
+                break;
+            }
+
+            case SEQ_VAR_SIXTEENTH_LIFT:
+            {
+                // Fill the offbeat sixteenths of the busiest percussion track,
+                // keeping its existing hits and its own velocity level.
+                const int track = busiestPercussionTrack();
+                if(track < 0) break;
+                const uint8_t vel = trackVelocity(track, 96);
+                for(int step = 1; step < 16; step += 2)
+                    if(!active[track][step])
+                        placeHit(track, step,
+                                 static_cast<uint8_t>(Clamp<int>(vel - 26, 12, 127)),
+                                 100, 1);
+                break;
+            }
+
+            case SEQ_VAR_THIN_OUT:
+            {
+                // Open up space by removing offbeat percussion hits, never the
+                // downbeats and never the kick or snare.
+                for(int track = TRK_CH; track < 16; ++track)
+                {
+                    if(trackHitCount(track) < 3) continue;
+                    for(int step = 0; step < 16; ++step)
+                    {
+                        if(!active[track][step]) continue;
+                        if((step & 3) == 0) continue;
+                        if(nextRandom(100) < 55) clearStep(track, step);
+                    }
+                }
+                break;
+            }
+
+            case SEQ_VAR_DICE_PROBABILITY:
+            {
+                // Leave the notes alone and make the bar breathe: offbeat hits
+                // become probabilistic, downbeats stay certain.
+                for(int track = 0; track < 16; ++track)
+                {
+                    for(int step = 0; step < 16; ++step)
+                    {
+                        if(!active[track][step]) continue;
+                        if(track <= TRK_SD && (step & 3) == 0)
+                        {
+                            probability[track][step] = 100;
+                            continue;
+                        }
+                        probability[track][step] = (step & 3) == 0
+                            ? static_cast<uint8_t>(88 + nextRandom(12))
+                            : static_cast<uint8_t>(45 + nextRandom(40));
+                    }
+                }
+                break;
+            }
+
+            case SEQ_VAR_BREAK:
+            {
+                // A classic break: strip the first beat of the percussion layer
+                // and answer it with the material from the last beat, moved
+                // one sixteenth earlier so it lands syncopated.
+                for(int track = TRK_CH; track < 16; ++track)
+                {
+                    if(trackHitCount(track) == 0) continue;
+                    for(int step = 0; step < 4; ++step) clearStep(track, step);
+                    for(int step = 12; step < 16; ++step)
+                    {
+                        if(!active[track][step]) continue;
+                        placeHit(track, step - 12 + 1,
+                                 velocity[track][step] ? velocity[track][step]
+                                                       : trackVelocity(track, 100),
+                                 probability[track][step] ? probability[track][step] : 100u,
+                                 ratchet[track][step]);
+                    }
+                }
+                // Keep the pulse readable: the kick still marks the downbeat.
+                if(!active[TRK_BD][0])
+                    placeHit(TRK_BD, 0, trackVelocity(TRK_BD, 118), 100, 1);
+                // Close the break with a roll on the open hat if it is playing.
+                if(trackHitCount(TRK_OH) > 0)
+                    placeHit(TRK_OH, 15, trackVelocity(TRK_OH, 110), 100, 2);
+                break;
+            }
 
             default:
                 return false;
@@ -799,21 +1087,42 @@ void control_send_build4()
 
 void control_send_drop()
 {
+    // DROP used to mute tracks 2..15 and leave them muted: the button could
+    // only ever be pressed once, and the only way back was to unmute fourteen
+    // tracks by hand. It is a toggle, and it remembers what was already muted
+    // so releasing the drop restores the mix the user had set up.
+    static bool dropActive = false;
+    static uint16_t preDropMuteMask = 0;
+
+    if(!dropActive)
+    {
+        preDropMuteMask = 0;
+        for(int track = 0; track < 16; ++track)
+            if(p4.track_muted[track]) preDropMuteMask |= (uint16_t)(1u << track);
+        for(int track = 2; track < 16; ++track)
+            control_send_mute(track, true);
+        dropActive = true;
+        return;
+    }
+
     for(int track = 2; track < 16; ++track)
-        control_send_mute(track, true);
+        control_send_mute(track, (preDropMuteMask & (1u << track)) != 0);
+    dropActive = false;
+}
+
+bool control_drop_active()
+{
+    // Tracks 2..15 all muted is the state DROP leaves behind, whichever way
+    // it was reached.
+    for(int track = 2; track < 16; ++track)
+        if(!p4.track_muted[track]) return false;
+    return true;
 }
 
 void control_send_launch_demo_set()
 {
     control_send_select_pattern(0);
     control_send_start();
-}
-
-void control_send_mix_preset(bool club_warm)
-{
-    control_send_set_volume(club_warm ? 110 : 100);
-    control_send_set_filter_cutoff(club_warm ? 12000 : 20000);
-    control_send_set_filter_resonance(club_warm ? 1.4f : 1.0f);
 }
 
 void control_send_get_pattern(int pattern) { LoadPatternToUi(pattern); }
@@ -918,7 +1227,10 @@ bool control_install_midi_song(const mem_midi::MidiSongData& song)
     LoadPatternToUi(firstPattern);
     SetOriginalTempo(song.bpm);
     midiSongPrepared = true;
+    midiSongEngaged = true;
     midiSongPersisted = persisted;
+    midiSongIndex = 0;
+    midiSongRepeat = 0;
     queuedLogicalPattern = -1;
     queuedDaisyPattern = 0xFF;
     activeDaisyPattern = 0;
@@ -937,6 +1249,75 @@ bool control_midi_song_ready()
     return midiSongPrepared;
 }
 
+bool control_song_available()
+{
+    return midiSongPrepared && midiSongChainCount > 0;
+}
+
+bool control_song_engaged()
+{
+    return midiSongEngaged;
+}
+
+bool control_song_loop()
+{
+    return midiSongLoop.load(std::memory_order_acquire);
+}
+
+void control_song_set_loop(bool loop)
+{
+    midiSongLoop.store(loop, std::memory_order_release);
+    if(midiSongEngaged && control_available())
+        daisyUsb.controlSong(p4.is_playing ? 1u : 2u, loop);
+}
+
+bool control_song_set_engaged(bool engaged)
+{
+    if(engaged && !control_song_available()) return false;
+    if(midiSongEngaged == engaged) return engaged;
+
+    midiSongEngaged = engaged;
+    if(!engaged)
+    {
+        SequencerInstance().songChainStop();
+        if(control_available()) daisyUsb.controlSong(0);
+        return false;
+    }
+
+    // Re-arming has to re-upload: the resident Daisy slots may have been
+    // overwritten by whatever single pattern the user was auditioning.
+    SequencerInstance().songChainReset();
+    const int firstPattern = midiSongLogicalPattern[0];
+    SequencerInstance().selectPattern(firstPattern);
+    LoadPatternToUi(firstPattern);
+    ui_sequencer_sync_from_current_pattern();
+    ApplyPatternPerformance(firstPattern);
+    if(control_available())
+    {
+        UploadPreparedMidiSong();
+        if(p4.is_playing)
+        {
+            SequencerInstance().songChainPlay();
+            daisyUsb.controlSong(1, midiSongLoop.load(std::memory_order_acquire));
+        }
+    }
+    return true;
+}
+
+void control_song_status(uint8_t* index, uint8_t* count, uint8_t* pattern)
+{
+    const uint8_t chain = midiSongChainCount;
+    const uint8_t idx = midiSongIndex < chain ? midiSongIndex : 0u;
+    if(index) *index = idx;
+    if(count) *count = chain;
+    if(pattern)
+    {
+        const uint8_t resident = chain > 0 ? midiSongDaisyChain[idx].pattern : 0u;
+        *pattern = resident < midiSongPatternCount
+            ? midiSongLogicalPattern[resident] : 0u;
+    }
+}
+
 bool control_midi_song_persisted()
 {
     return midiSongPrepared && midiSongPersisted;
@@ -949,9 +1330,12 @@ void control_cancel_midi_song()
     SequencerInstance().songChainReset();
     daisyUsb.controlSong(2);
     midiSongPrepared = false;
+    midiSongEngaged = false;
     midiSongPersisted = false;
     midiSongPatternCount = 0;
     midiSongChainCount = 0;
+    midiSongIndex = 0;
+    midiSongRepeat = 0;
 }
 
 void control_send_unload_daisy(uint8_t pad)
@@ -1035,7 +1419,46 @@ void control_send_set_filter(int type)
 {
     if(i2c_rotaries_owns_function(POD_FUNC_FILTER_TYPE)
        && !i2c_rotaries_is_applying()) return;
+    const int previous = p4.filter_type;
     p4.filter_type = Clamp(type, 0, 14);
+    // A model is inaudible while CUTOFF sits at whichever end of the sweep is
+    // transparent for it: a low-pass at 20 kHz, a high-pass at 20 Hz, a
+    // band-pass parked at either extreme. Selecting a filter and hearing
+    // nothing reads as a broken effect, so park the cutoff somewhere musical
+    // the first time a model is engaged. An explicit cutoff the user already
+    // dialled in is left alone.
+    if(p4.filter_type != FTYPE_NONE && previous != p4.filter_type)
+    {
+        const bool parkedOpen   = p4.cutoff_hz >= 19000;
+        const bool parkedClosed = p4.cutoff_hz <= 40;
+        if(parkedOpen || parkedClosed)
+        {
+            int musical = 1000;
+            switch(p4.filter_type)
+            {
+                case FTYPE_LOWPASS:
+                case FTYPE_RESONANT:
+                case FTYPE_LADDER:
+                case FTYPE_SVF_LP:    musical = 6000; break;
+                case FTYPE_HIGHPASS:
+                case FTYPE_SVF_HP:    musical = 300;  break;
+                case FTYPE_LOWSHELF:  musical = 220;  break;
+                case FTYPE_HIGHSHELF: musical = 5000; break;
+                case FTYPE_COMB:      musical = 220;  break;
+                default:              musical = 1200; break;   // BP/notch/AP/peak
+            }
+            p4.cutoff_hz = musical;
+        }
+        // The three EQ models take their gain from RESO. At the bottom of its
+        // range that is a full 18 dB cut, which sounds like the model muted the
+        // mix rather than a neutral starting point.
+        const bool isEq = p4.filter_type == FTYPE_PEAKING
+                       || p4.filter_type == FTYPE_LOWSHELF
+                       || p4.filter_type == FTYPE_HIGHSHELF;
+        // RESO maps 0.7..20.0 onto -18..+18 dB for these three, so a useful
+        // starting point is three quarters up the sweep.
+        if(isEq && p4.resonance_x10 < 120) p4.resonance_x10 = 152;  // ≈ +9 dB
+    }
     SendFilterState();
 }
 

@@ -1072,9 +1072,16 @@ struct __attribute__((packed)) PodStatePayload {
     uint8_t sdPresent;
     uint16_t sampleMask;
     uint32_t revision;
+    /* Song mode. Appended at the end on purpose: P4 accepts any packet at
+     * least as long as its own struct, so a Daisy running ahead of its P4
+     * still enumerates and the extra bytes are simply ignored. */
+    uint8_t songIndex;     /* position in the chain */
+    uint8_t songLength;    /* 0 = no arrangement loaded */
+    uint8_t songRepeat;    /* bars already played of the current entry */
+    uint8_t songFlags;     /* bit0 = playing, bit1 = looping */
 };
 
-static_assert(sizeof(PodStatePayload) == 66,
+static_assert(sizeof(PodStatePayload) == 70,
               "P4/Daisy PodStatePayload wire layout changed");
 
 static constexpr uint8_t POD_CONFIG_VERSION = 7;
@@ -1284,7 +1291,11 @@ struct BiquadEQ {
                 break;
             }
             case FTYPE_ALLPASS:
-                /* Audio EQ Cookbook — all-pass 2nd order */
+                /* Audio EQ Cookbook — all-pass 2nd order. Magnitude response is
+                 * flat by definition, so on the master bus this is only audible
+                 * once the output is blended back with the dry signal (see the
+                 * FTYPE_ALLPASS branch in the master chain, which turns it into
+                 * a tunable notch). Kept phase-accurate here. */
                 a0i = 1.f/(1.f+a);
                 b0 = (1.f-a)*a0i; b1=(-2.f*c_)*a0i; b2=1.f;
                 a1 = b1; a2 = (1.f-a)*a0i;
@@ -1302,12 +1313,53 @@ struct BiquadEQ {
     }
 };
 
-static inline float GlobalEqGainDb(uint8_t type)
+static inline float clampF(float v, float lo, float hi);
+
+static inline bool IsGlobalEqType(uint8_t type)
 {
-    /* The master payload has no EQ-gain field. A fixed musical boost keeps
-     * PEAK/LOW SHELF/HIGH SHELF distinct instead of becoming identity filters. */
-    return (type == FTYPE_PEAKING || type == FTYPE_LOWSHELF
-            || type == FTYPE_HIGHSHELF) ? 6.0f : 0.0f;
+    return type == FTYPE_PEAKING || type == FTYPE_LOWSHELF
+        || type == FTYPE_HIGHSHELF;
+}
+
+/* The RESO control on P4 spans exactly this range; the wire clamp is wider so
+ * that older/looser senders still land somewhere sane. Normalising against the
+ * range the UI actually produces is what makes a full sweep of the arc reach
+ * the full effect instead of stopping a few percent in. */
+static constexpr float kUiFilterQMin = 0.7f;
+static constexpr float kUiFilterQMax = 20.0f;
+
+static inline float FilterQNormalized(float q)
+{
+    return clampF((q - kUiFilterQMin) / (kUiFilterQMax - kUiFilterQMin),
+                  0.0f, 1.0f);
+}
+
+/* The master payload has no EQ-gain field, so a fixed boost used to be the
+ * only way to keep PEAK/LOW SHELF/HIGH SHELF from being identity filters.
+ * A fixed +6 dB is barely audible and leaves RESO doing nothing at all on
+ * those three models. RESO now *is* the gain for them: bottom of the sweep
+ * is a full cut, the middle is flat, the top is a full boost. */
+static inline float GlobalEqGainDb(uint8_t type, float q)
+{
+    if(!IsGlobalEqType(type)) return 0.0f;
+    return (FilterQNormalized(q) - 0.5f) * 36.0f;   /* -18 .. +18 dB */
+}
+
+/* EQ models take their gain from RESO, so their bandwidth must stay musical
+ * and constant instead of collapsing to a needle at the ends of the sweep. */
+static inline float GlobalEqQ(uint8_t type, float q)
+{
+    return IsGlobalEqType(type) ? 0.9f : q;
+}
+
+/* Ladder / SVF resonance is normalised 0..1, but the wire carries a biquad-style
+ * Q. The old `q / 28` put the default Q of 0.707 at 0.025 and the top of the UI
+ * sweep at 0.71, i.e. no audible resonance anywhere in the lower two thirds of
+ * the control. This curve reaches a usable 0.5 by mid travel and stops short of
+ * the self-oscillation that would blow up the master bus. */
+static inline float NormalizedResonance(float q)
+{
+    return clampF(sqrtf(FilterQNormalized(q)) * 0.95f, 0.0f, 0.95f);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1428,6 +1480,10 @@ static uint8_t songLength    = 0;
 static bool    songPlaying   = false;
 static uint8_t songIdx       = 0;
 static uint8_t songRepeatCnt = 0;
+/* When set, reaching the end of the chain wraps back to the first entry
+ * instead of stopping the transport. The startup showcase always loops; an
+ * imported arrangement loops only when the host asks it to. */
+static bool    songLoop      = false;
 
 /* Expanded LFO targets */
 enum TrackLfoTargetEx : uint8_t {
@@ -1464,6 +1520,15 @@ static uint32_t gFilterSrReduce = 0;  /* 0 = disabled */
 static float   gSrHoldL = 0, gSrHoldR = 0;
 static uint32_t gSrPhase = 0;
 static bool     gSrPrimed = false;
+/* Derived from gFilterQ once per parameter change instead of per sample. */
+static float   gCombFeedback  = 0.35f;
+static float   gAllpassDepth  = 0.5f;
+
+/* Single owner of "apply gFilterType/gFilterCutoff/gFilterQ to the DSP".
+ * The three command handlers used to duplicate this block, which is how the
+ * EQ models ended up with a hardcoded gain and how a type change could leave
+ * the biquad history of the previous model ringing in the new one. */
+static void ApplyGlobalFilterSettings(bool typeChanged);
 
 static bool* GetMasterFxRouteFlag(uint8_t fxId)
 {
@@ -1505,6 +1570,51 @@ static inline bool IsWaveFolderEngaged() { return waveFolderRouted && waveFolder
 static inline bool IsLimiterEngaged()    { return limiterRouted && limiterActive; }
 static inline bool IsAutowahEngaged()    { return autowahRouted && autowahActive; }
 static inline bool IsEarlyRefEngaged()   { return erRouted && erActive && erMix > 0.0001f; }
+
+static void ApplyGlobalFilterSettings(bool typeChanged)
+{
+    gFilterCutoff = clampF(gFilterCutoff, 20.f, 20000.f);
+    /* The RESONANT model is the only one allowed past Q 28. The clamp used to
+     * be applied per command, so switching RESONANT → LOWPASS could leave a
+     * Q of 40 on a single biquad and produce a screaming peak. */
+    gFilterQ = (gFilterType == FTYPE_RESONANT) ? clampF(gFilterQ, 0.3f, 40.f)
+                                               : clampF(gFilterQ, 0.3f, 28.f);
+
+    const float resNorm = NormalizedResonance(gFilterQ);
+    gCombFeedback = clampF(0.15f + resNorm * 0.82f, 0.f, 0.97f);
+    gAllpassDepth = clampF(0.25f + resNorm * 0.75f, 0.f, 1.f);
+
+    if(typeChanged){
+        /* Dump the history of the model we are leaving. Reusing it turned every
+         * model change into a click, and a high-Q tail could keep ringing
+         * through a filter that no longer had the poles to damp it. */
+        gFilterL.Reset();  gFilterR.Reset();
+        gFilter2L.Reset(); gFilter2R.Reset();
+    }
+
+    if(gFilterType == FTYPE_LADDER){
+        masterLadderL.SetFreq(gFilterCutoff);
+        masterLadderR.SetFreq(gFilterCutoff);
+        masterLadderL.SetRes(resNorm);
+        masterLadderR.SetRes(resNorm);
+    } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
+        /* DaisySP's SVF is only unconditionally stable below sr/3. */
+        const float svfFreq = clampF(gFilterCutoff, 20.f, (float)SAMPLE_RATE / 3.2f);
+        masterSvfL.SetFreq(svfFreq);
+        masterSvfR.SetFreq(svfFreq);
+        masterSvfL.SetRes(resNorm);
+        masterSvfR.SetRes(resNorm);
+    } else if(gFilterType != FTYPE_NONE && gFilterType != FTYPE_COMB){
+        const float eqQ  = GlobalEqQ(gFilterType, gFilterQ);
+        const float eqDb = GlobalEqGainDb(gFilterType, gFilterQ);
+        gFilterL.SetType(gFilterType, gFilterCutoff, eqQ, (float)SAMPLE_RATE, eqDb);
+        gFilterR.SetType(gFilterType, gFilterCutoff, eqQ, (float)SAMPLE_RATE, eqDb);
+        if(gFilterType == FTYPE_RESONANT){
+            gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
+            gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
+        }
+    }
+}
 
 /* ═══════════════════════════════════════════════════════════════════
  *  13. PER-PAD STATE
@@ -4637,6 +4747,7 @@ static __attribute__((noinline, optimize("O1"))) void BuildStartupShowcaseProgra
     songPlaying = false;
     songIdx = 0;
     songRepeatCnt = 0;
+    songLoop = true;   /* the showcase is an endless demo */
     dseq.currentPattern = 0;
     dseq.patternLength = 64;
     dseq.currentStep = -1;
@@ -5032,13 +5143,14 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                         dseq.currentPattern = nextPattern;
                     }
                 }
-                if(songPlaying && patternWrapped && songLength > 0){
+                if(songPlaying && patternWrapped && songLength > 0
+                   && songIdx < songLength){
                     songRepeatCnt++;
                     if(songRepeatCnt >= songChain[songIdx].repeats){
                         songRepeatCnt = 0;
                         songIdx++;
                         if(songIdx >= songLength){
-                            if(kStartupShowcaseDemo){
+                            if(songLoop){
                                 songIdx = 0;
                                 dseq.currentPattern = songChain[0].pattern;
                             } else {
@@ -5576,15 +5688,31 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 else if(gFilterType == FTYPE_SVF_HP)  { L = sanitizeF(masterSvfL.High()); R = sanitizeF(masterSvfR.High()); }
                 else /* FTYPE_SVF_BP */               { L = sanitizeF(masterSvfL.Band()); R = sanitizeF(masterSvfR.Band()); }
             } else if(gFilterType == FTYPE_COMB){
-                /* Comb filter via short delay line with feedback */
+                /* Comb filter via short delay line with feedback. The feedback
+                 * used to be gFilterQ/30, which put the default Q of 0.707 at
+                 * 0.023 — no audible comb at all until RESO was pushed past
+                 * 90 %. gCombFeedback is precomputed from the shared resonance
+                 * curve so the whole travel of RESO is useful. */
                 float combDelay = clampF(1.f / (gFilterCutoff > 20.f ? gFilterCutoff : 20.f) * (float)SAMPLE_RATE, 1.f, 4799.f);
-                float combFb = clampF(gFilterQ / 30.f, 0.f, 0.98f);
+                const float combFb = gCombFeedback;
                 float combL = combDelayL.Read(combDelay);
                 float combR = combDelayR.Read(combDelay);
                 combDelayL.Write(clampF(L + combL * combFb, -4.f, 4.f));
                 combDelayR.Write(clampF(R + combR * combFb, -4.f, 4.f));
                 L = L * 0.5f + combL * 0.5f;
                 R = R * 0.5f + combR * 0.5f;
+            } else if(gFilterType == FTYPE_ALLPASS){
+                /* A bare all-pass has a flat magnitude response: on the master
+                 * bus it was completely inaudible. Blending the phase-rotated
+                 * signal back with the dry one produces the tunable notch pair
+                 * users actually expect from an "AP" model, and RESO sets how
+                 * deep the notch cuts. */
+                const float wetL = sanitizeF(gFilterL.Process(L));
+                const float wetR = sanitizeF(gFilterR.Process(R));
+                /* (dry + allpass) / 2 is exactly the matching notch. */
+                const float depth = gAllpassDepth;
+                L += depth * (0.5f * (L + wetL) - L);
+                R += depth * (0.5f * (R + wetR) - R);
             } else {
                 L = sanitizeF(gFilterL.Process(L));
                 R = sanitizeF(gFilterR.Process(R));
@@ -5880,6 +6008,10 @@ static void BuildPodState(PodStatePayload& state)
     for(uint8_t track = 0; track < DSQ_TRACKS; track++)
         if(sampleLoaded[track]) state.sampleMask |= (1u << track);
     state.revision = podStateRevision;
+    state.songIndex = songIdx < songLength ? songIdx : 0u;
+    state.songLength = songLength;
+    state.songRepeat = songRepeatCnt;
+    state.songFlags = (songPlaying ? 1u : 0u) | (songLoop ? 2u : 0u);
 }
 
 static void ValidatePodConfig(PodConfigPayload& config)
@@ -6199,6 +6331,7 @@ static void ProcessCommand()
              * NO coincidían con el struct del master: el cutoff aterrizaba
              * como float basura y bitDepth=0 pasaba sin clamp → BitCrush a
              * 0 bits = silencio total. Era el "se cuelga con filtros OUT". */
+            const uint8_t previousFilterType = gFilterType;
             uint8_t incomingType = p[0];
             uint8_t incomingDistMode = p[1];
             uint8_t incomingBitDepth = p[2];
@@ -6232,28 +6365,7 @@ static void ProcessCommand()
             if(gFilterDist > 1.0f) gFilterDist *= 0.01f;
             gFilterDist = clampF(gFilterDist, 0.f, 1.f);
             if(gFilterSrReduce > (uint32_t)SAMPLE_RATE) gFilterSrReduce = 0;
-            gFilterCutoff = clampF(gFilterCutoff, 20.f, 20000.f);
-            gFilterQ      = (gFilterType == FTYPE_RESONANT) ? clampF(gFilterQ, 0.3f, 40.f) : clampF(gFilterQ, 0.3f, 28.f);
-            if(gFilterType == FTYPE_LADDER){
-                masterLadderL.SetFreq(gFilterCutoff);
-                masterLadderR.SetFreq(gFilterCutoff);
-                masterLadderL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                masterLadderR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-            } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
-                masterSvfL.SetFreq(gFilterCutoff);
-                masterSvfR.SetFreq(gFilterCutoff);
-                masterSvfL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                masterSvfR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-            } else {
-                gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                 (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                 (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                if(gFilterType == FTYPE_RESONANT){
-                    gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                    gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                }
-            }
+            ApplyGlobalFilterSettings(gFilterType != previousFilterType);
             podStateRevision++;
         }
         break;
@@ -6261,25 +6373,7 @@ static void ProcessCommand()
         if(len >= 4 && (podApplyingCommand
            || !PodOwnsFunction(POD_FUNC_FILTER_CUTOFF))){
             memcpy(&gFilterCutoff, p, 4);
-            gFilterCutoff = clampF(gFilterCutoff, 20.f, 20000.f);
-            if(gFilterType){
-                if(gFilterType == FTYPE_LADDER){
-                    masterLadderL.SetFreq(gFilterCutoff);
-                    masterLadderR.SetFreq(gFilterCutoff);
-                } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
-                    masterSvfL.SetFreq(gFilterCutoff);
-                    masterSvfR.SetFreq(gFilterCutoff);
-                } else {
-                    gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                    gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                    if(gFilterType == FTYPE_RESONANT){
-                        gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                        gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                    }
-                }
-            }
+            ApplyGlobalFilterSettings(false);
             podStateRevision++;
         }
         break;
@@ -6287,25 +6381,7 @@ static void ProcessCommand()
         if(len >= 4 && (podApplyingCommand
            || !PodOwnsFunction(POD_FUNC_FILTER_RESONANCE))){
             memcpy(&gFilterQ, p, 4);
-            gFilterQ = (gFilterType == FTYPE_RESONANT) ? clampF(gFilterQ, 0.3f, 40.f) : clampF(gFilterQ, 0.3f, 28.f);
-            if(gFilterType){
-                if(gFilterType == FTYPE_LADDER){
-                    masterLadderL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                    masterLadderR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
-                    masterSvfL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                    masterSvfR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                } else {
-                    gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                    gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                    if(gFilterType == FTYPE_RESONANT){
-                        gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                        gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                    }
-                }
-            }
+            ApplyGlobalFilterSettings(false);
             podStateRevision++;
         }
         break;
@@ -7727,10 +7803,18 @@ static void ProcessCommand()
         /* Reset mega upgrade state */
         masterAutowahL.Init((float)SAMPLE_RATE);
         masterAutowahR.Init((float)SAMPLE_RATE);
+        masterAutowahL.SetLevel(1.0f);
+        masterAutowahR.SetLevel(1.0f);
+        masterAutowahL.SetWah(autowahLevel);
+        masterAutowahR.SetWah(autowahLevel);
         masterLadderL.Init((float)SAMPLE_RATE);
         masterLadderR.Init((float)SAMPLE_RATE);
         masterSvfL.Init((float)SAMPLE_RATE);
         masterSvfR.Init((float)SAMPLE_RATE);
+        /* Re-Init wipes the DaisySP modules' cutoff/resonance; without this the
+         * master filter silently reverted to its constructor defaults after a
+         * reset while the reported state still showed the user's values. */
+        ApplyGlobalFilterSettings(true);
         erDelayL.Init();
         erDelayR.Init();
         combDelayL.Init();
@@ -7741,6 +7825,7 @@ static void ProcessCommand()
         memset(beatRepBufR, 0, sizeof(beatRepBufR));
         memset(chokeGroup, 0, sizeof(chokeGroup));
         songLength = 0; songPlaying = false; songIdx = 0; songRepeatCnt = 0;
+        songLoop = false;
         synthActiveMask = 0x01FF;  /* all 9 engines active */
         break;
 
@@ -8434,8 +8519,12 @@ static void ProcessCommand()
         if(len >= 4){
             float lvl; memcpy(&lvl, p, 4);
             autowahLevel = clampF(lvl, 0.f, 1.f);
-            masterAutowahL.SetLevel(autowahLevel);
-            masterAutowahR.SetLevel(autowahLevel);
+            /* SetWah is the envelope-driven sweep amount and the only reason
+             * the effect is audible. It was left at 0 by InitFX and no command
+             * ever touched it, so AUTOWAH did nothing no matter how it was
+             * driven; the control only moved DaisySP's output level. */
+            masterAutowahL.SetWah(autowahLevel);
+            masterAutowahR.SetWah(autowahLevel);
         }
         break;
     case CMD_AUTOWAH_MIX:
@@ -8529,10 +8618,12 @@ static void ProcessCommand()
         }
         break;
     case CMD_SONG_CONTROL:
+        /* [action(1), loop(1, optional)] — 0=stop, 1=play, 2=reset. */
         if(len >= 1){
             if(p[0] == 1){
                 /* Play song mode */
                 if(songLength > 0){
+                    if(len >= 2) songLoop = (p[1] != 0);
                     songPlaying = true;
                     songIdx = 0;
                     songRepeatCnt = 0;
@@ -8547,16 +8638,18 @@ static void ProcessCommand()
                 songPlaying = false;
                 songIdx = 0;
                 songRepeatCnt = 0;
+                if(len >= 2) songLoop = (p[1] != 0);
             }
         }
         break;
     case CMD_SONG_GET_POS:
         {
+            const uint8_t safeIdx = songIdx < songLength ? songIdx : 0;
             uint8_t resp[4] = {
                 songIdx,
-                songPlaying ? songChain[songIdx < songLength ? songIdx : 0].pattern : (uint8_t)0,
+                songLength > 0 ? songChain[safeIdx].pattern : (uint8_t)0,
                 songRepeatCnt,
-                0
+                (uint8_t)((songPlaying ? 1u : 0u) | (songLoop ? 2u : 0u))
             };
             BuildResponse(CMD_SONG_GET_POS, hdr->sequence, resp, sizeof(resp));
         }
@@ -9714,10 +9807,11 @@ static void InitFX()
     /* ── Mega Upgrade: init new master FX modules ── */
     masterAutowahL.Init(sr);
     masterAutowahR.Init(sr);
-    masterAutowahL.SetLevel(0.5f);
-    masterAutowahR.SetLevel(0.5f);
-    masterAutowahL.SetWah(0.0f);
-    masterAutowahR.SetWah(0.0f);
+    masterAutowahL.SetLevel(1.0f);
+    masterAutowahR.SetLevel(1.0f);
+    /* The wah amount, not the level, is what makes this effect audible. */
+    masterAutowahL.SetWah(autowahLevel);
+    masterAutowahR.SetWah(autowahLevel);
 
     masterLadderL.Init(sr);
     masterLadderR.Init(sr);
@@ -9734,6 +9828,7 @@ static void InitFX()
     masterSvfR.SetRes(0.3f);
     masterSvfL.SetDrive(0.0f);
     masterSvfR.SetDrive(0.0f);
+    ApplyGlobalFilterSettings(true);
 
     erDelayL.Init();
     erDelayR.Init();
@@ -9757,6 +9852,7 @@ static void InitFX()
     songPlaying = false;
     songIdx = 0;
     songRepeatCnt = 0;
+    songLoop = false;
 
     autowahActive = false;
     autowahRouted = true;

@@ -91,7 +91,8 @@ class DaisyUsbTransport
                     float value);
     void synthPreset(uint8_t engine, uint8_t preset);
     bool uploadSong(const SongEntry* entries, uint8_t count);
-    bool controlSong(uint8_t action); // 0=stop, 1=play, 2=reset
+    // 0=stop, 1=play, 2=reset. `loop` wraps the chain instead of stopping.
+    bool controlSong(uint8_t action, bool loop = false);
 
     bool connected() const { return state_.engine_responding; }
     const TransportState& state() const { return state_; }
