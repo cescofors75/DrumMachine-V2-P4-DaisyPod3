@@ -13,7 +13,7 @@
 // Engine indices (compatible with Daisy synthNoteOnEx / synthParam)
 //   0 = 808 sampler   1 = 909 sampler   2 = 505 sampler   (NOT exposed here)
 //   3 = TB-303         4 = Wavetable    5 = SH-101         6 = FM 2-Op
-//   7 = physical model (Modal + String voices)
+//   7 = reserved legacy physical-model engine (not exposed in the UI)
 
 #define SP_ENGINE_303    3
 #define SP_ENGINE_WT     4
@@ -21,7 +21,7 @@
 #define SP_ENGINE_FM2OP  6
 #define SP_ENGINE_PHYS   7
 
-#define SP_ENGINE_COUNT  5   // exposed engines 3..7
+#define SP_ENGINE_COUNT  4   // exposed engines 3..6
 
 typedef struct {
     uint8_t      param_id;
@@ -258,10 +258,4 @@ static const SynthEngineDef SP_ENGINES[SP_ENGINE_COUNT] = {
     { SP_ENGINE_FM2OP, "FM2",   "FM 2-Op",
       SP_PARAMS_FM2OP, (uint8_t)(sizeof(SP_PARAMS_FM2OP)/sizeof(SP_PARAMS_FM2OP[0])),
             SP_PRESETS_FM2OP,4 },
-    // The engine, its parameters and its presets were all implemented on both
-    // sides and simply never listed here, so PIANO, PIANO PARAMS and the XTRA
-    // pads could not reach them.
-    { SP_ENGINE_PHYS,  "PHYS",  "Physical Model",
-      SP_PARAMS_PHYS,  (uint8_t)(sizeof(SP_PARAMS_PHYS)/sizeof(SP_PARAMS_PHYS[0])),
-      SP_PRESETS_PHYS, 4 },
 };

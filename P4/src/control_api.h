@@ -20,24 +20,18 @@ void control_send_queue_pattern(int index);
 void control_send_cancel_pattern_queue();
 void control_send_fill();
 void control_send_variation();
-// Each variation transforms the pattern that is loaded rather than stamping a
-// fixed beat over it, so the result depends on — and preserves — whatever the
-// user or the MIDI importer put there.
 enum SequencerVariation : uint8_t {
-    SEQ_VAR_GHOST_GROOVE = 1,   // quiet notes in the gaps before existing hits
-    SEQ_VAR_ROTATE,             // percussion shifted, kick and snare anchored
-    SEQ_VAR_HALF_TIME,          // first half stretched over the whole bar
-    SEQ_VAR_DOUBLE_TIME,        // first half folded and played twice
-    SEQ_VAR_SWAP_HALVES,        // beats 1-2 traded with beats 3-4
-    SEQ_VAR_EUCLID,             // same hit count, evenly redistributed
-    SEQ_VAR_ACCENT_GROOVE,      // re-articulates dynamics, moves no notes
-    SEQ_VAR_RATCHET_STORM,      // rolls on the hits already in the last beat
-    SEQ_VAR_SIXTEENTH_LIFT,     // offbeat sixteenths on the busiest track
-    SEQ_VAR_THIN_OUT,           // opens space, keeps downbeats
-    SEQ_VAR_DICE_PROBABILITY,   // makes offbeats probabilistic
-    SEQ_VAR_BREAK,              // syncopated break built from the last beat
-    SEQ_VAR_UNDO,
-    SEQ_VAR_FIRST = SEQ_VAR_GHOST_GROOVE
+    SEQ_VAR_NEON_BREAK = 1,
+    SEQ_VAR_RATCHET_STORM,
+    SEQ_VAR_GHOST_GROOVE,
+    SEQ_VAR_POLYRHYTHM,
+    SEQ_VAR_HALF_TIME,
+    SEQ_VAR_MIRROR,
+    SEQ_VAR_TOM_CASCADE,
+    SEQ_VAR_ACID_SWITCH,
+    SEQ_VAR_HAT_LIFT,
+    SEQ_VAR_SPARSE_SPACE,
+    SEQ_VAR_UNDO
 };
 bool control_apply_sequencer_variation(uint8_t variation);
 bool control_variation_can_undo();
@@ -46,9 +40,9 @@ bool control_patterns_ready();
 uint8_t control_factory_patterns_found();
 uint8_t control_factory_patterns_expected();
 void control_send_build4();
-void control_send_drop();   // toggles: mutes tracks 2..15, then restores
-bool control_drop_active();
+void control_send_drop();
 void control_send_launch_demo_set();
+void control_send_mix_preset(bool club_warm);
 void control_send_get_pattern(int pattern);
 bool control_save_user_pattern(int source, int destination);
 bool control_user_pattern_is_saved(int pattern);
@@ -57,18 +51,6 @@ bool control_install_midi_song(const mem_midi::MidiSongData& song);
 bool control_midi_song_ready();
 bool control_midi_song_persisted();
 void control_cancel_midi_song();
-
-// SONG mode. An imported arrangement stays resident until it is explicitly
-// cancelled; engaging and disengaging only decides whether it drives the
-// transport, so the user can audition a single pattern and come back.
-bool control_song_available();
-bool control_song_engaged();
-bool control_song_set_engaged(bool engaged);
-bool control_song_loop();
-void control_song_set_loop(bool loop);
-// Reports the live chain position: `index` of `count`, and the logical P4
-// pattern currently playing. Any pointer may be null.
-void control_song_status(uint8_t* index, uint8_t* count, uint8_t* pattern);
 void control_send_unload_daisy(uint8_t pad);
 void control_send_set_step(int track, int step, bool active);
 void control_send_set_step_velocity(int track, int step, int velocity);
