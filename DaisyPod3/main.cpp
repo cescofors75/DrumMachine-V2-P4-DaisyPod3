@@ -1445,8 +1445,15 @@ DSY_SDRAM_BSS static float beatRepBufR[BEAT_REPEAT_BUF_SIZE];
 static bool     beatRepActive = false;
 static uint8_t  beatRepDiv    = 0;   /* 0=off, 2=1/2, 4=1/4, 8=1/8, 16=1/16, 32=1/32 */
 static uint32_t beatRepLen    = 0;   /* samples per slice */
-static uint32_t beatRepWp     = 0;
-static uint32_t beatRepRp     = 0;
+/* Capture-then-loop. The old version kept writing into the circular buffer
+ * while it played back and derived the slice start from the *moving* write
+ * pointer, so the read pointer was reset to `wp - len` on essentially every
+ * sample: the effect was a fixed delay line whose contents were continuously
+ * overwritten by its own output, not a repeating slice. The slice now always
+ * lives at buffer[0 .. len), which removes the circular-wrap arithmetic and
+ * the two overlapping window comparisons entirely. */
+static uint32_t beatRepPos    = 0;   /* position inside the slice */
+static bool     beatRepCapturing = false;
 static bool     beatRepPlaying = false;
 
 /* Ping-Pong Delay — second delay line for stereo */
@@ -2613,6 +2620,8 @@ static void ResetMasterProcessingState()
     beatRepActive = false;
     beatRepDiv = 0;
     beatRepPlaying = false;
+    beatRepCapturing = false;
+    beatRepPos = 0;
     delayPingPong = false;
     chorusStereoMode = true;
 }
@@ -5871,20 +5880,22 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         }
 
         /* ── Beat Repeat ── */
-        if(beatRepActive && beatRepDiv > 0){
-            /* Always record into circular buffer */
-            beatRepBufL[beatRepWp] = L;
-            beatRepBufR[beatRepWp] = R;
-            beatRepWp = (beatRepWp + 1) % BEAT_REPEAT_BUF_SIZE;
-
-            if(beatRepPlaying && beatRepLen > 0){
-                L = beatRepBufL[beatRepRp];
-                R = beatRepBufR[beatRepRp];
-                beatRepRp = (beatRepRp + 1) % BEAT_REPEAT_BUF_SIZE;
-                /* Loop the slice */
-                if(beatRepRp >= beatRepWp ||
-                   ((beatRepWp > beatRepLen) && (beatRepRp >= (beatRepWp - beatRepLen))))
-                    beatRepRp = (beatRepWp >= beatRepLen) ? (beatRepWp - beatRepLen) : 0;
+        if(beatRepActive && beatRepDiv > 0 && beatRepLen > 0){
+            if(beatRepCapturing){
+                /* First pass: record one slice while passing the audio through,
+                 * so the repeat starts from material the user actually heard. */
+                beatRepBufL[beatRepPos] = L;
+                beatRepBufR[beatRepPos] = R;
+                if(++beatRepPos >= beatRepLen){
+                    beatRepPos = 0;
+                    beatRepCapturing = false;
+                }
+            } else if(beatRepPlaying){
+                /* Then loop it untouched. Nothing writes to the buffer here, so
+                 * the slice cannot degrade into feedback. */
+                L = beatRepBufL[beatRepPos];
+                R = beatRepBufR[beatRepPos];
+                if(++beatRepPos >= beatRepLen) beatRepPos = 0;
             }
         }
         DSP_PROF_END(MASTER_FX);
@@ -8561,6 +8572,8 @@ static void ProcessCommand()
             if(beatRepDiv == 0){
                 beatRepActive = false;
                 beatRepPlaying = false;
+                beatRepCapturing = false;
+                beatRepPos = 0;
             } else {
                 beatRepActive = true;
                 /* Calculate slice len from BPM and division */
@@ -8569,12 +8582,10 @@ static void ProcessCommand()
                 beatRepLen = (uint32_t)(sliceSec * (float)SAMPLE_RATE);
                 if(beatRepLen > BEAT_REPEAT_BUF_SIZE) beatRepLen = BEAT_REPEAT_BUF_SIZE;
                 if(beatRepLen < 64) beatRepLen = 64;
+                /* Capture the next slice, then repeat it. */
+                beatRepPos = 0;
+                beatRepCapturing = true;
                 beatRepPlaying = true;
-                /* Set read pointer to start of current slice */
-                if(beatRepWp >= beatRepLen)
-                    beatRepRp = beatRepWp - beatRepLen;
-                else
-                    beatRepRp = 0;
             }
         }
         break;
@@ -9842,8 +9853,8 @@ static void InitFX()
     memset(beatRepBufR, 0, sizeof(beatRepBufR));
     beatRepActive = false;
     beatRepDiv = 0;
-    beatRepWp = 0;
-    beatRepRp = 0;
+    beatRepPos = 0;
+    beatRepCapturing = false;
     beatRepPlaying = false;
 
     memset(chokeGroup, 0, sizeof(chokeGroup));

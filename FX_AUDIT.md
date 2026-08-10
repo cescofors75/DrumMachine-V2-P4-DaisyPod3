@@ -250,17 +250,122 @@ que soltar el drop devuelve la mezcla que el usuario tenía.
 
 ---
 
-## Pendiente / no tocado en esta pasada
+## 8. MUTE y SOLO simultáneos en la misma pista
 
-Encontrado pero fuera del alcance pedido, documentado para la siguiente:
+Se podían encender los dos a la vez. Daisy resuelve la combinación así:
 
-- **`control_send_fill()` y `control_send_build4()`** son destructivos igual que
-  lo era DROP: reescriben permanentemente la pista 2 (fill) y los pasos 12–15
-  de la pista 1 (build), sin retorno. El toast dice "1 compás + retorno" y
-  "4 compases", pero no hay ni retorno ni temporización.
-- **Beat repeat** (`beatRepRp` / `beatRepWp`): la condición de bucle de slice
-  mezcla dos comparaciones de ventana y puede saltar el punto de lectura de
-  forma no obvia al envolver el buffer circular.
+```cpp
+bool muted = trackMute[p];
+if(anySolo && !trackSolo[p]) muted = true;
+```
+
+El mute gana. Es decir: la pista que pedías escuchar en solo era justo la única
+que se quedaba callada, con los dos botones encendidos describiendo estados
+contradictorios y el audio sin seguir a ninguno.
+
+**Corregido:** son mutuamente excluyentes. Poner MUTE en una pista en solo le
+quita el solo; poner SOLO en una pista silenciada le quita el mute. La regla se
+aplica en `control_send_mute`, `control_send_solo`, `control_send_mute_mask` y
+`control_send_solo_mask` —o sea, en todos los caminos: sequencer, mute de grupo,
+máscara, y controles físicos del Pod— y además se refleja al instante en los
+callbacks de la UI para que el botón responda sin esperar a que drene la cola.
+
+## 9. El patrón 1 sonaba distinto tras salir y volver
+
+Al arrancar, el patrón 1 sonaba "solo con samplers". Ibas al patrón 2, volvías
+al 1, y ya sonaba diferente —y correcto—.
+
+La causa es un choque de orden en el arranque. Daisy hace esto cada vez que un
+WAV aterriza en un pad:
+
+```cpp
+/* A WAV loaded into a LIVE pad always becomes its audible source. */
+if(pad < DSQ_TRACKS) dsqTrackEngine[pad] = -1;
+```
+
+Razonable para un pad LIVE. Pero la secuencia de arranque es:
+
+1. Daisy enumera → P4 manda `SendCurrentState()` → `ApplyPatternPerformance(0)`
+   asigna los motores de síntesis que pide el patrón 1.
+2. **Después** P4 escanea su SD y sube los 16 WAV del kit. Cada carga pone ese
+   track en sampler → **los 16 motores quedan pisados.**
+
+P4 ya intentaba protegerse, pero al revés:
+
+```cpp
+if (control_pattern_track_uses_sampler(p4.current_pattern, cursor))
+    control_send_set_track_engine(cursor, -1);
+```
+
+Solo reafirmaba el caso sampler, que ya era cierto y no cambiaba nada; el caso
+que había que restaurar —la pista con motor de síntesis— no se tocaba nunca.
+Al cambiar de patrón y volver, `ApplyPatternPerformance()` reasignaba los
+motores correctos y de ahí que sonara distinto la segunda vez.
+
+**Corregido:** `control_restore_track_engine(track)` reasigna lo que el perfil
+del patrón actual pide de verdad, y se llama tras cada pad del kit.
+
+## 10. FILL y BUILD 4
+
+Eran destructivos igual que lo era DROP. `control_send_fill()` reescribía
+permanentemente la pista 2 y `control_send_build4()` los pasos 12–15 de la
+pista 1, pese a que los toasts prometían "1 compás + retorno" y "4 compases".
+No había ni retorno ni temporización.
+
+**Corregido usando la maquinaria que ya existía en Daisy.**
+`CMD_DSQ_QUEUE_PATTERN` acepta `[patrón, compases]` y Daisy ya sabe volver sola
+al patrón anterior en la línea de compás (`performanceReturnPattern` /
+`performanceBarsRemaining`). Ahora FILL y BUILD renderizan una variante del
+patrón actual en un slot residente de reserva y la encolan con 1 y 4 compases:
+el banco de P4 no se toca y el botón se puede volver a pulsar al momento.
+
+- FILL: corcheas continuas más semicorcheas en el último tiempo, con redoble
+  al cierre. Los golpes que ya existían conservan su velocity.
+- BUILD: rampa de caja de 62 a 118 en la segunda mitad del compás, con
+  ratchets al final.
+
+Ambos respetan lo que ya hay y no tocan otras pistas. Se rechazan en modo SONG,
+donde la cadena ocupa los slots residentes. También hubo que añadir un guard en
+`control_process()`: mientras el patrón temporal está sonando, el cambio de
+patrón que reporta Daisy es esperado y no se puede confundir con alguien
+girando el encoder físico.
+
+## 11. Beat repeat
+
+Estaba roto de dos formas a la vez:
+
+```cpp
+beatRepBufL[beatRepWp] = L;              // escribe SIEMPRE, también al reproducir
+beatRepWp = (beatRepWp + 1) % BUF;
+if(beatRepPlaying && beatRepLen > 0){
+    L = beatRepBufL[beatRepRp];
+    beatRepRp = (beatRepRp + 1) % BUF;
+    if(beatRepRp >= beatRepWp ||
+       ((beatRepWp > beatRepLen) && (beatRepRp >= (beatRepWp - beatRepLen))))
+        beatRepRp = (beatRepWp >= beatRepLen) ? (beatRepWp - beatRepLen) : 0;
+}
+```
+
+1. `beatRepWp` avanza cada muestra, así que el inicio del slice recalculado como
+   `wp - len` se desplaza continuamente. Trazando: tras el disparo `rp = wp-len`;
+   en la siguiente muestra la segunda condición se cumple con igualdad y `rp`
+   vuelve a `wp-len`. **`rp` persigue a `wp` para siempre**: no era un slice que
+   se repite, era una línea de retardo fija de `len` muestras.
+2. El buffer se sigue escribiendo durante la reproducción, así que el contenido
+   se sobrescribe con la propia salida del efecto.
+
+Además `beatRepRp >= beatRepWp` es una comparación cruda que deja de significar
+nada en cuanto uno de los dos punteros envuelve el buffer de 96 000 muestras.
+
+**Corregido:** captura y bucle. Al disparar se graba un slice pasando el audio
+en directo, y a partir de ahí se repite intacto. El slice vive siempre en
+`buffer[0 .. len)`, lo que elimina de golpe la aritmética circular y las dos
+comparaciones de ventana solapadas.
+
+---
+
+## Pendiente / no tocado
+
 - **Autowah doble dry/wet**: DaisySP ya mezcla internamente vía `wah_`, y el
   firmware vuelve a mezclar con `autowahMix`. Suena bien pero la curva del
   control no es lineal en la mezcla.
@@ -281,3 +386,11 @@ Encontrado pero fuera del alcance pedido, documentado para la siguiente:
 5. Aplicar cada variación sobre un patrón de fábrica y sobre uno importado, y
    confirmar que el resultado depende del patrón de partida.
 6. `PIANO` → `PHYS`, y un slot XTRA en PHYS con los cuatro presets A/B/C/D.
+7. MUTE sobre una pista en solo y SOLO sobre una pista silenciada: nunca deben
+   quedar los dos botones encendidos.
+8. Arrancar en frío y escuchar el patrón 1 **sin** cambiar de patrón: debe sonar
+   igual que después de ir al 2 y volver.
+9. FILL y BUILD durante PLAY: deben volver solos al patrón original y no dejar
+   ningún cambio en la rejilla.
+10. Beat repeat en cada división: el slice debe repetirse limpio, sin degradarse
+    ni convertirse en un eco.
