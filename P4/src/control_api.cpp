@@ -40,6 +40,12 @@ uint8_t activeDaisyPattern = 0;
 uint8_t queuedDaisyPattern = 0xFF;
 uint8_t expectedDaisyPattern = 0xFF;
 uint32_t expectedDaisyPatternSinceMs = 0;
+// FILL / BUILD render a variant of the current pattern into a scratch resident
+// slot and let Daisy play it for N bars before returning on its own. While that
+// is in flight the reported pattern legitimately differs from activeDaisyPattern
+// and must not be mistaken for someone turning the physical pattern encoder.
+uint8_t performanceScratchSlot = 0xFF;
+uint32_t performanceUntilMs = 0;
 // `midiSongPrepared` means an arrangement is resident in RAM (and in the user
 // pattern slots). `midiSongEngaged` means SONG mode is actually driving the
 // transport. Keeping the two apart is what lets the user step out to a single
@@ -127,7 +133,13 @@ bool SendWithRetry(uint8_t command, const void* payload, uint16_t length)
     return false;
 }
 
-bool UploadPattern(uint8_t destination, int logicalPattern)
+// Optional per-step rewrite applied on the way out to Daisy. FILL and BUILD
+// use it to render a variant of the current pattern into a scratch resident
+// slot, which is how they stay non-destructive: the P4 bank is never touched.
+using StepTransform = void (*)(uint8_t track, uint8_t step, StepUploadData& data);
+
+bool UploadPattern(uint8_t destination, int logicalPattern,
+                   StepTransform transform = nullptr)
 {
     Sequencer& sequencer = SequencerInstance();
     logicalPattern = Clamp(logicalPattern, 0, MAX_PATTERNS - 1);
@@ -140,6 +152,9 @@ bool UploadPattern(uint8_t destination, int logicalPattern)
     for(uint8_t track = 0; track < 16; ++track)
     {
         sequencer.snapshotTrackForUpload(logicalPattern, track, 16, snapshot);
+        if(transform != nullptr)
+            for(uint8_t step = 0; step < 16; ++step)
+                transform(track, step, snapshot[step]);
         trackPayload[0] = destination;
         trackPayload[1] = track;
         trackPayload[2] = 16;
@@ -256,6 +271,52 @@ void ApplyPatternPerformance(int logicalPattern)
             daisyUsb.setTrackEngine(track, sound.engines[track]);
         }
     }
+}
+
+// MUTE and SOLO are mutually exclusive per track. Daisy applies solo after
+// mute (`if(anySolo && !trackSolo[p]) muted = true;` on top of `trackMute[p]`),
+// so a track carrying both is silent no matter which button the user thinks is
+// winning. These two helpers keep the pair consistent from every entry point.
+void PushSoloWithout(int track)
+{
+    p4.track_solo[track] = false;
+    uint16_t soloMask = 0;
+    for(int other = 0; other < 16; ++other)
+        if(p4.track_solo[other]) soloMask |= (uint16_t)(1u << other);
+    daisyUsb.setTrackSoloMask(soloMask);
+}
+
+void UnmuteTrack(int track)
+{
+    p4.track_muted[track] = false;
+    SequencerInstance().muteTrack(track, false);
+    daisyUsb.setTrackMute(track, false);
+}
+
+// Renders `transform` over the current pattern into a scratch slot and asks
+// Daisy to play it for `bars` bars. Daisy restores the previous pattern by
+// itself at the bar line, so nothing in the P4 bank changes and the button can
+// be pressed again immediately.
+bool RunPerformancePattern(StepTransform transform, uint8_t bars)
+{
+    if(!control_available() || transform == nullptr || bars == 0) return false;
+    // The arrangement owns every resident slot while SONG is driving the
+    // transport; borrowing one would corrupt the scene it holds.
+    if(midiSongEngaged) return false;
+
+    // Stay clear of both the active slot and the +1 slot the pattern queue uses.
+    const uint8_t scratch = static_cast<uint8_t>((activeDaisyPattern + 10u) % 20u);
+    if(scratch == queuedDaisyPattern) return false;
+    if(!UploadPattern(scratch, Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1),
+                      transform))
+        return false;
+
+    performanceScratchSlot = scratch;
+    // One bar at 40 BPM is 6 s; give the round trip generous headroom before
+    // the guard expires on its own.
+    performanceUntilMs = millis() + 7000u * bars;
+    daisyUsb.queuePattern(scratch, bars);
+    return true;
 }
 
 void SendCurrentState()
@@ -428,6 +489,13 @@ void control_process()
             expectedDaisyPattern = 0xFF;
     }
 
+    // A FILL/BUILD is over once Daisy has returned to the slot it came from,
+    // or once the window has clearly lapsed.
+    if(performanceScratchSlot != 0xFF && transport.engine_responding
+       && (transport.pattern == activeDaisyPattern
+           || (int32_t)(millis() - performanceUntilMs) > 0))
+        performanceScratchSlot = 0xFF;
+
     if(midiSongEngaged && transport.engine_responding
        && transport.pattern < midiSongPatternCount)
     {
@@ -469,6 +537,7 @@ void control_process()
     else if(!midiSongEngaged && transport.engine_responding && engineWasConnected
             && queuedLogicalPattern < 0
             && expectedDaisyPattern == 0xFF
+            && performanceScratchSlot == 0xFF
             && transport.pattern != activeDaisyPattern)
     {
         // This is a physical Daisy pattern control. Translate the movement of
@@ -591,13 +660,27 @@ void control_send_cancel_pattern_queue()
     daisyUsb.cancelPatternQueue();
 }
 
-void control_send_fill()
+bool control_send_fill()
 {
-    for(int step = 0; step < 16; ++step)
+    // Used to overwrite track 2 of the loaded pattern permanently, despite the
+    // UI promising "1 bar and back". Now it renders a busier closed-hat bar
+    // into a scratch slot and lets Daisy return by itself after one bar.
+    return RunPerformancePattern([](uint8_t track, uint8_t step,
+                                    StepUploadData& data)
     {
-        const bool active = (step & 1) == 0 || step >= 12;
-        control_send_set_step(2, step, active);
-    }
+        if(track != 2) return;
+        // Straight eighths, then sixteenths across the last beat.
+        const bool fill = (step & 1) == 0 || step >= 12;
+        if(!fill) return;
+        if(!data.active)
+        {
+            data.active = true;
+            data.velocity = step >= 12 ? 104 : 88;
+            data.probability = 100;
+            data.ratchet = 1;
+        }
+        if(step >= 14) data.ratchet = data.ratchet < 2 ? 2 : data.ratchet;
+    }, 1);
 }
 
 void control_send_variation()
@@ -1079,10 +1162,28 @@ bool control_patterns_ready() { return patternBankReady; }
 uint8_t control_factory_patterns_found() { return factoryPatternsFound; }
 uint8_t control_factory_patterns_expected() { return FACTORY_PATTERN_COUNT; }
 
-void control_send_build4()
+bool control_send_build4()
 {
-    for(int step = 12; step < 16; ++step)
-        control_send_set_step(1, step, true);
+    // Used to permanently add four snare hits to the loaded pattern. Now it is
+    // a four-bar riser rendered into a scratch slot: a snare roll that fills in
+    // across the bar, returning to the original pattern on its own.
+    return RunPerformancePattern([](uint8_t track, uint8_t step,
+                                    StepUploadData& data)
+    {
+        if(track != 1) return;
+        if(step < 8) return;
+        if(!data.active)
+        {
+            data.active = true;
+            data.probability = 100;
+            data.ratchet = 1;
+        }
+        // Ramp the level across the second half of the bar.
+        const int shaped = 62 + (step - 8) * 8;
+        data.velocity = static_cast<uint8_t>(shaped > 127 ? 127 : shaped);
+        if(step >= 14) data.ratchet = 2;
+        if(step == 15) data.ratchet = 3;
+    }, 4);
 }
 
 void control_send_drop()
@@ -1371,6 +1472,10 @@ void control_send_mute(int track, bool muted)
     p4.track_muted[track] = muted;
     SequencerInstance().muteTrack(track, muted);
     daisyUsb.setTrackMute(track, muted);
+    // MUTE and SOLO are exclusive. Muting a soloed track left both buttons lit
+    // while the engine resolved the pair by silencing it, so the lit SOLO was
+    // describing something the mix was not doing.
+    if(muted && p4.track_solo[track]) PushSoloWithout(track);
 }
 
 void control_send_set_volume(int value)
@@ -1595,24 +1700,46 @@ void control_send_solo(int track, bool soloed)
     if(track < 0 || track >= 16) return;
     p4.track_solo[track] = soloed;
     daisyUsb.setTrackSolo(track, soloed);
+    // Soloing a muted track is a contradiction the engine resolves as silence:
+    // the one track you asked to hear is the one that stays quiet.
+    if(soloed && p4.track_muted[track]) UnmuteTrack(track);
 }
 
 void control_send_mute_mask(uint16_t mask)
 {
+    uint16_t soloMask = 0;
     for(int track = 0; track < 16; ++track)
     {
         const bool muted = (mask & (1u << track)) != 0;
         p4.track_muted[track] = muted;
         SequencerInstance().muteTrack(track, muted);
+        // A muted track cannot stay soloed.
+        if(muted) p4.track_solo[track] = false;
+        if(p4.track_solo[track]) soloMask |= (uint16_t)(1u << track);
     }
     daisyUsb.setTrackMuteMask(mask);
+    daisyUsb.setTrackSoloMask(soloMask);
 }
 
 void control_send_solo_mask(uint16_t mask)
 {
+    uint16_t muteMask = 0;
+    bool muteChanged = false;
     for(int track = 0; track < 16; ++track)
-        p4.track_solo[track] = (mask & (1u << track)) != 0;
+    {
+        const bool soloed = (mask & (1u << track)) != 0;
+        p4.track_solo[track] = soloed;
+        // A soloed track cannot stay muted.
+        if(soloed && p4.track_muted[track])
+        {
+            p4.track_muted[track] = false;
+            SequencerInstance().muteTrack(track, false);
+            muteChanged = true;
+        }
+        if(p4.track_muted[track]) muteMask |= (uint16_t)(1u << track);
+    }
     daisyUsb.setTrackSoloMask(mask);
+    if(muteChanged) daisyUsb.setTrackMuteMask(muteMask);
 }
 
 void control_mark_fx_screen_dirty() { fxDirty.store(true, std::memory_order_release); }
@@ -1628,6 +1755,23 @@ bool control_pattern_track_uses_sampler(int pattern, int track)
     BuiltinPatternSoundProfile profile{};
     return getBuiltinPatternSoundProfile(pattern, profile)
         && profile.engines[track] == -1;
+}
+
+void control_restore_track_engine(int track)
+{
+    // Daisy forces a track to the sampler whenever a WAV lands on that pad, so
+    // that a freshly loaded live pad audibly plays what was just sent. For a
+    // sequencer track whose pattern assigns a synth engine that is wrong, and
+    // it is why the boot kit upload used to leave the first pattern sounding
+    // like samplers only: the kit lands *after* SendCurrentState() has applied
+    // the profile, silently overwriting all 16 engines. Re-assert the engine
+    // the current pattern actually asks for once the upload completes.
+    if(track < 0 || track >= 16) return;
+    const int pattern = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+    BuiltinPatternSoundProfile profile{};
+    const int8_t engine = getBuiltinPatternSoundProfile(pattern, profile)
+        ? profile.engines[track] : -1;
+    daisyUsb.setTrackEngine(track, engine);
 }
 
 void control_send_synth_note_on_ex(uint8_t engine, uint8_t note,
