@@ -11,6 +11,7 @@ namespace
 constexpr uint32_t kEngineTimeoutMs = 3000;
 constexpr uint32_t kPingIntervalMs = 1000;
 constexpr uint32_t kPositionIntervalMs = 40;
+constexpr uint32_t kPodStateIntervalMs = 25;
 constexpr uint32_t kQueryTimeoutMs = 400;
 constexpr size_t kTelemetryBacklogLimit = 8;
 }
@@ -483,7 +484,7 @@ void DaisyUsbTransport::poll()
         if(sendQuery(CMD_GET_STATUS)) last_status_ms_ = now;
         return;
     }
-    if(now - last_pod_state_ms_ >= 100u)
+    if(now - last_pod_state_ms_ >= kPodStateIntervalMs)
     {
         if(sendQuery(CMD_POD_GET_STATE)) last_pod_state_ms_ = now;
         return;

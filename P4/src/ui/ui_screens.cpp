@@ -57,6 +57,7 @@ static std::atomic<uint16_t> s_ctrl_mute_mask{0};
 static std::atomic<bool>     s_ctrl_solo_mask_pending{false};
 static std::atomic<uint16_t> s_ctrl_solo_mask{0};
 static std::atomic<bool>     s_ctrl_pattern_sync_pending{false};
+static std::atomic<int8_t>   s_ctrl_pattern_step_pending{0};
 
 // Touch debounce tuned for GT911 + multi-indev setup.
 static const uint32_t MUTE_DEBOUNCE_TRACK_MS = 180;
@@ -427,6 +428,12 @@ static void seq_launch_absolute_pattern(int pattern);
 static int  seq_queued_pattern = -1;
 static bool seq_quantize_enabled = true;
 
+static void step_pattern_relative(int delta) {
+    if (delta == 0) return;
+    s_ctrl_pattern_step_pending.fetch_add(delta > 0 ? 1 : -1,
+                                          std::memory_order_release);
+}
+
 static void header_play_cb(lv_event_t* e) {
     LV_UNUSED(e);
     // Debounce — LVGL can double-fire on a sloppy tap, causing visible
@@ -448,27 +455,7 @@ static void header_play_cb(lv_event_t* e) {
 
 static void header_pattern_cb(lv_event_t* e) {
     int delta = (int)(intptr_t)lv_event_get_user_data(e);
-    // If a bar-quantized destination is already armed, continue browsing from
-    // that destination. Using current_pattern here kept retransmitting the same
-    // Pxx on every tap until the bar changed, which looked like a frozen <>.
-    const int browse_pattern = (p4.is_playing && seq_queued_pattern >= 0)
-        ? seq_queued_pattern : p4.current_pattern;
-    int next_pattern = browse_pattern + delta;
-    if (next_pattern < 0) next_pattern = Config::MAX_PATTERNS - 1;
-    if (next_pattern >= Config::MAX_PATTERNS) next_pattern = 0;
-
-    // While running, +/- only edits the one-bar queue. The audible/current
-    // pattern remains authoritative until Daisy fires step 0 of the next bar.
-    if (p4.is_playing && seq_quantize_enabled && ui_control_available()) {
-        seq_queued_pattern = next_pattern;
-        control_send_queue_pattern(next_pattern);
-        char qmsg[48];
-        snprintf(qmsg, sizeof(qmsg), "Q 1 BAR -> P%02d", next_pattern + 1);
-        ui_show_toast(qmsg, RED808_CYAN);
-        return;
-    }
-
-    seq_launch_absolute_pattern(next_pattern);
+    step_pattern_relative(delta);
 }
 
 // =============================================================================
@@ -2355,6 +2342,11 @@ static uint8_t s_pod_owner_badge_count = 0;
 static bool pod_control_functions_conflict(uint8_t left, uint8_t right) {
     if (left == POD_FUNC_NONE || right == POD_FUNC_NONE) return false;
     if (left == right) return true;
+    const bool leftPattern = left == POD_FUNC_PATTERN_PREV
+                          || left == POD_FUNC_PATTERN_NEXT;
+    const bool rightPattern = right == POD_FUNC_PATTERN_PREV
+                           || right == POD_FUNC_PATTERN_NEXT;
+    if (leftPattern && rightPattern) return true;
     const bool leftCrush = left == POD_FUNC_CRUSH_MACRO;
     const bool rightCrush = right == POD_FUNC_CRUSH_MACRO;
     return (leftCrush && (right == POD_FUNC_BIT_DEPTH
@@ -2517,8 +2509,10 @@ static void pod_control_value_refresh(uint8_t row) {
     if (row >= POD_CONTROL_ROW_COUNT || !s_pod_control_value_labels[row]) return;
     uint8_t* field = pod_control_config_field(row);
     if (!field) return;
-    lv_label_set_text(s_pod_control_value_labels[row],
-                      pod_control_function_name(*field));
+    const bool patternEncoder = row == 4
+        && (*field == POD_FUNC_PATTERN_PREV || *field == POD_FUNC_PATTERN_NEXT);
+    lv_label_set_text(s_pod_control_value_labels[row], patternEncoder
+        ? "PATTERN +/-" : pod_control_function_name(*field));
 }
 
 static void pod_status_modal_refresh(void) {
@@ -3044,6 +3038,8 @@ static void grid_pad_mode_cb(lv_event_t* e) {
 // never lost between the 100 ms USB polls. Audio actions are executed locally
 // by Daisy; navigation actions are consumed here because P4 owns the display.
 static uint32_t s_pod_action_seen_revision = 0;
+static int16_t s_pod_encoder_position_seen = 0;
+static bool s_pod_encoder_position_ready = false;
 
 static void pod_apply_navigation_action(uint8_t function, uint8_t selected_pad) {
     switch (function) {
@@ -3082,9 +3078,32 @@ static void pod_apply_navigation_action(uint8_t function, uint8_t selected_pad) 
 
 static void pod_process_physical_actions(void) {
     const auto& transport = daisyUsb.state();
+    if (!transport.engine_responding) {
+        s_pod_encoder_position_ready = false;
+        return;
+    }
     if (transport.pod_revision == s_pod_action_seen_revision) return;
     s_pod_action_seen_revision = transport.pod_revision;
-    if (transport.pod.config.version != POD_CONFIG_VERSION) return;
+    if (transport.pod.config.version != POD_CONFIG_VERSION) {
+        s_pod_encoder_position_ready = false;
+        return;
+    }
+
+    const int16_t encoderPosition = transport.pod.encoderPosition;
+    if (!s_pod_encoder_position_ready) {
+        s_pod_encoder_position_seen = encoderPosition;
+        s_pod_encoder_position_ready = true;
+    } else {
+        const int16_t encoderDelta = static_cast<int16_t>(
+            static_cast<uint16_t>(encoderPosition)
+            - static_cast<uint16_t>(s_pod_encoder_position_seen));
+        s_pod_encoder_position_seen = encoderPosition;
+        const uint8_t encoderFunction = transport.pod.config.encoderFunction;
+        if (encoderDelta != 0
+            && (encoderFunction == POD_FUNC_PATTERN_PREV
+                || encoderFunction == POD_FUNC_PATTERN_NEXT))
+            step_pattern_relative(encoderDelta);
+    }
 
     const uint8_t events = transport.pod.buttonPressEvents;
     const uint8_t functions[3] = {
@@ -4046,6 +4065,8 @@ static lv_obj_t* fx_page_lbl                   = NULL;
 static lv_obj_t* fx_view_btn                   = NULL;
 static lv_obj_t* fx_view_lbl                   = NULL;
 static lv_obj_t* fx_pattern_lbl                = NULL;
+static lv_obj_t* fx_active_lbl                 = NULL;
+static lv_obj_t* fx_all_off_btn                = NULL;
 static bool s_fx_ui_syncing = false;
 static uint32_t s_fx_toggle_last_ms[FX_CARD_COUNT] = {};
 static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX buttons
@@ -4057,6 +4078,15 @@ static const char* fx_names[FX_CARD_COUNT] = {
     "FLANGE", "DELAY", "REVERB", "FOLD", "CRUSH", "PHASER",
     "CUTOFF", "RESO", "DRIVE", "BITS", "SRATE", "FILTER"
 };
+
+static const char* fx_filter_model_name(int type) {
+    static const char* names[] = {
+        "OFF", "LOWPASS", "HIGHPASS", "BANDPASS", "NOTCH",
+        "ALLPASS", "PEAK", "LOW SHELF", "HIGH SHELF", "RESONANT",
+        "LADDER", "SVF LP", "SVF HP", "SVF BP", "COMB"
+    };
+    return names[constrain(type, 0, 14)];
+}
 
 static const uint32_t fx_colors[FX_CARD_COUNT] = {
     0xC9271B, 0xE86820, 0xF5BC31, 0xF2552F, 0xFF8C2A, 0xF7EAD7,
@@ -4149,6 +4179,7 @@ static bool fx_card_is_muted(int cell) {
 }
 
 static const char* fx_card_button_text(int cell, bool muted) {
+    if (cell == FX_CARD_FILTER) return "OFF ALL FX";
     if (fx_card_has_onoff(cell)) return muted ? "OFF" : "ON";
     return muted ? "OFF" : "ON";
 }
@@ -4254,6 +4285,154 @@ static void fx_card_reset(int cell) {
     }
 }
 
+static void fx_active_name_append(char* text, size_t textSize, size_t& used,
+                                  int& count, const char* name) {
+    if (!text || textSize == 0 || !name || used >= textSize - 1) return;
+    const size_t remaining = textSize - used;
+    const int written = snprintf(text + used, remaining, "%s%s",
+                                 count == 0 ? "" : " / ", name);
+    if (written > 0) {
+        const size_t appended = (size_t)written < remaining
+            ? (size_t)written : remaining - 1;
+        used += appended;
+    }
+    count++;
+}
+
+static bool fx_any_processing_active(void) {
+    const uint8_t extraFx = daisyUsb.state().pod.reservedFx;
+    return !p4.enc_muted[0] || !p4.enc_muted[1] || !p4.enc_muted[2]
+        || !p4.pot_muted[0] || p4.pot_value[1] > 0 || !p4.pot_muted[2]
+        || p4.distortion_pct > 0 || p4.bitcrush_bits < 16
+        || p4.sample_rate_hz > 0 || p4.filter_type != 0 || extraFx != 0;
+}
+
+static void fx_active_header_refresh(void) {
+    char text[192] = {};
+    size_t used = 0;
+    int count = 0;
+
+    for (int cell = FX_CARD_FLANGE; cell <= FX_CARD_REVERB; ++cell)
+        if (!p4.enc_muted[cell])
+            fx_active_name_append(text, sizeof(text), used, count, fx_names[cell]);
+    if (!p4.pot_muted[0])
+        fx_active_name_append(text, sizeof(text), used, count, fx_names[FX_CARD_FOLD]);
+    if (p4.pot_value[1] > 0)
+        fx_active_name_append(text, sizeof(text), used, count, fx_names[FX_CARD_CRUSH]);
+    if (!p4.pot_muted[2])
+        fx_active_name_append(text, sizeof(text), used, count, fx_names[FX_CARD_PHASER]);
+    if (p4.distortion_pct > 0)
+        fx_active_name_append(text, sizeof(text), used, count, fx_names[FX_CARD_DRIVE]);
+    if (p4.pot_value[1] == 0 && p4.bitcrush_bits < 16)
+        fx_active_name_append(text, sizeof(text), used, count, fx_names[FX_CARD_BITS]);
+    if (p4.pot_value[1] == 0 && p4.sample_rate_hz > 0)
+        fx_active_name_append(text, sizeof(text), used, count, fx_names[FX_CARD_SRATE]);
+    if (p4.filter_type != 0)
+        fx_active_name_append(text, sizeof(text), used, count,
+                              fx_filter_model_name(p4.filter_type));
+    const uint8_t extraFx = daisyUsb.state().pod.reservedFx;
+    if ((extraFx & POD_FX_EXTRA_AUTOWAH) != 0)
+        fx_active_name_append(text, sizeof(text), used, count, "AUTOWAH");
+    if ((extraFx & POD_FX_EXTRA_BEAT_REPEAT) != 0)
+        fx_active_name_append(text, sizeof(text), used, count, "BEAT REPEAT");
+    if ((extraFx & POD_FX_EXTRA_TAPE_STOP) != 0)
+        fx_active_name_append(text, sizeof(text), used, count, "TAPE STOP");
+    if ((extraFx & POD_FX_EXTRA_STEREO_WIDTH) != 0)
+        fx_active_name_append(text, sizeof(text), used, count, "WIDTH");
+
+    if (count == 0) snprintf(text, sizeof(text), "ALL FX OFF");
+    else {
+        char prefixed[sizeof(text)] = {};
+        snprintf(prefixed, sizeof(prefixed), "ON: %s", text);
+        snprintf(text, sizeof(text), "%s", prefixed);
+    }
+
+    static char previous[192] = {};
+    static lv_obj_t* previousLabel = NULL;
+    if (fx_active_lbl
+        && (previousLabel != fx_active_lbl || strcmp(previous, text) != 0)) {
+        previousLabel = fx_active_lbl;
+        snprintf(previous, sizeof(previous), "%s", text);
+        lv_label_set_text(fx_active_lbl, text);
+        lv_obj_set_style_text_color(fx_active_lbl,
+            count == 0 ? RED808_TEXT_DIM : RED808_CYAN, 0);
+    }
+
+    static bool previousAnyActive = false;
+    static lv_obj_t* previousFilterButton = NULL;
+    static lv_obj_t* previousHeaderButton = NULL;
+    lv_obj_t* filterButton = fx_toggle_btns[FX_CARD_FILTER];
+    const bool anyActive = fx_any_processing_active();
+    if (previousFilterButton != filterButton
+        || previousHeaderButton != fx_all_off_btn
+        || previousAnyActive != anyActive) {
+        previousFilterButton = filterButton;
+        previousHeaderButton = fx_all_off_btn;
+        previousAnyActive = anyActive;
+        if (filterButton) {
+            lv_obj_t* label = lv_obj_get_child(filterButton, 0);
+            if (label) {
+                lv_label_set_text(label, "OFF ALL FX");
+                lv_obj_set_style_text_color(label,
+                    anyActive ? fx_safe_text_color(fx_colors[FX_CARD_FILTER])
+                              : RED808_TEXT_DIM, 0);
+            }
+            lv_obj_set_style_bg_opa(filterButton,
+                anyActive ? LV_OPA_30 : LV_OPA_10, 0);
+            lv_obj_set_style_shadow_opa(filterButton,
+                anyActive ? LV_OPA_50 : LV_OPA_0, 0);
+        }
+        if (fx_all_off_btn) {
+            lv_obj_t* label = lv_obj_get_child(fx_all_off_btn, 0);
+            if (label)
+                lv_obj_set_style_text_color(label,
+                    anyActive ? RED808_TEXT : RED808_TEXT_DIM, 0);
+            lv_obj_set_style_bg_opa(fx_all_off_btn,
+                anyActive ? LV_OPA_70 : LV_OPA_10, 0);
+            lv_obj_set_style_shadow_opa(fx_all_off_btn,
+                anyActive ? LV_OPA_40 : LV_OPA_0, 0);
+        }
+    }
+}
+
+static void fx_card_turn_off(int cell) {
+    if (cell < 0 || cell >= FX_CARD_COUNT) return;
+    const uint8_t ownerFunction = fx_card_owner_function(cell);
+    if (ownerFunction != POD_FUNC_NONE
+        && pod_function_has_physical_owner(ownerFunction)) return;
+
+    if (cell <= FX_CARD_REVERB) {
+        p4.enc_muted[cell] = true;
+        if (control_available())
+            control_send_fx_enc(cell, p4.enc_value[cell], true);
+        s_fx_arc_anim[cell] = 0.0f;
+    } else if (cell == FX_CARD_FOLD || cell == FX_CARD_PHASER) {
+        const int potIndex = cell == FX_CARD_FOLD ? 0 : 2;
+        const int valueIndex = cell == FX_CARD_FOLD ? 3 : 2;
+        p4.pot_muted[potIndex] = true;
+        if (control_available())
+            control_send_fx_pot(potIndex, p4.pot_value[valueIndex], true);
+        s_fx_arc_anim[cell] = 0.0f;
+    } else {
+        const int neutral = fx_card_neutral_u7(cell);
+        fx_card_send_value(cell, neutral);
+        s_fx_arc_anim[cell] = (float)neutral;
+    }
+}
+
+static void fx_all_turn_off(void) {
+    control_send_all_fx_off();
+    for (int cell = 0; cell < FX_CARD_COUNT; ++cell)
+        s_fx_arc_anim[cell] = 0.0f;
+    control_mark_fx_screen_dirty();
+    fx_active_header_refresh();
+}
+
+static void fx_all_off_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    fx_all_turn_off();
+}
+
 static int fx_page_count(void) {
     int perPage = fx_view_modes[constrain(fx_view_mode, 0, FX_VIEW_MODE_COUNT - 1)];
     return (FX_CARD_COUNT + perPage - 1) / perPage;
@@ -4345,7 +4524,10 @@ static void fx_apply_layout(void) {
             else lv_obj_clear_flag(fx_src_labels[cell], LV_OBJ_FLAG_HIDDEN);
         }
         if (fx_toggle_btns[cell]) {
-            lv_obj_set_size(fx_toggle_btns[cell], compact12 ? 76 : (compact6 ? 90 : 104), compact12 ? 32 : (compact6 ? 38 : 42));
+            int toggleWidth = compact12 ? 76 : (compact6 ? 90 : 104);
+            if (cell == FX_CARD_FILTER)
+                toggleWidth = compact12 ? 100 : (compact6 ? 112 : 126);
+            lv_obj_set_size(fx_toggle_btns[cell], toggleWidth, compact12 ? 32 : (compact6 ? 38 : 42));
             lv_obj_align(fx_toggle_btns[cell], LV_ALIGN_BOTTOM_MID, 0, compact12 ? -6 : (compact6 ? -10 : -14));
             lv_obj_t* lbl = lv_obj_get_child(fx_toggle_btns[cell], 0);
             if (lbl) lv_obj_set_style_text_font(lbl, toggleFont, 0);
@@ -4362,9 +4544,6 @@ static void fx_apply_layout(void) {
 static void fx_toggle_cb(lv_event_t* e) {
     int cell = (int)(intptr_t)lv_event_get_user_data(e);
     if (cell < 0 || cell >= FX_CARD_COUNT) return;
-    const uint8_t ownerFunction = fx_card_owner_function(cell);
-    if (ownerFunction != POD_FUNC_NONE
-        && pod_function_has_physical_owner(ownerFunction)) return;
     uint32_t now = millis();
     // Per-button debounce (700ms) + global cross-button cooldown (200ms).
     // GT911 on P4 with LVGL can fire duplicate CLICKED events within <300ms;
@@ -4374,6 +4553,13 @@ static void fx_toggle_cb(lv_event_t* e) {
     if (now - s_fx_any_toggle_last_ms  < 200) return;
     s_fx_toggle_last_ms[cell] = now;
     s_fx_any_toggle_last_ms   = now;
+    if (cell == FX_CARD_FILTER) {
+        fx_all_turn_off();
+        return;
+    }
+    const uint8_t ownerFunction = fx_card_owner_function(cell);
+    if (ownerFunction != POD_FUNC_NONE
+        && pod_function_has_physical_owner(ownerFunction)) return;
     if (fx_card_has_onoff(cell)) {
         if (cell < 3) {
             bool unmuting = p4.enc_muted[cell];
@@ -4484,6 +4670,25 @@ static void create_fx_screen(void) {
     lv_obj_set_style_text_color(fx_pattern_lbl, RED808_WARNING, 0);
     lv_obj_set_style_text_font(fx_pattern_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_align(fx_pattern_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    fx_active_lbl = lv_label_create(scr_fx);
+    lv_label_set_text(fx_active_lbl, "ALL FX OFF");
+    lv_obj_set_size(fx_active_lbl, 210, 28);
+    lv_obj_set_pos(fx_active_lbl, 342, 15);
+    lv_label_set_long_mode(fx_active_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_text_font(fx_active_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fx_active_lbl, RED808_TEXT_DIM, 0);
+    lv_obj_set_style_text_align(fx_active_lbl, LV_TEXT_ALIGN_LEFT, 0);
+
+    fx_all_off_btn = lv_btn_create(scr_fx);
+    lv_obj_set_size(fx_all_off_btn, 136, 36);
+    lv_obj_set_pos(fx_all_off_btn, 560, 8);
+    apply_control_button_style(fx_all_off_btn, RED808_ERROR, false, 8);
+    lv_obj_add_event_cb(fx_all_off_btn, fx_all_off_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* allOffLabel = lv_label_create(fx_all_off_btn);
+    lv_label_set_text(allOffLabel, "OFF ALL FX");
+    lv_obj_set_style_text_font(allOffLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(allOffLabel);
 
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         // Card container
@@ -4718,13 +4923,8 @@ static void fx_format_display_value(int cell, int u7, bool muted,
             break;
         }
         case FX_CARD_FILTER: {
-            static const char* names[] = {
-                "OFF", "LOWPASS", "HIGHPASS", "BANDPASS", "NOTCH",
-                "ALLPASS", "PEAK", "LOW SHELF", "HIGH SHELF", "RESONANT",
-                "LADDER", "SVF LP", "SVF HP", "SVF BP", "COMB"
-            };
             const int type = constrain((int)(normalized * 14.0f + 0.5f), 0, 14);
-            snprintf(value, valueSize, "%s", names[type]);
+            snprintf(value, valueSize, "%s", fx_filter_model_name(type));
             break;
         }
         default:
@@ -4761,6 +4961,8 @@ static void update_fx_screen(void) {
         prev_fx_pattern_lbl = fx_pattern_lbl;
         lv_label_set_text_fmt(fx_pattern_lbl, "PAT P%03d", p4.current_pattern + 1);
     }
+
+    fx_active_header_refresh();
 
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         int val = fx_card_current_value_u7(cell);
@@ -4809,7 +5011,7 @@ static void update_fx_screen(void) {
             }
 
             // Update toggle button
-            if (fx_toggle_btns[cell]) {
+            if (fx_toggle_btns[cell] && cell != FX_CARD_FILTER) {
                 lv_obj_t* lbl = lv_obj_get_child(fx_toggle_btns[cell], 0);
                 if (lbl) lv_label_set_text(lbl, fx_card_button_text(cell, muted));
                 lv_color_t tc = fx_safe_text_color(fx_colors[cell]);
@@ -12012,6 +12214,8 @@ static void ui_reload_themed_screens(void) {
     fx_view_btn = NULL;
     fx_view_lbl = NULL;
     fx_pattern_lbl = NULL;
+    fx_active_lbl = NULL;
+    fx_all_off_btn = NULL;
     fx_page = 0;
     fx_view_mode = 0;
     for (int i = 0; i < 16; i++) {
@@ -12231,6 +12435,17 @@ static int8_t   s_pad_noteoff_engine[16] = {-1, -1, -1, -1, -1, -1, -1, -1,
                                            -1, -1, -1, -1, -1, -1, -1, -1};
 
 void ui_process_control_queue(void) {
+    const int patternStep = s_ctrl_pattern_step_pending.exchange(
+        0, std::memory_order_acquire);
+    if (patternStep != 0) {
+        int nextPattern = (p4.current_pattern + patternStep)
+                        % Config::MAX_PATTERNS;
+        if (nextPattern < 0) nextPattern += Config::MAX_PATTERNS;
+        seq_queued_pattern = -1;
+        control_send_select_pattern(nextPattern);
+        ui_sequencer_sync_from_current_pattern();
+    }
+
     if (s_ctrl_pattern_sync_pending.exchange(false, std::memory_order_acquire)) {
         control_sync_current_pattern();
     }

@@ -542,6 +542,13 @@ enum PodLedFunction : uint8_t {
     POD_LED_COUNT
 };
 
+enum PodExtraFxActiveBits : uint8_t {
+    POD_FX_EXTRA_AUTOWAH = 1u << 0,
+    POD_FX_EXTRA_BEAT_REPEAT = 1u << 1,
+    POD_FX_EXTRA_TAPE_STOP = 1u << 2,
+    POD_FX_EXTRA_STEREO_WIDTH = 1u << 3,
+};
+
 static constexpr uint8_t POD_CONFIG_VERSION = 7;
 
 typedef struct __attribute__((packed)) {
@@ -598,7 +605,7 @@ typedef struct __attribute__((packed)) {
     uint8_t filterType;
     uint8_t bitDepth;
     uint8_t distortionPct;
-    uint8_t reservedFx;
+    uint8_t reservedFx;      // PodExtraFxActiveBits
     uint16_t cutoffHz;
     uint16_t resonanceX10;
     uint16_t sampleRateHz;

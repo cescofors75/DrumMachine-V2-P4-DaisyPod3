@@ -1009,6 +1009,13 @@ enum PodLedFunction : uint8_t {
     POD_LED_COUNT
 };
 
+enum PodExtraFxActiveBits : uint8_t {
+    POD_FX_EXTRA_AUTOWAH = 1u << 0,
+    POD_FX_EXTRA_BEAT_REPEAT = 1u << 1,
+    POD_FX_EXTRA_TAPE_STOP = 1u << 2,
+    POD_FX_EXTRA_STEREO_WIDTH = 1u << 3,
+};
+
 struct __attribute__((packed)) PodConfigPayload {
     uint8_t version;
     uint8_t button1Function;
@@ -1105,6 +1112,11 @@ static bool PodFunctionsConflict(uint8_t left, uint8_t right)
 {
     if(left == POD_FUNC_NONE || right == POD_FUNC_NONE) return false;
     if(left == right) return true;
+    const bool leftPattern = left == POD_FUNC_PATTERN_PREV
+                          || left == POD_FUNC_PATTERN_NEXT;
+    const bool rightPattern = right == POD_FUNC_PATTERN_PREV
+                           || right == POD_FUNC_PATTERN_NEXT;
+    if(leftPattern && rightPattern) return true;
     const bool leftCrush = left == POD_FUNC_CRUSH_MACRO;
     const bool rightCrush = right == POD_FUNC_CRUSH_MACRO;
     return (leftCrush && (right == POD_FUNC_BIT_DEPTH
@@ -1393,8 +1405,8 @@ DSY_SDRAM_BSS static float beatRepBufR[BEAT_REPEAT_BUF_SIZE];
 static bool     beatRepActive = false;
 static uint8_t  beatRepDiv    = 0;   /* 0=off, 2=1/2, 4=1/4, 8=1/8, 16=1/16, 32=1/32 */
 static uint32_t beatRepLen    = 0;   /* samples per slice */
-static uint32_t beatRepWp     = 0;
-static uint32_t beatRepRp     = 0;
+static uint32_t beatRepPos    = 0;
+static bool     beatRepCapturing = false;
 static bool     beatRepPlaying = false;
 
 /* Ping-Pong Delay — second delay line for stereo */
@@ -2503,6 +2515,8 @@ static void ResetMasterProcessingState()
     beatRepActive = false;
     beatRepDiv = 0;
     beatRepPlaying = false;
+    beatRepCapturing = false;
+    beatRepPos = 0;
     delayPingPong = false;
     chorusStereoMode = true;
 }
@@ -5743,20 +5757,18 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         }
 
         /* ── Beat Repeat ── */
-        if(beatRepActive && beatRepDiv > 0){
-            /* Always record into circular buffer */
-            beatRepBufL[beatRepWp] = L;
-            beatRepBufR[beatRepWp] = R;
-            beatRepWp = (beatRepWp + 1) % BEAT_REPEAT_BUF_SIZE;
-
-            if(beatRepPlaying && beatRepLen > 0){
-                L = beatRepBufL[beatRepRp];
-                R = beatRepBufR[beatRepRp];
-                beatRepRp = (beatRepRp + 1) % BEAT_REPEAT_BUF_SIZE;
-                /* Loop the slice */
-                if(beatRepRp >= beatRepWp ||
-                   ((beatRepWp > beatRepLen) && (beatRepRp >= (beatRepWp - beatRepLen))))
-                    beatRepRp = (beatRepWp >= beatRepLen) ? (beatRepWp - beatRepLen) : 0;
+        if(beatRepActive && beatRepDiv > 0 && beatRepLen > 0){
+            if(beatRepCapturing){
+                beatRepBufL[beatRepPos] = L;
+                beatRepBufR[beatRepPos] = R;
+                if(++beatRepPos >= beatRepLen){
+                    beatRepPos = 0;
+                    beatRepCapturing = false;
+                }
+            } else if(beatRepPlaying){
+                L = beatRepBufL[beatRepPos];
+                R = beatRepBufR[beatRepPos];
+                if(++beatRepPos >= beatRepLen) beatRepPos = 0;
             }
         }
         DSP_PROF_END(MASTER_FX);
@@ -5874,6 +5886,11 @@ static void BuildPodState(PodStatePayload& state)
                        | ((gFilterBitDepth < 16 || gFilterSrReduce > 0) ? 32u : 0u)
                        | (gFilterType != FTYPE_NONE ? 64u : 0u)
                        | (gFilterDist > 0.0001f ? 128u : 0u);
+    state.reservedFx = (autowahActive ? POD_FX_EXTRA_AUTOWAH : 0u)
+                     | (beatRepActive ? POD_FX_EXTRA_BEAT_REPEAT : 0u)
+                     | (tapeStopActive ? POD_FX_EXTRA_TAPE_STOP : 0u)
+                     | ((stereoWidth < 0.99f || stereoWidth > 1.01f)
+                        ? POD_FX_EXTRA_STEREO_WIDTH : 0u);
     state.bpmX10 = podCurrentBpmX10;
     state.playing = dseq.playing ? 1u : 0u;
     state.sdPresent = sdPresent ? 1u : 0u;
@@ -8476,6 +8493,8 @@ static void ProcessCommand()
             if(beatRepDiv == 0){
                 beatRepActive = false;
                 beatRepPlaying = false;
+                beatRepCapturing = false;
+                beatRepPos = 0;
             } else {
                 beatRepActive = true;
                 /* Calculate slice len from BPM and division */
@@ -8484,12 +8503,9 @@ static void ProcessCommand()
                 beatRepLen = (uint32_t)(sliceSec * (float)SAMPLE_RATE);
                 if(beatRepLen > BEAT_REPEAT_BUF_SIZE) beatRepLen = BEAT_REPEAT_BUF_SIZE;
                 if(beatRepLen < 64) beatRepLen = 64;
+                beatRepPos = 0;
+                beatRepCapturing = true;
                 beatRepPlaying = true;
-                /* Set read pointer to start of current slice */
-                if(beatRepWp >= beatRepLen)
-                    beatRepRp = beatRepWp - beatRepLen;
-                else
-                    beatRepRp = 0;
             }
         }
         break;
@@ -8841,10 +8857,7 @@ static void ApplyPodEncoderFunction(uint8_t function, int increment)
         }
         case POD_FUNC_PATTERN_PREV:
         case POD_FUNC_PATTERN_NEXT:
-            ApplyPodButtonFunction(increment > 0 ? POD_FUNC_PATTERN_NEXT
-                                                 : POD_FUNC_PATTERN_PREV,
-                                   hw.system.GetNow());
-            break;
+            return;
         case POD_FUNC_DELAY_MIX: {
             float value = clampF(delayMix + (increment > 0 ? 0.02f : -0.02f),
                                  0.0f, 1.0f);
@@ -8996,8 +9009,16 @@ static void ProcessPodControls(uint32_t now)
     const int increment = pod.encoder.Increment();
     if(increment != 0)
     {
-        podEncoderPosition += increment;
-        ApplyPodEncoderFunction(podConfig.encoderFunction, increment);
+        if(podConfig.encoderFunction == POD_FUNC_PATTERN_PREV
+           || podConfig.encoderFunction == POD_FUNC_PATTERN_NEXT)
+        {
+            podEncoderPosition += increment;
+            podStateRevision++;
+        }
+        else
+        {
+            ApplyPodEncoderFunction(podConfig.encoderFunction, increment);
+        }
     }
 
     if(pod.button1.RisingEdge())
@@ -9751,8 +9772,8 @@ static void InitFX()
     memset(beatRepBufR, 0, sizeof(beatRepBufR));
     beatRepActive = false;
     beatRepDiv = 0;
-    beatRepWp = 0;
-    beatRepRp = 0;
+    beatRepPos = 0;
+    beatRepCapturing = false;
     beatRepPlaying = false;
 
     memset(chokeGroup, 0, sizeof(chokeGroup));

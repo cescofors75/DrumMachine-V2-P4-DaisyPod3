@@ -1,5 +1,6 @@
 param(
     [switch]$SkipBuild,
+    [switch]$Clean,
     [switch]$SkipClean,
     [ValidateRange(10, 180)]
     [int]$TimeoutSeconds = 45
@@ -19,7 +20,11 @@ $firmware = Join-Path $projectDir 'build\DrumMachineV2_DaisyPod3.bin'
 if(-not $SkipBuild) {
     Write-Host 'Compilando DrumMachineV2 DaisyPod3...' -ForegroundColor Cyan
     $buildArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $buildScript)
-    if(-not $SkipClean) { $buildArgs += '-Clean' }
+    if($Clean -and -not $SkipClean) { $buildArgs += '-Clean' }
+    else {
+        Write-Host 'Build incremental de DaisyPod3 (usa -Clean para reconstruir todo).' `
+            -ForegroundColor DarkGray
+    }
     & pwsh.exe @buildArgs
     if($LASTEXITCODE -ne 0) {
         throw "La compilacion de DaisyPod3 fallo con codigo $LASTEXITCODE"

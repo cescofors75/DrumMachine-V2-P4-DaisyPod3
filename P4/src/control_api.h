@@ -69,6 +69,7 @@ void control_send_set_sample_rate(int rate_hz);
 void control_send_set_crush_macro(uint8_t value);
 void control_send_fx_enc(int encoder, uint8_t value, bool muted);
 void control_send_fx_pot(int pot, uint8_t value, bool muted);
+void control_send_all_fx_off();
 void control_send_solo(int track, bool soloed);
 void control_send_mute_mask(uint16_t mask);
 void control_send_solo_mask(uint16_t mask);

@@ -29,7 +29,8 @@ constexpr uint16_t kExpectedPid = 0x01F6;
 constexpr uint8_t kRotaryGain = 51;
 constexpr uint16_t kRotaryInitialValue = 512;
 constexpr uint32_t kRotaryI2cHz = 100000;
-constexpr uint32_t kRotaryTaskPeriodMs = 5;
+constexpr uint32_t kRotaryTaskPeriodMs = 1;
+constexpr uint32_t kRotaryI2cTimeoutMs = 3;
 constexpr uint32_t kAbsentRetryMs = 1000;
 constexpr uint32_t kMuxRetryMs = 2000;
 constexpr uint8_t kFailuresBeforeOffline = 3;
@@ -550,7 +551,7 @@ void togglePhysicalFx(uint8_t function, uint16_t raw)
 void i2c_rotaries_init()
 {
     Wire1.begin(ROTARY_I2C_SDA, ROTARY_I2C_SCL, kRotaryI2cHz);
-    Wire1.setTimeOut(10);
+    Wire1.setTimeOut(kRotaryI2cTimeoutMs);
     for(uint8_t i = 0; i < kRotaryCount; ++i)
     {
         s_values[i].store(0, std::memory_order_relaxed);

@@ -549,6 +549,8 @@ void control_send_select_pattern(int index)
 {
     if(midiSongPrepared) control_cancel_midi_song();
     index = Clamp(index, 0, MAX_PATTERNS - 1);
+    if(queuedLogicalPattern >= 0 || queuedDaisyPattern != 0xFF)
+        daisyUsb.cancelPatternQueue();
     SequencerInstance().selectPattern(index);
     LoadPatternToUi(index);
     activeDaisyPattern = DefaultDaisyPattern(index);
@@ -1181,6 +1183,34 @@ void control_send_fx_pot(int pot, uint8_t value, bool muted)
         daisyUsb.sendU8(CMD_PHASER_ACTIVE, muted ? 0u : 1u);
         daisyUsb.sendFloat(CMD_PHASER_DEPTH, unit);
     }
+    fxDirty.store(true, std::memory_order_release);
+}
+
+void control_send_all_fx_off()
+{
+    for(int encoder = 0; encoder < 3; ++encoder)
+        p4.enc_muted[encoder] = true;
+    p4.pot_muted[0] = true;
+    p4.pot_muted[1] = true;
+    p4.pot_muted[2] = true;
+    p4.pot_value[1] = 0;
+    p4.filter_type = 0;
+    p4.cutoff_hz = 20000;
+    p4.resonance_x10 = 7;
+    p4.distortion_pct = 0;
+    p4.bitcrush_bits = 16;
+    p4.sample_rate_hz = 0;
+
+    daisyUsb.sendU8(CMD_FLANGER_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_DELAY_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_REVERB_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_PHASER_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_AUTOWAH_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_STEREO_WIDTH, 100);
+    daisyUsb.sendU8(CMD_TAPE_STOP, 0);
+    daisyUsb.sendU8(CMD_BEAT_REPEAT, 0);
+    daisyUsb.sendFloat(CMD_WAVEFOLDER_GAIN, 1.0f);
+    SendFilterState();
     fxDirty.store(true, std::memory_order_release);
 }
 
