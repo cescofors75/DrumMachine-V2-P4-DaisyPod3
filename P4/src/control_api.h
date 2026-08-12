@@ -75,6 +75,7 @@ void control_send_solo_mask(uint16_t mask);
 void control_mark_fx_screen_dirty();
 bool control_consume_fx_screen_dirty();
 bool control_pattern_track_uses_sampler(int pattern, int track);
+void control_restore_track_engine(int track);
 
 void control_send_synth_note_on_ex(uint8_t engine, uint8_t note,
                                    uint8_t velocity, bool accent, bool slide);

@@ -1242,6 +1242,16 @@ bool control_pattern_track_uses_sampler(int pattern, int track)
         && profile.engines[track] == -1;
 }
 
+void control_restore_track_engine(int track)
+{
+    if(track < 0 || track >= 16) return;
+    const int pattern = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+    BuiltinPatternSoundProfile profile{};
+    const int8_t engine = getBuiltinPatternSoundProfile(pattern, profile)
+        ? profile.engines[track] : -1;
+    daisyUsb.setTrackEngine(track, engine);
+}
+
 void control_send_synth_note_on_ex(uint8_t engine, uint8_t note,
                                    uint8_t velocity, bool accent, bool slide)
 {

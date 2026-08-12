@@ -8599,9 +8599,7 @@ static bool sd_factory_autoload_tick(void) {
         s_sd_upload_state.store(0, std::memory_order_release);
         if (result.result == SD_UP_OK) {
             ++s_factory_kit_loaded;
-            if (control_pattern_track_uses_sampler(p4.current_pattern,
-                                                   s_factory_kit_cursor))
-                control_send_set_track_engine(s_factory_kit_cursor, -1);
+            control_restore_track_engine(s_factory_kit_cursor);
         } else {
             ++s_factory_kit_failures;
         }
