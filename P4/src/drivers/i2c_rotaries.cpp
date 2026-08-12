@@ -42,6 +42,8 @@ constexpr uint32_t kFaderPollMs = 10;
 constexpr uint8_t kFaderLedGpio = 45;
 constexpr uint8_t kFaderLedCount = 14;
 constexpr size_t kFaderLedSymbols = kFaderLedCount * 24u;
+constexpr uint32_t kFaderLedRefreshMs = 1000;
+constexpr uint32_t kFaderLedRetryMs = 2000;
 
 std::atomic<uint16_t> s_values[kRotaryCount];
 std::atomic<uint8_t> s_gains[kRotaryCount];
@@ -73,7 +75,9 @@ uint32_t s_lastMuxProbeMs = 0;
 uint32_t s_lastFaderPollMs = 0;
 uint32_t s_faderFilteredQ3 = 0;
 bool s_haveFaderValue = false;
-bool s_faderLedReady = false;
+std::atomic<bool> s_faderLedReady{false};
+uint32_t s_lastFaderLedRefreshMs = 0;
+uint32_t s_lastFaderLedRetryMs = 0;
 rmt_data_t s_faderLedData[kFaderLedSymbols] = {};
 TaskHandle_t s_rotaryTask = nullptr;
 
@@ -310,9 +314,27 @@ void faderLedByte(size_t& symbol, uint8_t value)
     }
 }
 
-void updateFaderLeds(uint16_t value)
+bool ensureFaderLedDriver(uint32_t now)
 {
-    if(!s_faderLedReady) return;
+    if(s_faderLedReady.load(std::memory_order_acquire)) return true;
+    if(s_lastFaderLedRetryMs != 0
+       && static_cast<uint32_t>(now - s_lastFaderLedRetryMs)
+            < kFaderLedRetryMs)
+        return false;
+    s_lastFaderLedRetryMs = now;
+    pinMode(kFaderLedGpio, OUTPUT);
+    digitalWrite(kFaderLedGpio, LOW);
+    const bool ready = rmtInit(kFaderLedGpio, RMT_TX_MODE,
+                               RMT_MEM_NUM_BLOCKS_1, 10000000);
+    s_faderLedReady.store(ready, std::memory_order_release);
+    P4_LOG_PRINTF("[Fader LED] RMT %s on GPIO%u\n",
+                  ready ? "ready" : "retry pending", kFaderLedGpio);
+    return ready;
+}
+
+void updateFaderLeds(uint16_t value, uint32_t now)
+{
+    if(!ensureFaderLedDriver(now)) return;
     // Keep the first position visible even at zero so power/data wiring can be
     // distinguished from an unpowered fader.
     const uint8_t lit = static_cast<uint8_t>(1u
@@ -324,18 +346,18 @@ void updateFaderLeds(uint16_t value)
         uint8_t red = 0, green = 0, blue = 0;
         if(pixel < lit)
         {
-            // Low-current cyan-to-magenta bar; GRB order matches M5Stack's
-            // official NEOPIXEL example for the 14 SK6812 LEDs.
-            red = static_cast<uint8_t>((static_cast<uint16_t>(pixel) * 30u)
-                                       / (kFaderLedCount - 1u));
-            green = 28;
-            blue = static_cast<uint8_t>(48u - pixel);
+            const bool tip = pixel + 1u == lit;
+            red = tip ? 64 : 32;
+            green = tip ? 24 : 5;
+            blue = tip ? 2 : 0;
         }
         faderLedByte(symbol, green);
         faderLedByte(symbol, red);
         faderLedByte(symbol, blue);
     }
-    rmtWrite(kFaderLedGpio, s_faderLedData, kFaderLedSymbols, 20);
+    if(!rmtWrite(kFaderLedGpio, s_faderLedData, kFaderLedSymbols, 20))
+        P4_LOG_PRINTLN("[Fader LED] RMT write timed out");
+    s_lastFaderLedRefreshMs = now;
 }
 
 void pollFader(uint32_t now)
@@ -371,16 +393,19 @@ void pollFader(uint32_t now)
     const uint16_t previous = s_faderValue.load(std::memory_order_relaxed);
     const uint16_t delta = previous > normalized ? previous - normalized
                                                   : normalized - previous;
-    if(delta >= 3u || (firstValue && previous != normalized)
-       || normalized == 0u || normalized == 1023u)
+    const bool acceptedChange = previous != normalized
+        && (delta >= 3u || firstValue || normalized == 0u
+            || normalized == 1023u);
+    if(acceptedChange)
     {
-        if(previous != normalized)
-        {
-            s_faderValue.store(normalized, std::memory_order_release);
-            s_faderChanged.store(true, std::memory_order_release);
-            updateFaderLeds(normalized);
-        }
+        s_faderValue.store(normalized, std::memory_order_release);
+        s_faderChanged.store(true, std::memory_order_release);
     }
+    const bool refreshDue = s_lastFaderLedRefreshMs == 0
+        || static_cast<uint32_t>(now - s_lastFaderLedRefreshMs)
+            >= kFaderLedRefreshMs;
+    if(firstValue || acceptedChange || refreshDue)
+        updateFaderLeds(acceptedChange ? normalized : previous, now);
 }
 
 uint8_t mapAbsolute(uint16_t raw, uint16_t low, uint16_t high)
@@ -586,11 +611,10 @@ void i2c_rotaries_init()
     s_lastFaderPollMs = 0;
     s_faderFilteredQ3 = 0;
     s_haveFaderValue = false;
-    pinMode(kFaderLedGpio, OUTPUT);
-    digitalWrite(kFaderLedGpio, LOW);
-    s_faderLedReady = rmtInit(kFaderLedGpio, RMT_TX_MODE,
-                              RMT_MEM_NUM_BLOCKS_1, 10000000);
-    updateFaderLeds(0);
+    s_faderLedReady.store(false, std::memory_order_relaxed);
+    s_lastFaderLedRefreshMs = 0;
+    s_lastFaderLedRetryMs = 0;
+    updateFaderLeds(0, millis());
 }
 
 void i2c_rotaries_poll()
@@ -845,7 +869,7 @@ bool p4_fader_detected()
 
 bool p4_fader_led_driver_ready()
 {
-    return s_faderLedReady;
+    return s_faderLedReady.load(std::memory_order_acquire);
 }
 
 uint16_t p4_fader_raw()

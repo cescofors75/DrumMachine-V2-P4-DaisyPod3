@@ -2312,7 +2312,7 @@ static const char* pod_control_function_name(uint8_t function) {
         "PATTERN -", "PATTERN +", "MASTER VOL", "SEQ VOL",
         "LIVE VOL", "TEMPO", "SELECT PAD", "BACK", "MIXER", "FX",
         "SEQUENCER", "PAD GRID", "PAD SOUNDS", "XTRA PADS",
-        "DELAY MIX", "REVERB MIX", "BUTTON CONFIG", "SCREEN BRIGHTNESS",
+        "DELAY MIX", "REVERB MIX", "BUTTON CONFIG", "DISPLAY BRIGHTNESS",
         "FLANGER DEPTH", "WAVEFOLDER", "CRUSH MACRO", "PHASER DEPTH",
         "FILTER CUTOFF", "FILTER RESONANCE", "DISTORTION", "BIT DEPTH",
         "SAMPLE RATE", "FILTER TYPE"
@@ -12742,49 +12742,308 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
 }
 
 // =============================================================================
-// LOCAL STATUS SCREENSAVER — shown after 5 minutes without touch.
+// LOCAL STATUS SCREENSAVER — shown after 1 minute without touch.
 // =============================================================================
-static const uint32_t SCREENSAVER_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+static const uint32_t SCREENSAVER_TIMEOUT_MS = 60UL * 1000UL;
+static const uint32_t SCREENSAVER_PAGE_MS = 6500;
 static bool     s_screensaver_active = false;
 static int      s_screensaver_return = 2;               // pantalla a restaurar
+static uint8_t  s_screensaver_page = 0;
+static uint32_t s_screensaver_page_started_ms = 0;
+static lv_obj_t* s_screensaver_stage = NULL;
+static lv_obj_t* s_screensaver_kicker = NULL;
+static lv_obj_t* s_screensaver_title = NULL;
+static lv_obj_t* s_screensaver_detail = NULL;
+static lv_obj_t* s_screensaver_counter = NULL;
+
+struct ScreensaverCreditPage {
+    const char* kicker;
+    const char* title;
+    const char* detail;
+};
+
+static const ScreensaverCreditPage SCREENSAVER_CREDITS[] = {
+    {
+        "RED808 / AGRADECIMIENTOS",
+        "GRACIAS",
+        "A TODA LA GENTE QUE ME HA AYUDADO,\n"
+        "APOYADO Y HECHO POSIBLE ESTE VIAJE."
+    },
+    {
+        "FAMILIA",
+        "MoNika",
+        "MI MUJER\n\nOTTO  /  MAC  /  BUDY\nMIS BABYS"
+    },
+    {
+        "CREW / THE BOYS",
+        "ADRI  /  AITOR  /  BRZUOS\n"
+        "FREDY  /  KARZ  /  MARCOS\n"
+        "ORIOL  /  VICTURIOSO",
+        ""
+    },
+    {
+        "MENTORIA",
+        "GUSTAVO PATOW",
+        "(UdG)"
+    },
+    {
+        "AMIGOS / FAMILIARES",
+        "FRANCESC  /  NONE  /  NANDU\n"
+        "LIMA  /  TILLO  /  XARLY\n"
+        "ERNEST  /  PAULA  /  NARCIS\n"
+        "GRIMAL  /  PANDA  /  GARBIN",
+        ""
+    },
+    {
+        "EN MEMORIA DE",
+        "JAVI LOBATO  /  ROTEM",
+        "DEP"
+    }
+};
+static constexpr uint8_t SCREENSAVER_PAGE_COUNT =
+    sizeof(SCREENSAVER_CREDITS) / sizeof(SCREENSAVER_CREDITS[0]);
+static lv_obj_t* s_screensaver_progress[SCREENSAVER_PAGE_COUNT] = {};
+
+static void screensaver_fade_exec(void* object, int32_t value) {
+    lv_obj_set_style_opa(static_cast<lv_obj_t*>(object),
+                         static_cast<lv_opa_t>(value), 0);
+}
+
+static void screensaver_translate_exec(void* object, int32_t value) {
+    lv_obj_set_style_translate_y(static_cast<lv_obj_t*>(object), value, 0);
+}
+
+static void screensaver_show_page(uint8_t page, bool animate) {
+    if (!s_screensaver_stage || page >= SCREENSAVER_PAGE_COUNT) return;
+    const ScreensaverCreditPage& credit = SCREENSAVER_CREDITS[page];
+    const ThemeColors& red808 = theme_presets[THEME_RED808];
+    s_screensaver_page = page;
+    lv_label_set_text(s_screensaver_kicker, credit.kicker);
+    lv_label_set_text(s_screensaver_title, credit.title);
+    lv_label_set_text(s_screensaver_detail, credit.detail);
+    lv_obj_set_style_text_font(s_screensaver_title,
+        page == 0 ? &lv_font_montserrat_40 : &lv_font_montserrat_28, 0);
+    lv_label_set_text_fmt(s_screensaver_counter, "%02u / %02u",
+                          page + 1u, SCREENSAVER_PAGE_COUNT);
+    for (uint8_t i = 0; i < SCREENSAVER_PAGE_COUNT; ++i) {
+        lv_obj_set_style_bg_color(s_screensaver_progress[i],
+            lv_color_hex(i == page ? red808.accent2 : red808.border), 0);
+    }
+    if (!animate) return;
+
+    lv_anim_del(s_screensaver_stage, screensaver_fade_exec);
+    lv_anim_del(s_screensaver_stage, screensaver_translate_exec);
+    lv_obj_set_style_opa(s_screensaver_stage, LV_OPA_20, 0);
+    lv_obj_set_style_translate_y(s_screensaver_stage, 16, 0);
+
+    lv_anim_t fade;
+    lv_anim_init(&fade);
+    lv_anim_set_var(&fade, s_screensaver_stage);
+    lv_anim_set_exec_cb(&fade, screensaver_fade_exec);
+    lv_anim_set_values(&fade, LV_OPA_20, LV_OPA_COVER);
+    lv_anim_set_time(&fade, 520);
+    lv_anim_set_path_cb(&fade, lv_anim_path_ease_out);
+    lv_anim_start(&fade);
+
+    lv_anim_t rise;
+    lv_anim_init(&rise);
+    lv_anim_set_var(&rise, s_screensaver_stage);
+    lv_anim_set_exec_cb(&rise, screensaver_translate_exec);
+    lv_anim_set_values(&rise, 16, 0);
+    lv_anim_set_time(&rise, 620);
+    lv_anim_set_path_cb(&rise, lv_anim_path_ease_out);
+    lv_anim_start(&rise);
+}
 
 static void create_screensaver_screen(void) {
     if (scr_screensaver) return;
 
+    const ThemeColors& red808 = theme_presets[THEME_RED808];
+    const lv_color_t bg = lv_color_hex(red808.bg);
+    const lv_color_t panel = lv_color_hex(red808.panel);
+    const lv_color_t border = lv_color_hex(red808.border);
+    const lv_color_t text = lv_color_hex(red808.text);
+    const lv_color_t dim = lv_color_hex(red808.text_dim);
+    const lv_color_t accent = lv_color_hex(red808.accent);
+    const lv_color_t accent2 = lv_color_hex(red808.accent2);
+
     scr_screensaver = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_screensaver, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(scr_screensaver, bg, 0);
     lv_obj_clear_flag(scr_screensaver, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t* lbl = lv_label_create(scr_screensaver);
-    lv_label_set_text(lbl,
-        "RED808 DRUMMACHINE V2\n\n"
-        "P4  < USB-C >  DAISYPOD3\n\n"
-        "(toca para volver)");
-    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
-    lv_obj_center(lbl);
+    lv_obj_t* rail = lv_obj_create(scr_screensaver);
+    lv_obj_set_size(rail, 308, LCD_V_RES);
+    lv_obj_set_pos(rail, 0, 0);
+    lv_obj_set_style_radius(rail, 0, 0);
+    lv_obj_set_style_bg_color(rail, panel, 0);
+    lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(rail, 0, 0);
+    lv_obj_clear_flag(rail, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* rail_line = lv_obj_create(scr_screensaver);
+    lv_obj_set_size(rail_line, 2, LCD_V_RES);
+    lv_obj_set_pos(rail_line, 308, 0);
+    lv_obj_set_style_radius(rail_line, 0, 0);
+    lv_obj_set_style_bg_color(rail_line, accent, 0);
+    lv_obj_set_style_border_width(rail_line, 0, 0);
+    lv_obj_clear_flag(rail_line, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(rail_line, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* brand = lv_label_create(rail);
+    lv_label_set_text(brand, "RED808");
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_40, 0);
+    lv_obj_set_style_text_color(brand, text, 0);
+    lv_obj_set_pos(brand, 30, 30);
+
+    lv_obj_t* product = lv_label_create(rail);
+    lv_label_set_text(product, "DRUMMACHINE V2");
+    lv_obj_set_style_text_font(product, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_color(product, accent2, 0);
+    lv_obj_set_pos(product, 32, 82);
+
+    lv_obj_t* brand_rule = lv_obj_create(rail);
+    lv_obj_set_size(brand_rule, 244, 1);
+    lv_obj_set_pos(brand_rule, 30, 120);
+    lv_obj_set_style_bg_color(brand_rule, border, 0);
+    lv_obj_set_style_border_width(brand_rule, 0, 0);
+    lv_obj_clear_flag(brand_rule, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(brand_rule, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* demo_kicker = lv_label_create(rail);
+    lv_label_set_text(demo_kicker, "FIRST DEMO");
+    lv_obj_set_style_text_font(demo_kicker, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(demo_kicker, dim, 0);
+    lv_obj_set_pos(demo_kicker, 32, 154);
+
+    lv_obj_t* demo = lv_label_create(rail);
+    lv_label_set_text(demo, "01/08/2026\nON/OFF FESTIVAL");
+    lv_obj_set_style_text_font(demo, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(demo, text, 0);
+    lv_obj_set_style_text_line_space(demo, 8, 0);
+    lv_obj_set_pos(demo, 30, 177);
+
+    lv_obj_t* partner_kicker = lv_label_create(rail);
+    lv_label_set_text(partner_kicker, "PARTNER TECNOLOGICO");
+    lv_obj_set_style_text_font(partner_kicker, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(partner_kicker, dim, 0);
+    lv_obj_set_pos(partner_kicker, 32, 286);
+
+    lv_obj_t* partner = lv_label_create(rail);
+    lv_label_set_text(partner, "Daisy.audio");
+    lv_obj_set_style_text_font(partner, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(partner, accent2, 0);
+    lv_obj_set_pos(partner, 30, 309);
+
+    lv_obj_t* author_kicker = lv_label_create(rail);
+    lv_label_set_text(author_kicker, "DESARROLLADO POR");
+    lv_obj_set_style_text_font(author_kicker, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(author_kicker, dim, 0);
+    lv_obj_set_pos(author_kicker, 32, 408);
+
+    lv_obj_t* author = lv_label_create(rail);
+    lv_label_set_text(author, "CESCO FORS");
+    lv_obj_set_style_text_font(author, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(author, text, 0);
+    lv_obj_set_pos(author, 30, 431);
+
+    lv_obj_t* open_source = lv_label_create(rail);
+    lv_label_set_text(open_source, "#opensource");
+    lv_obj_set_style_text_font(open_source, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_color(open_source, accent, 0);
+    lv_obj_set_pos(open_source, 31, 469);
+
+    lv_obj_t* header = lv_label_create(scr_screensaver);
+    lv_label_set_text(header, "AGRADECIMIENTOS / RED808");
+    lv_obj_set_style_text_font(header, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_color(header, accent, 0);
+    lv_obj_set_style_text_letter_space(header, 2, 0);
+    lv_obj_set_pos(header, 354, 36);
+
+    lv_obj_t* header_rule = lv_obj_create(scr_screensaver);
+    lv_obj_set_size(header_rule, 620, 1);
+    lv_obj_set_pos(header_rule, 354, 78);
+    lv_obj_set_style_bg_color(header_rule, border, 0);
+    lv_obj_set_style_border_width(header_rule, 0, 0);
+    lv_obj_clear_flag(header_rule, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(header_rule, LV_OBJ_FLAG_CLICKABLE);
+
+    s_screensaver_stage = lv_obj_create(scr_screensaver);
+    lv_obj_set_size(s_screensaver_stage, 620, 350);
+    lv_obj_set_pos(s_screensaver_stage, 354, 116);
+    lv_obj_set_style_bg_opa(s_screensaver_stage, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_screensaver_stage, 0, 0);
+    lv_obj_set_style_pad_all(s_screensaver_stage, 0, 0);
+    lv_obj_clear_flag(s_screensaver_stage, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_screensaver_kicker = lv_label_create(s_screensaver_stage);
+    lv_obj_set_width(s_screensaver_kicker, 620);
+    lv_obj_set_pos(s_screensaver_kicker, 0, 0);
+    lv_obj_set_style_text_font(s_screensaver_kicker, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_color(s_screensaver_kicker, accent2, 0);
+
+    s_screensaver_title = lv_label_create(s_screensaver_stage);
+    lv_obj_set_width(s_screensaver_title, 620);
+    lv_obj_set_pos(s_screensaver_title, 0, 52);
+    lv_label_set_long_mode(s_screensaver_title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(s_screensaver_title, text, 0);
+    lv_obj_set_style_text_line_space(s_screensaver_title, 8, 0);
+
+    s_screensaver_detail = lv_label_create(s_screensaver_stage);
+    lv_obj_set_width(s_screensaver_detail, 620);
+    lv_obj_set_pos(s_screensaver_detail, 0, 216);
+    lv_label_set_long_mode(s_screensaver_detail, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(s_screensaver_detail, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(s_screensaver_detail, dim, 0);
+    lv_obj_set_style_text_line_space(s_screensaver_detail, 6, 0);
+
+    s_screensaver_counter = lv_label_create(scr_screensaver);
+    lv_obj_set_style_text_font(s_screensaver_counter, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(s_screensaver_counter, dim, 0);
+    lv_obj_set_pos(s_screensaver_counter, 354, 516);
+
+    for (uint8_t i = 0; i < SCREENSAVER_PAGE_COUNT; ++i) {
+        s_screensaver_progress[i] = lv_obj_create(scr_screensaver);
+        lv_obj_set_size(s_screensaver_progress[i], 42, 3);
+        lv_obj_set_pos(s_screensaver_progress[i], 354 + i * 54, 548);
+        lv_obj_set_style_radius(s_screensaver_progress[i], 0, 0);
+        lv_obj_set_style_border_width(s_screensaver_progress[i], 0, 0);
+        lv_obj_clear_flag(s_screensaver_progress[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(s_screensaver_progress[i], LV_OBJ_FLAG_CLICKABLE);
+    }
+    screensaver_show_page(0, false);
 }
 
 static void screensaver_tick(void) {
     // Nunca sobre el boot: tiene su propio flujo de arranque.
     if (active_screen == 0) return;
 
+    const uint32_t now = millis();
     uint32_t inact = millis() - lvgl_port_last_touch_ms();
     if (!s_screensaver_active) {
         if (inact >= SCREENSAVER_TIMEOUT_MS) {
             if (!scr_screensaver) create_screensaver_screen();
             if (scr_screensaver) {
                 s_screensaver_return = active_screen;
+                s_screensaver_page_started_ms = now;
+                screensaver_show_page(0, true);
                 lv_scr_load_anim(scr_screensaver, LV_SCR_LOAD_ANIM_FADE_ON,
                                  400, 0, false);
                 s_screensaver_active = true;
             }
         }
-    } else if (inact < SCREENSAVER_TIMEOUT_MS) {
-        // Un toque reinició el contador → volver a la pantalla previa.
-        s_screensaver_active = false;
-        ui_navigate_to(s_screensaver_return);
+    } else {
+        if (inact < SCREENSAVER_TIMEOUT_MS) {
+            // Un toque reinició el contador → volver a la pantalla previa.
+            s_screensaver_active = false;
+            ui_navigate_to(s_screensaver_return);
+        } else if (static_cast<uint32_t>(now - s_screensaver_page_started_ms)
+                   >= SCREENSAVER_PAGE_MS) {
+            s_screensaver_page_started_ms = now;
+            screensaver_show_page(
+                static_cast<uint8_t>((s_screensaver_page + 1u)
+                                     % SCREENSAVER_PAGE_COUNT),
+                true);
+        }
     }
 }
 

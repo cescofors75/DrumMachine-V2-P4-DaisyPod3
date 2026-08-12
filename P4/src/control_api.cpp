@@ -1206,6 +1206,11 @@ void control_send_all_fx_off()
     daisyUsb.sendU8(CMD_REVERB_ACTIVE, 0);
     daisyUsb.sendU8(CMD_PHASER_ACTIVE, 0);
     daisyUsb.sendU8(CMD_AUTOWAH_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_CHORUS_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_TREMOLO_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_COMP_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_LIMITER_ACTIVE, 0);
+    daisyUsb.sendU8(CMD_EARLY_REF_ACTIVE, 0);
     daisyUsb.sendU8(CMD_STEREO_WIDTH, 100);
     daisyUsb.sendU8(CMD_TAPE_STOP, 0);
     daisyUsb.sendU8(CMD_BEAT_REPEAT, 0);
