@@ -62,7 +62,10 @@ void setup() {
 
     // 4. Load persisted settings (NVS) and apply the saved theme
     settings_load();
-    ui_theme_apply((VisualTheme)settings_boot_theme());
+    const int boot_theme = settings_boot_theme();
+    P4_THEME_LOG_PRINTF("[THEME] boot staged=%d current=%u p4=%d\n",
+                        boot_theme, static_cast<unsigned>(ui_theme_index()), p4.theme);
+    ui_theme_apply((VisualTheme)boot_theme);
 
     // 5. Mount SPIFFS BEFORE creating screens: create_live_screen() restores
     // the persisted XTRA pad state from SPIFFS, so the FS must be up first.
@@ -97,6 +100,8 @@ void setup() {
     // 7. Restore the P4 settings. control_process() pushes the resulting state
     // to DaisyPod3 as soon as the USB command handshake becomes active.
     settings_apply();
+    P4_THEME_LOG_PRINTF("[THEME] settings applied staged=%d current=%u p4=%d\n",
+                        boot_theme, static_cast<unsigned>(ui_theme_index()), p4.theme);
 
     // 9. Start DSP processing task (Core 0)
     P4_LOG_PRINTLN("[INIT] DSP task...");

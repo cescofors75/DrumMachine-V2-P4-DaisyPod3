@@ -261,11 +261,11 @@ static int ui_layout_h(void) {
 }
 
 static inline lv_color_t ui_track_color(int track) {
-    return lv_color_hex(theme_presets[currentTheme].track_colors[track & 0x0F]);
+    return lv_color_hex(theme_presets[ui_theme_index()].track_colors[track & 0x0F]);
 }
 
 static inline bool ui_track_color_is_light(int track) {
-    uint32_t c = theme_presets[currentTheme].track_colors[track & 0x0F];
+    uint32_t c = theme_presets[ui_theme_index()].track_colors[track & 0x0F];
     uint8_t r = (uint8_t)((c >> 16) & 0xFF);
     uint8_t g = (uint8_t)((c >> 8) & 0xFF);
     uint8_t b = (uint8_t)(c & 0xFF);
@@ -847,7 +847,7 @@ static const uint8_t XTRA_MELODIC_BASE_NOTES[3][4] = {
 };
 
 static inline lv_color_t xtra_slot_color(int slot) {
-    return lv_color_hex(theme_presets[currentTheme].track_colors[slot & 0x0F]);
+    return lv_color_hex(theme_presets[ui_theme_index()].track_colors[slot & 0x0F]);
 }
 
 static void xtra_apply_visual_state(int slot, bool active, lv_coord_t lx, lv_coord_t ly) {
@@ -1685,7 +1685,12 @@ static void ui_live_consume_sync_p4(void) {
 
 static void grid_theme_cb(lv_event_t* e) {
     LV_UNUSED(e);
-    int next = ((int)currentTheme + 1) % THEME_COUNT;
+    const uint8_t previous = ui_theme_index();
+    int next = (previous + 1) % THEME_COUNT;
+    P4_THEME_LOG_PRINTF("[THEME] click current=%u p4=%d next=%d heap=%u psram=%u\n",
+                        static_cast<unsigned>(previous), p4.theme, next,
+                        static_cast<unsigned>(ESP.getFreeHeap()),
+                        static_cast<unsigned>(ESP.getFreePsram()));
     p4.theme = next;
     ui_theme_apply((VisualTheme)next);
     // Sync theme to S3
@@ -6085,7 +6090,7 @@ static void create_sequencer_screen(void) {
     // ── Track rows ──
     for (int t = 0; t < 16; t++) {
         int rowY = SEQ_GRID_Y + t * (SEQ_TRACK_H + SEQ_TRACK_GAP);
-        lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[t]);
+        lv_color_t tc = lv_color_hex(theme_presets[ui_theme_index()].track_colors[t]);
 
         // Alternating row background for legibility
         lv_obj_t* row_bg = lv_obj_create(scr_sequencer);
@@ -6459,7 +6464,7 @@ static void update_sequencer_screen(void) {
         bool isolated = anySolo && !soloed;
         uint8_t trk_key = (uint8_t)((isolated ? 4 : 0) | (soloed ? 2 : 0)
                                     | (muted ? 1 : 0));
-        lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[t]);
+        lv_color_t tc = lv_color_hex(theme_presets[ui_theme_index()].track_colors[t]);
 
         if (trk_key != prev_trk_key[t]) {
             prev_trk_key[t] = trk_key;
@@ -6935,7 +6940,7 @@ static void create_volumes_screen(void) {
     for (int i = 0; i < 16; i++) {
         int x = margin + i * (strip_w + gap);
         int cx = x + strip_w / 2;
-        lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[i]);
+        lv_color_t tc = lv_color_hex(theme_presets[ui_theme_index()].track_colors[i]);
         lv_color_t tc_hi = lv_color_mix(lv_color_white(), tc, 110);   // lit top of the fader
 
         // Strip panel background
@@ -7106,7 +7111,7 @@ static void update_volumes_screen(void) {
         if (vol_strip_panels[i]) {
             lv_obj_set_style_border_color(vol_strip_panels[i],
                 p4.track_muted[i] ? RED808_ERROR :
-                lv_color_hex(theme_presets[currentTheme].track_colors[i]), 0);
+                lv_color_hex(theme_presets[ui_theme_index()].track_colors[i]), 0);
             lv_obj_set_style_border_opa(vol_strip_panels[i],
                 p4.track_muted[i] ? LV_OPA_80 : LV_OPA_40, 0);
             lv_obj_set_style_bg_opa(vol_strip_panels[i],
@@ -7115,7 +7120,7 @@ static void update_volumes_screen(void) {
         if (vol_name_labels[i]) {
             lv_obj_set_style_text_color(vol_name_labels[i],
                 p4.track_muted[i] ? RED808_TEXT_DIM :
-                lv_color_hex(theme_presets[currentTheme].track_colors[i]), 0);
+                lv_color_hex(theme_presets[ui_theme_index()].track_colors[i]), 0);
         }
     }
     prev_init = true;
@@ -7152,7 +7157,7 @@ static void update_volumes_screen(void) {
         int next = (int)beat_glow[i] - 40;
         if (next < 0) next = 0;
         beat_glow[i] = (uint8_t)next;
-        lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[i]);
+        lv_color_t tc = lv_color_hex(theme_presets[ui_theme_index()].track_colors[i]);
         lv_obj_set_style_border_opa(vol_strip_panels[i],
             (lv_opa_t)max((int)LV_OPA_40, next), 0);
         lv_obj_set_style_bg_opa(vol_strip_panels[i],
@@ -9250,7 +9255,7 @@ static void create_sdcard_screen(void) {
         snprintf(num_str, sizeof(num_str), "%s\n%d", trackNames[i], i);
         lv_label_set_text(num_lbl, num_str);
         lv_obj_set_style_text_font(num_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(num_lbl, lv_color_hex(theme_presets[currentTheme].track_colors[i]), 0);
+        lv_obj_set_style_text_color(num_lbl, lv_color_hex(theme_presets[ui_theme_index()].track_colors[i]), 0);
         lv_obj_set_style_text_align(num_lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_center(num_lbl);
 
@@ -11862,7 +11867,7 @@ static lv_obj_t* create_theme_transition_screen(void) {
     lv_obj_align(tag, LV_ALIGN_CENTER, 0, -38);
 
     lv_obj_t* name = lv_label_create(scr);
-    lv_label_set_text(name, theme_presets[currentTheme].name);
+    lv_label_set_text(name, theme_presets[ui_theme_index()].name);
     lv_obj_set_style_text_font(name, &lv_font_montserrat_40, 0);
     lv_obj_set_style_text_letter_space(name, 6, 0);
     lv_obj_set_style_text_color(name, RED808_ACCENT, 0);
@@ -11881,6 +11886,11 @@ static lv_obj_t* create_theme_transition_screen(void) {
 static void ui_reload_themed_screens(void) {
     int saved_screen = active_screen;
     const int saved_pattern = p4.current_pattern;
+    P4_THEME_LOG_PRINTF("[THEME] reload begin current=%u p4=%d screen=%d gen=%u heap=%u psram=%u\n",
+                        static_cast<unsigned>(ui_theme_index()), p4.theme,
+                        saved_screen, static_cast<unsigned>(s_ui_refresh_gen),
+                        static_cast<unsigned>(ESP.getFreeHeap()),
+                        static_cast<unsigned>(ESP.getFreePsram()));
 
     // Stop touch_task from hit-testing/enqueuing against pads that are about
     // to be deleted. ui_navigate_to() at the end restores the flag.
@@ -12109,6 +12119,11 @@ static void ui_reload_themed_screens(void) {
     // synchronously here, so a one-shot timer reaps it once the fade is done.
     lv_timer_t* reap = lv_timer_create(theme_transition_del_cb, 450, trans_scr);
     lv_timer_set_repeat_count(reap, 1);
+    P4_THEME_LOG_PRINTF("[THEME] reload end current=%u p4=%d screen=%d gen=%u heap=%u psram=%u\n",
+                        static_cast<unsigned>(ui_theme_index()), p4.theme,
+                        active_screen, static_cast<unsigned>(s_ui_refresh_gen),
+                        static_cast<unsigned>(ESP.getFreeHeap()),
+                        static_cast<unsigned>(ESP.getFreePsram()));
 }
 
 void ui_navigate_to(int screen_id) {
@@ -12744,6 +12759,9 @@ void ui_update_current_screen(void) {
     // Theme change — recreate all screens with new palette
     static int prev_theme = -1;
     if (p4.theme != prev_theme && prev_theme != -1) {
+        P4_THEME_LOG_PRINTF("[THEME] update detected prev=%d p4=%d current=%u\n",
+                            prev_theme, p4.theme,
+                            static_cast<unsigned>(ui_theme_index()));
         prev_theme = p4.theme;
         ui_theme_apply((VisualTheme)p4.theme);
         ui_reload_themed_screens();

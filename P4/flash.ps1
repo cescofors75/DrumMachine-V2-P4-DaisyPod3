@@ -1,6 +1,7 @@
 param(
     [string]$Port,
-    [switch]$DetectOnly
+    [switch]$DetectOnly,
+    [switch]$SkipClean
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,6 +94,18 @@ if(-not $selected) {
 Write-Host "ESP32-P4 detectado en $($selected.port)" -ForegroundColor Green
 Write-Host "  $($selected.description)  [$($selected.hwid)]"
 if($DetectOnly) { exit 0 }
+
+if(-not $SkipClean) {
+    Write-Host 'Limpiando artefactos anteriores de P4...' -ForegroundColor Cyan
+    & $pio run --project-dir $projectDir --environment esp32p4-upload --target clean
+    if($LASTEXITCODE -ne 0) {
+        throw "La limpieza de P4 fallo con codigo $LASTEXITCODE"
+    }
+    $buildCacheDir = Join-Path $projectDir '.pio\build_cache'
+    if(Test-Path $buildCacheDir) {
+        Remove-Item -Recurse -Force $buildCacheDir
+    }
+}
 
 Write-Host 'Flasheando DrumMachineV2 P4 con no-stub...' -ForegroundColor Cyan
 & $pio run `

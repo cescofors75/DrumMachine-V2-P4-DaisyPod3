@@ -32,6 +32,16 @@
 #define P4_FX_LOG_PRINTF(...) ((void)0)
 #endif
 
+#ifndef P4_ENABLE_THEME_DIAGNOSTICS
+#define P4_ENABLE_THEME_DIAGNOSTICS 0
+#endif
+
+#if P4_ENABLE_THEME_DIAGNOSTICS
+#define P4_THEME_LOG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+#define P4_THEME_LOG_PRINTF(...) ((void)0)
+#endif
+
 // Periodic Serial report of render FPS, LVGL task rate, touch poll rate and
 // free heap (internal/PSRAM) — every PERF_LOG_INTERVAL_MS. Zero-cost when
 // disabled (counters + prints compile out entirely). Enable with

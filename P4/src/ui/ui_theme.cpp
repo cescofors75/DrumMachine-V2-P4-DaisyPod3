@@ -2,6 +2,7 @@
 // ui_theme.cpp — RED808 theme presets (mirror of S3)
 // =============================================================================
 #include "ui_theme.h"
+#include "config.h"
 
 VisualTheme currentTheme = THEME_OCEAN;
 
@@ -59,22 +60,42 @@ const ThemeColors theme_presets[THEME_COUNT] = {
       .name="GREYSCALE" },
 };
 
+uint8_t ui_theme_index() {
+  const uint8_t index = static_cast<uint8_t>(currentTheme);
+  if (index < THEME_COUNT) return index;
+  P4_THEME_LOG_PRINTF("[THEME] invalid current=%u; repairing to OCEAN\n",
+            static_cast<unsigned>(index));
+  currentTheme = THEME_OCEAN;
+  return static_cast<uint8_t>(currentTheme);
+}
+
 // Theme accessors
-lv_color_t theme_bg()       { return lv_color_hex(theme_presets[currentTheme].bg); }
-lv_color_t theme_panel()    { return lv_color_hex(theme_presets[currentTheme].panel); }
-lv_color_t theme_surface()  { return lv_color_hex(theme_presets[currentTheme].surface); }
-lv_color_t theme_border()   { return lv_color_hex(theme_presets[currentTheme].border); }
-lv_color_t theme_text()     { return lv_color_hex(theme_presets[currentTheme].text); }
-lv_color_t theme_text_dim() { return lv_color_hex(theme_presets[currentTheme].text_dim); }
-lv_color_t theme_accent()   { return lv_color_hex(theme_presets[currentTheme].accent); }
-lv_color_t theme_accent2()  { return lv_color_hex(theme_presets[currentTheme].accent2); }
-lv_color_t theme_success()  { return lv_color_hex(theme_presets[currentTheme].success); }
-lv_color_t theme_warning()  { return lv_color_hex(theme_presets[currentTheme].warning); }
-lv_color_t theme_error()    { return lv_color_hex(theme_presets[currentTheme].error); }
-lv_color_t theme_info()     { return lv_color_hex(theme_presets[currentTheme].info); }
-lv_color_t theme_cyan()     { return lv_color_hex(theme_presets[currentTheme].cyan); }
+lv_color_t theme_bg()       { return lv_color_hex(theme_presets[ui_theme_index()].bg); }
+lv_color_t theme_panel()    { return lv_color_hex(theme_presets[ui_theme_index()].panel); }
+lv_color_t theme_surface()  { return lv_color_hex(theme_presets[ui_theme_index()].surface); }
+lv_color_t theme_border()   { return lv_color_hex(theme_presets[ui_theme_index()].border); }
+lv_color_t theme_text()     { return lv_color_hex(theme_presets[ui_theme_index()].text); }
+lv_color_t theme_text_dim() { return lv_color_hex(theme_presets[ui_theme_index()].text_dim); }
+lv_color_t theme_accent()   { return lv_color_hex(theme_presets[ui_theme_index()].accent); }
+lv_color_t theme_accent2()  { return lv_color_hex(theme_presets[ui_theme_index()].accent2); }
+lv_color_t theme_success()  { return lv_color_hex(theme_presets[ui_theme_index()].success); }
+lv_color_t theme_warning()  { return lv_color_hex(theme_presets[ui_theme_index()].warning); }
+lv_color_t theme_error()    { return lv_color_hex(theme_presets[ui_theme_index()].error); }
+lv_color_t theme_info()     { return lv_color_hex(theme_presets[ui_theme_index()].info); }
+lv_color_t theme_cyan()     { return lv_color_hex(theme_presets[ui_theme_index()].cyan); }
 
 void ui_theme_apply(VisualTheme theme) {
-    if (theme >= THEME_COUNT) return;
+  const uint8_t requested = static_cast<uint8_t>(theme);
+  if (requested >= THEME_COUNT) {
+    P4_THEME_LOG_PRINTF("[THEME] rejected apply=%u current=%u\n",
+              static_cast<unsigned>(requested),
+              static_cast<unsigned>(ui_theme_index()));
+    return;
+  }
+  const uint8_t previous = ui_theme_index();
     currentTheme = theme;
+  P4_THEME_LOG_PRINTF("[THEME] apply %u->%u (%s)\n",
+            static_cast<unsigned>(previous),
+            static_cast<unsigned>(requested),
+            theme_presets[requested].name);
 }

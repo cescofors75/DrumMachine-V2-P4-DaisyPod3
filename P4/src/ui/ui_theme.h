@@ -40,6 +40,7 @@ lv_color_t theme_warning();
 lv_color_t theme_error();
 lv_color_t theme_info();
 lv_color_t theme_cyan();
+uint8_t ui_theme_index();
 
 void ui_theme_apply(VisualTheme theme);
 
