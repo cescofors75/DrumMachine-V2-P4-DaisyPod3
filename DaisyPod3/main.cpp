@@ -7727,6 +7727,10 @@ static void ProcessCommand()
         /* Reset mega upgrade state */
         masterAutowahL.Init((float)SAMPLE_RATE);
         masterAutowahR.Init((float)SAMPLE_RATE);
+        masterAutowahL.SetLevel(1.0f);
+        masterAutowahR.SetLevel(1.0f);
+        masterAutowahL.SetWah(autowahLevel);
+        masterAutowahR.SetWah(autowahLevel);
         masterLadderL.Init((float)SAMPLE_RATE);
         masterLadderR.Init((float)SAMPLE_RATE);
         masterSvfL.Init((float)SAMPLE_RATE);
@@ -8434,8 +8438,8 @@ static void ProcessCommand()
         if(len >= 4){
             float lvl; memcpy(&lvl, p, 4);
             autowahLevel = clampF(lvl, 0.f, 1.f);
-            masterAutowahL.SetLevel(autowahLevel);
-            masterAutowahR.SetLevel(autowahLevel);
+            masterAutowahL.SetWah(autowahLevel);
+            masterAutowahR.SetWah(autowahLevel);
         }
         break;
     case CMD_AUTOWAH_MIX:
@@ -9714,10 +9718,10 @@ static void InitFX()
     /* ── Mega Upgrade: init new master FX modules ── */
     masterAutowahL.Init(sr);
     masterAutowahR.Init(sr);
-    masterAutowahL.SetLevel(0.5f);
-    masterAutowahR.SetLevel(0.5f);
-    masterAutowahL.SetWah(0.0f);
-    masterAutowahR.SetWah(0.0f);
+    masterAutowahL.SetLevel(1.0f);
+    masterAutowahR.SetLevel(1.0f);
+    masterAutowahL.SetWah(autowahLevel);
+    masterAutowahR.SetWah(autowahLevel);
 
     masterLadderL.Init(sr);
     masterLadderR.Init(sr);
