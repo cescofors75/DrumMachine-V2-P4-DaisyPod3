@@ -248,6 +248,22 @@ void ApplyPatternPerformance(int logicalPattern)
     }
 }
 
+void PushSoloWithout(int track)
+{
+    p4.track_solo[track] = false;
+    uint16_t soloMask = 0;
+    for(int other = 0; other < 16; ++other)
+        if(p4.track_solo[other]) soloMask |= (uint16_t)(1u << other);
+    daisyUsb.setTrackSoloMask(soloMask);
+}
+
+void UnmuteTrack(int track)
+{
+    p4.track_muted[track] = false;
+    SequencerInstance().muteTrack(track, false);
+    daisyUsb.setTrackMute(track, false);
+}
+
 void SendCurrentState()
 {
     SequencerInstance().selectPattern(Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1));
@@ -987,6 +1003,7 @@ void control_send_mute(int track, bool muted)
     p4.track_muted[track] = muted;
     SequencerInstance().muteTrack(track, muted);
     daisyUsb.setTrackMute(track, muted);
+    if(muted && p4.track_solo[track]) PushSoloWithout(track);
 }
 
 void control_send_set_volume(int value)
@@ -1172,24 +1189,42 @@ void control_send_solo(int track, bool soloed)
     if(track < 0 || track >= 16) return;
     p4.track_solo[track] = soloed;
     daisyUsb.setTrackSolo(track, soloed);
+    if(soloed && p4.track_muted[track]) UnmuteTrack(track);
 }
 
 void control_send_mute_mask(uint16_t mask)
 {
+    uint16_t soloMask = 0;
     for(int track = 0; track < 16; ++track)
     {
         const bool muted = (mask & (1u << track)) != 0;
         p4.track_muted[track] = muted;
         SequencerInstance().muteTrack(track, muted);
+        if(muted) p4.track_solo[track] = false;
+        if(p4.track_solo[track]) soloMask |= (uint16_t)(1u << track);
     }
     daisyUsb.setTrackMuteMask(mask);
+    daisyUsb.setTrackSoloMask(soloMask);
 }
 
 void control_send_solo_mask(uint16_t mask)
 {
+    uint16_t muteMask = 0;
+    bool muteChanged = false;
     for(int track = 0; track < 16; ++track)
-        p4.track_solo[track] = (mask & (1u << track)) != 0;
+    {
+        const bool soloed = (mask & (1u << track)) != 0;
+        p4.track_solo[track] = soloed;
+        if(soloed && p4.track_muted[track])
+        {
+            p4.track_muted[track] = false;
+            SequencerInstance().muteTrack(track, false);
+            muteChanged = true;
+        }
+        if(p4.track_muted[track]) muteMask |= (uint16_t)(1u << track);
+    }
     daisyUsb.setTrackSoloMask(mask);
+    if(muteChanged) daisyUsb.setTrackMuteMask(muteMask);
 }
 
 void control_mark_fx_screen_dirty() { fxDirty.store(true, std::memory_order_release); }

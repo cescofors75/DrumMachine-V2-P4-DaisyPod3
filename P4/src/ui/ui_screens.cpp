@@ -5758,11 +5758,24 @@ static void seq_mute_cb(lv_event_t* e) {
 
         bool next = !p4.track_muted[track];
         p4.track_muted[track] = next;
+        bool soloCleared = false;
+        if (next && p4.track_solo[track]) {
+            p4.track_solo[track] = false;
+            soloCleared = true;
+        }
         char tb[48];
         snprintf(tb, sizeof(tb), "MUTE T%d %s",
                  track + 1, next ? "ON" : "OFF");
         ui_show_toast(tb, next ? RED808_ERROR : RED808_SUCCESS);
-        if (ui_control_available()) enqueue_mute_control((uint8_t)track, next);
+        if (ui_control_available()) {
+            enqueue_mute_control((uint8_t)track, next);
+            if (soloCleared) {
+                uint16_t soloMask = 0;
+                for (int other = 0; other < 16; ++other)
+                    if (p4.track_solo[other]) soloMask |= (uint16_t)(1u << other);
+                enqueue_solo_mask_control(soloMask);
+            }
+        }
     }
 }
 
@@ -5790,12 +5803,15 @@ static void seq_solo_cb(lv_event_t* e) {
              track + 1, wasSolo ? "OFF" : "ON");
     ui_show_toast(toastBuf, wasSolo ? RED808_BORDER : RED808_ACCENT);
 
-    // Solo is an independent mixer layer. It must never rewrite the user's
-    // mute selection: Daisy already applies trackSolo after trackMute.
     const uint16_t soloMask = wasSolo ? 0u : (uint16_t)(1u << track);
     for (int t = 0; t < 16; ++t)
         p4.track_solo[t] = (soloMask & (1u << t)) != 0;
-    if (ui_control_available()) enqueue_solo_mask_control(soloMask);
+    const bool muteCleared = !wasSolo && p4.track_muted[track];
+    if (muteCleared) p4.track_muted[track] = false;
+    if (ui_control_available()) {
+        enqueue_solo_mask_control(soloMask);
+        if (muteCleared) enqueue_mute_control((uint8_t)track, false);
+    }
 }
 
 // ── Pagination helpers ─────────────────────────────────────────────────────
