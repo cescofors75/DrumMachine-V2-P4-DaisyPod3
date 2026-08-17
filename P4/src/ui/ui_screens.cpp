@@ -15,6 +15,7 @@
 #include "../mem_midi_loader.h"
 #include "config.h"
 #include "../../../shared/synth_params.h"
+#include "../../../DaisyPod3/mpd218_mapping.h"
 #include <Arduino.h>
 #include <SD_MMC.h>
 #include <SPIFFS.h>
@@ -725,6 +726,18 @@ static lv_obj_t* s_pad_inst_modal_kit_btns[3][5] = {};   // [engine 0=808/1=909/
 static lv_obj_t* s_pad_inst_modal_kit_lbl_eng[3] = {};   // labels "808"/"909"/"505"
 static lv_obj_t* s_pod_status_modal = NULL;
 static lv_obj_t* s_pod_status_label = NULL;
+static lv_obj_t* s_mpd_map_modal = NULL;
+static lv_obj_t* s_mpd_map_summary_label = NULL;
+static lv_obj_t* s_mpd_device_buttons[red808_mpd218::kDeviceCount] = {};
+static lv_obj_t* s_mpd_bank_buttons[red808_mpd218::kBankCount] = {};
+static lv_obj_t* s_mpd_pad_layer_buttons[red808_mpd218::kLayerCount] = {};
+static lv_obj_t* s_mpd_knob_layer_buttons[red808_mpd218::kLayerCount] = {};
+static lv_obj_t* s_mpd_pad_labels[red808_mpd218::kPadsPerLayer] = {};
+static lv_obj_t* s_mpd_knob_labels[red808_mpd218::kKnobsPerLayer] = {};
+static uint8_t s_mpd_device = 0;
+static uint8_t s_mpd_bank = 0;
+static uint8_t s_mpd_pad_layer = 0;
+static uint8_t s_mpd_knob_layer = 0;
 static constexpr uint8_t POD_CONTROL_ROW_COUNT = 11;
 static lv_obj_t* s_pod_control_value_labels[POD_CONTROL_ROW_COUNT] = {};
 static lv_obj_t* s_pod_function_modal = NULL;
@@ -735,6 +748,7 @@ static PodConfigPayload s_pod_config = {};
 static uint32_t s_pod_seen_revision = 0;
 static void pod_status_modal_close_cb(lv_event_t* e);
 static void pod_function_modal_close_cb(lv_event_t* e);
+static void mpd_map_modal_close_cb(lv_event_t* e);
 
 static const char* POD_CONTROL_TITLES[POD_CONTROL_ROW_COUNT] = {
     "BUTTON 1", "BUTTON 2", "KNOB 1", "KNOB 2", "ENCODER",
@@ -2715,6 +2729,360 @@ static void pod_led_color_cycle_cb(lv_event_t* e) {
     pod_send_config();
 }
 
+// =============================================================================
+// AKAI MPD218 MIDI MAP — the same fixed table consumed by DaisyPod3
+// =============================================================================
+static const char* const MPD_BANK_NAMES[red808_mpd218::kBankCount] = {
+    "LIVE / MASTER", "SEQUENCER", "SYNTHS"
+};
+
+static const char* const MPD_DRUM_PAD_NAMES[3][16] = {
+    {"KICK", "SNARE", "CLOSED HH", "OPEN HH", "CYMBAL", "CLAP",
+     "RIMSHOT", "COWBELL", "LOW TOM", "MID TOM", "HIGH TOM", "MARACAS",
+     "CLAVES", "HIGH CONGA", "MID CONGA", "LOW CONGA"},
+    {"KICK", "SNARE", "CLOSED HH", "OPEN HH", "CRASH", "CLAP",
+     "RIMSHOT", "RIDE", "LOW TOM", "MID TOM", "HIGH TOM", "SHAKER",
+     "CLAVE", "HIGH PERC", "MID PERC", "LOW PERC"},
+    {"KICK", "SNARE", "CLOSED HH", "OPEN HH", "CYMBAL", "CLAP",
+     "RIMSHOT", "COWBELL", "LOW TOM", "MID TOM", "HIGH TOM", "SHAKER",
+     "CLAVE", "HIGH PERC", "MID PERC", "LOW PERC"}
+};
+
+static const char* const MPD_KNOB_ACTION_NAMES[] = {
+    "NONE",
+    "MASTER VOLUME", "LIVE VOLUME", "SEQ VOLUME", "TEMPO",
+    "DELAY MIX", "REVERB MIX", "FILTER CUTOFF", "FILTER RESONANCE",
+    "DISTORTION", "BIT DEPTH", "SAMPLE RATE", "FILTER TYPE",
+    "FLANGER DEPTH", "PHASER DEPTH", "WAVEFOLDER", "CRUSH MACRO",
+    "LIVE PITCH", "SELECT PAD",
+    "TRACK VOLUME", "TRACK PAN", "TRACK REVERB", "TRACK DELAY",
+    "TRACK CHORUS", "TRACK PITCH", "TRACK FILTER", "TRACK RESONANCE",
+    "TRACK DISTORT", "TRACK BIT DEPTH", "TRACK EQ LOW", "TRACK EQ HIGH",
+    "SEQ TEMPO", "SEQ SWING", "HUMANIZE TIME", "HUMANIZE VEL",
+    "SELECT PATTERN", "SELECT TRACK",
+    "DRUM DECAY", "DRUM PITCH", "DRUM TONE", "DRUM VOLUME",
+    "DRUM SNAPPY", "DRUM PUNCH",
+    "MELODIC PARAM 1", "MELODIC PARAM 2", "MELODIC PARAM 3",
+    "MELODIC PARAM 4", "MELODIC PARAM 5", "MELODIC PARAM 6",
+    "SYNTH ENGINE", "SYNTH PRESET", "CHORUS MIX", "TREMOLO DEPTH",
+    "AUTO-WAH MIX", "STEREO WIDTH"
+};
+
+static_assert(sizeof(MPD_KNOB_ACTION_NAMES) / sizeof(MPD_KNOB_ACTION_NAMES[0])
+              == red808_mpd218::KNOB_STEREO_WIDTH + 1,
+              "MPD knob labels must follow KnobActionType");
+
+static void mpd_note_name(uint8_t note, char* out, size_t outSize) {
+    static const char* const names[12] = {
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+    };
+    snprintf(out, outSize, "%s%d", names[note % 12], (int)(note / 12) - 1);
+}
+
+static void mpd_pad_action_text(const red808_mpd218::PadAction& action,
+                                char* out, size_t outSize) {
+    using namespace red808_mpd218;
+    switch (action.type) {
+        case PAD_TRIGGER_SAMPLE:
+            snprintf(out, outSize, "SAMPLE %02u", (unsigned)action.arg0 + 1u);
+            break;
+        case PAD_TRIGGER_MELODIC: {
+            char note[6] = {};
+            mpd_note_name(action.arg0, note, sizeof(note));
+            snprintf(out, outSize, "MELODIC %s", note);
+            break;
+        }
+        case PAD_SELECT_PATTERN:
+            snprintf(out, outSize, "PATTERN %02u", (unsigned)action.arg0 + 1u);
+            break;
+        case PAD_TOGGLE_TRACK_MUTE:
+            snprintf(out, outSize, "MUTE TRACK %02u", (unsigned)action.arg0 + 1u);
+            break;
+        case PAD_SELECT_TRACK:
+            snprintf(out, outSize, "SELECT TRACK %02u", (unsigned)action.arg0 + 1u);
+            break;
+        case PAD_TRIGGER_SYNTH: {
+            const uint8_t engine = action.arg0 < 3 ? action.arg0 : 0;
+            const uint8_t pad = action.arg1 < 16 ? action.arg1 : 0;
+            static const char* const engines[3] = {"808", "909", "505"};
+            snprintf(out, outSize, "%s %s", engines[engine],
+                     MPD_DRUM_PAD_NAMES[engine][pad]);
+            break;
+        }
+        case PAD_PLAY_TOGGLE:       snprintf(out, outSize, "PLAY / PAUSE"); break;
+        case PAD_STOP_ALL:          snprintf(out, outSize, "STOP + PANIC"); break;
+        case PAD_PATTERN_PREV:      snprintf(out, outSize, "PATTERN -"); break;
+        case PAD_PATTERN_NEXT:      snprintf(out, outSize, "PATTERN +"); break;
+        case PAD_TOGGLE_LOOP:       snprintf(out, outSize, "PAD LOOP"); break;
+        case PAD_TOGGLE_REVERSE:    snprintf(out, outSize, "PAD REVERSE"); break;
+        case PAD_TOGGLE_STUTTER:    snprintf(out, outSize, "PAD STUTTER"); break;
+        case PAD_CLEAR_SELECTED_FX: snprintf(out, outSize, "CLEAR PAD FX"); break;
+        default:                    snprintf(out, outSize, "NONE"); break;
+    }
+}
+
+static void mpd_map_set_selector_style(lv_obj_t* button, bool selected) {
+    if (!button) return;
+    lv_obj_set_style_bg_color(button,
+        selected ? RED808_ACCENT : RED808_SURFACE, 0);
+    lv_obj_set_style_border_color(button,
+        selected ? RED808_CYAN : RED808_BORDER, 0);
+    lv_obj_set_style_border_width(button, selected ? 3 : 1, 0);
+    lv_obj_t* label = lv_obj_get_child(button, 0);
+    if (label) lv_obj_set_style_text_color(label,
+        selected ? lv_color_white() : RED808_TEXT_DIM, 0);
+}
+
+static void mpd_map_refresh(void) {
+    using namespace red808_mpd218;
+    if (!s_mpd_map_modal) return;
+
+    for (uint8_t i = 0; i < kDeviceCount; ++i)
+        mpd_map_set_selector_style(s_mpd_device_buttons[i], i == s_mpd_device);
+    for (uint8_t i = 0; i < kBankCount; ++i)
+        mpd_map_set_selector_style(s_mpd_bank_buttons[i], i == s_mpd_bank);
+    for (uint8_t i = 0; i < kLayerCount; ++i) {
+        mpd_map_set_selector_style(s_mpd_pad_layer_buttons[i],
+                                   i == s_mpd_pad_layer);
+        mpd_map_set_selector_style(s_mpd_knob_layer_buttons[i],
+                                   i == s_mpd_knob_layer);
+    }
+
+    const uint8_t channel = static_cast<uint8_t>(
+        1u + s_mpd_device * kChannelsPerDevice + s_mpd_bank);
+    const uint8_t noteBase = kPadNoteBase[s_mpd_pad_layer];
+    const uint8_t ccBase = kKnobCcBase[s_mpd_knob_layer];
+    if (s_mpd_map_summary_label) {
+        lv_label_set_text_fmt(s_mpd_map_summary_label,
+            "DEVICE %u  |  BANK %u %s  |  MIDI CH %u  |  PADS %c N%u-%u  |  KNOBS %c CC%u-%u",
+            (unsigned)s_mpd_device + 1u, (unsigned)s_mpd_bank + 1u,
+            MPD_BANK_NAMES[s_mpd_bank], (unsigned)channel,
+            'A' + s_mpd_pad_layer, (unsigned)noteBase,
+            (unsigned)(noteBase + kPadsPerLayer - 1u),
+            'A' + s_mpd_knob_layer, (unsigned)ccBase,
+            (unsigned)(ccBase + kKnobsPerLayer - 1u));
+    }
+
+    for (uint8_t pad = 0; pad < kPadsPerLayer; ++pad) {
+        if (!s_mpd_pad_labels[pad]) continue;
+        char action[40] = {};
+        mpd_pad_action_text(kPadMap[s_mpd_bank][s_mpd_pad_layer][pad],
+                            action, sizeof(action));
+        lv_label_set_text_fmt(s_mpd_pad_labels[pad], "P%02u  ·  N%u\n%s",
+                              (unsigned)pad + 1u,
+                              (unsigned)(noteBase + pad), action);
+    }
+
+    for (uint8_t knob = 0; knob < kKnobsPerLayer; ++knob) {
+        if (!s_mpd_knob_labels[knob]) continue;
+        const uint8_t action = static_cast<uint8_t>(
+            kKnobMap[s_mpd_bank][s_mpd_knob_layer][knob].type);
+        const char* name = action < sizeof(MPD_KNOB_ACTION_NAMES)
+                                      / sizeof(MPD_KNOB_ACTION_NAMES[0])
+            ? MPD_KNOB_ACTION_NAMES[action] : "NONE";
+        lv_label_set_text_fmt(s_mpd_knob_labels[knob], "K%u  ·  CC%u\n%s",
+                              (unsigned)knob + 1u,
+                              (unsigned)(ccBase + knob), name);
+    }
+}
+
+static void mpd_map_selector_cb(lv_event_t* e) {
+    const uint16_t packed = static_cast<uint16_t>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    const uint8_t group = static_cast<uint8_t>(packed >> 8);
+    const uint8_t value = static_cast<uint8_t>(packed & 0xFFu);
+    switch (group) {
+        case 0:
+            if (value < red808_mpd218::kDeviceCount) s_mpd_device = value;
+            break;
+        case 1:
+            if (value < red808_mpd218::kBankCount) s_mpd_bank = value;
+            break;
+        case 2:
+            if (value < red808_mpd218::kLayerCount) s_mpd_pad_layer = value;
+            break;
+        case 3:
+            if (value < red808_mpd218::kLayerCount) s_mpd_knob_layer = value;
+            break;
+        default: return;
+    }
+    mpd_map_refresh();
+}
+
+static lv_obj_t* mpd_map_make_selector(lv_obj_t* parent, int x, int y,
+                                       int width, const char* text,
+                                       uint8_t group, uint8_t value) {
+    lv_obj_t* button = lv_btn_create(parent);
+    lv_obj_set_size(button, width, 34);
+    lv_obj_set_pos(button, x, y);
+    apply_control_button_style(button, RED808_ACCENT2, false, 8);
+    lv_obj_set_style_bg_color(button, RED808_SURFACE, 0);
+    lv_obj_t* label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_center(label);
+    const uint16_t packed = static_cast<uint16_t>(
+        (static_cast<uint16_t>(group) << 8) | value);
+    lv_obj_add_event_cb(button, mpd_map_selector_cb, LV_EVENT_CLICKED,
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(packed)));
+    return button;
+}
+
+static void mpd_map_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_mpd_map_modal) lv_obj_del(s_mpd_map_modal);
+    s_mpd_map_modal = NULL;
+    s_mpd_map_summary_label = NULL;
+    memset(s_mpd_device_buttons, 0, sizeof(s_mpd_device_buttons));
+    memset(s_mpd_bank_buttons, 0, sizeof(s_mpd_bank_buttons));
+    memset(s_mpd_pad_layer_buttons, 0, sizeof(s_mpd_pad_layer_buttons));
+    memset(s_mpd_knob_layer_buttons, 0, sizeof(s_mpd_knob_layer_buttons));
+    memset(s_mpd_pad_labels, 0, sizeof(s_mpd_pad_labels));
+    memset(s_mpd_knob_labels, 0, sizeof(s_mpd_knob_labels));
+}
+
+static void mpd_map_modal_open_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_mpd_map_modal) { mpd_map_modal_close_cb(NULL); return; }
+
+    s_mpd_map_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_mpd_map_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_mpd_map_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_mpd_map_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_mpd_map_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_mpd_map_modal, 0, 0);
+    lv_obj_clear_flag(s_mpd_map_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_mpd_map_modal, mpd_map_modal_close_cb,
+                        LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_mpd_map_modal);
+    lv_obj_set_size(card, 984, 568);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "MIDI MAP  /  AKAI MPD218 + CME H4MIDI");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 18, 12);
+
+    lv_obj_t* close = lv_btn_create(card);
+    lv_obj_set_size(close, 78, 34);
+    lv_obj_set_pos(close, 888, 10);
+    apply_control_button_style(close, RED808_WARNING, false, 8);
+    lv_obj_t* closeLabel = lv_label_create(close);
+    lv_label_set_text(closeLabel, "BACK");
+    lv_obj_set_style_text_font(closeLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(closeLabel);
+    lv_obj_add_event_cb(close, [](lv_event_t*) { mpd_map_modal_close_cb(NULL); },
+                        LV_EVENT_CLICKED, NULL);
+
+    auto makeGroupLabel = [&](int x, const char* text) {
+        lv_obj_t* label = lv_label_create(card);
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(label, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(label, x, 48);
+    };
+    makeGroupLabel(18, "DEVICE / CHANNEL SET");
+    makeGroupLabel(240, "PROGRAM / BANK");
+    makeGroupLabel(530, "PAD BANK");
+    makeGroupLabel(735, "CTRL BANK");
+
+    for (uint8_t device = 0; device < red808_mpd218::kDeviceCount; ++device) {
+        char text[12] = {};
+        snprintf(text, sizeof(text), "DEV %u", (unsigned)device + 1u);
+        s_mpd_device_buttons[device] = mpd_map_make_selector(
+            card, 18 + device * 100, 62, 94, text, 0, device);
+    }
+    for (uint8_t bank = 0; bank < red808_mpd218::kBankCount; ++bank) {
+        char text[10] = {};
+        snprintf(text, sizeof(text), "BANK %u", (unsigned)bank + 1u);
+        s_mpd_bank_buttons[bank] = mpd_map_make_selector(
+            card, 240 + bank * 91, 62, 85, text, 1, bank);
+    }
+    for (uint8_t layer = 0; layer < red808_mpd218::kLayerCount; ++layer) {
+        char text[2] = {static_cast<char>('A' + layer), '\0'};
+        s_mpd_pad_layer_buttons[layer] = mpd_map_make_selector(
+            card, 530 + layer * 57, 62, 51, text, 2, layer);
+        s_mpd_knob_layer_buttons[layer] = mpd_map_make_selector(
+            card, 735 + layer * 57, 62, 51, text, 3, layer);
+    }
+
+    s_mpd_map_summary_label = lv_label_create(card);
+    lv_obj_set_width(s_mpd_map_summary_label, 948);
+    lv_obj_set_pos(s_mpd_map_summary_label, 18, 108);
+    lv_obj_set_style_text_font(s_mpd_map_summary_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_mpd_map_summary_label, RED808_ACCENT, 0);
+    lv_obj_set_style_text_align(s_mpd_map_summary_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    for (uint8_t pad = 0; pad < red808_mpd218::kPadsPerLayer; ++pad) {
+        const int column = pad % 4;
+        const int line = pad / 4;
+        lv_obj_t* panel = lv_obj_create(card);
+        lv_obj_set_size(panel, 150, 71);
+        lv_obj_set_pos(panel, 18 + column * 158, 136 + line * 79);
+        lv_obj_set_style_bg_color(panel, RED808_SURFACE, 0);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_90, 0);
+        lv_obj_set_style_border_width(panel, 1, 0);
+        lv_obj_set_style_border_color(panel, RED808_ACCENT2, 0);
+        lv_obj_set_style_radius(panel, 10, 0);
+        lv_obj_set_style_pad_all(panel, 4, 0);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+        s_mpd_pad_labels[pad] = lv_label_create(panel);
+        lv_obj_set_width(s_mpd_pad_labels[pad], 140);
+        lv_label_set_long_mode(s_mpd_pad_labels[pad], LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(s_mpd_pad_labels[pad], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(s_mpd_pad_labels[pad], &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_mpd_pad_labels[pad], RED808_TEXT, 0);
+        lv_obj_center(s_mpd_pad_labels[pad]);
+    }
+
+    for (uint8_t knob = 0; knob < red808_mpd218::kKnobsPerLayer; ++knob) {
+        const int column = knob % 2;
+        const int line = knob / 2;
+        lv_obj_t* panel = lv_obj_create(card);
+        lv_obj_set_size(panel, 143, 71);
+        lv_obj_set_pos(panel, 660 + column * 151, 136 + line * 79);
+        lv_obj_set_style_bg_color(panel, RED808_PANEL, 0);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(panel, 2, 0);
+        lv_obj_set_style_border_color(panel, RED808_CYAN, 0);
+        lv_obj_set_style_radius(panel, 10, 0);
+        lv_obj_set_style_pad_all(panel, 4, 0);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+        s_mpd_knob_labels[knob] = lv_label_create(panel);
+        lv_obj_set_width(s_mpd_knob_labels[knob], 133);
+        lv_label_set_long_mode(s_mpd_knob_labels[knob], LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(s_mpd_knob_labels[knob], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(s_mpd_knob_labels[knob], &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_mpd_knob_labels[knob], RED808_CYAN, 0);
+        lv_obj_center(s_mpd_knob_labels[knob]);
+    }
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_obj_set_width(hint, 948);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(hint,
+        "REFERENCE MAP: DEV 1 uses CH 1/2/3; DEV 2 uses CH 4/5/6. "
+        "PAD BANK and CTRL BANK A/B/C are independent. H4 merge: allow clock/transport from one master only.\n"
+        "The selected bank/layers above are a setup view; the merged MIDI stream cannot report which physical H4 input was used.");
+    lv_obj_set_pos(hint, 18, 462);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+
+    mpd_map_refresh();
+}
+
 static void pod_status_modal_update(void) {
     if (!s_pod_status_modal) return;
     static uint32_t lastUpdateMs = 0;
@@ -2781,6 +3149,7 @@ static void pod_status_modal_update(void) {
 
 static void pod_status_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_mpd_map_modal) mpd_map_modal_close_cb(NULL);
     if (s_pod_function_modal) pod_function_modal_close_cb(NULL);
     if (s_pod_status_modal) lv_obj_del(s_pod_status_modal);
     s_pod_status_modal = NULL;
@@ -2828,12 +3197,13 @@ static void pod_status_popup_cb(lv_event_t* e) {
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t* title = lv_label_create(card);
-    lv_label_set_text(title, "PHYSICAL CONTROL MAP  /  DAISYPOD3 + P4 CONTROLS");
+    lv_label_set_text(title, "CONTROL MAP  /  DAISYPOD3 + P4 + MIDI");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, RED808_CYAN, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_t* subtitle = lv_label_create(card);
-    lv_label_set_text(subtitle, "Prioridad: Daisy mecanico > rotary/fader P4 > control digital");
+    lv_label_set_text(subtitle,
+        "Hardware asignable + mapa completo de 2 controladores MIDI");
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(subtitle, RED808_TEXT_DIM, 0);
     lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 32);
@@ -2898,6 +3268,20 @@ static void pod_status_popup_cb(lv_event_t* e) {
     lv_obj_set_style_text_align(s_pod_status_label, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_text_font(s_pod_status_label, &lv_font_montserrat_12, 0);
     lv_obj_set_pos(s_pod_status_label, 18, 382);
+
+    lv_obj_t* midiMap = lv_btn_create(card);
+    lv_obj_set_size(midiMap, 100, 42);
+    lv_obj_set_pos(midiMap, 816, 392);
+    apply_control_button_style(midiMap, RED808_CYAN, false, 10);
+    lv_obj_t* midiMapLabel = lv_label_create(midiMap);
+    lv_label_set_text(midiMapLabel, "MIDI MAP\n2 DEVICES");
+    lv_obj_set_width(midiMapLabel, 88);
+    lv_obj_set_style_text_align(midiMapLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(midiMapLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(midiMapLabel);
+    lv_obj_add_event_cb(midiMap, mpd_map_modal_open_cb,
+                        LV_EVENT_CLICKED, NULL);
+
     lv_obj_t* close = lv_btn_create(card);
     lv_obj_set_size(close, 100, 42);
     lv_obj_set_pos(close, 816, 444);

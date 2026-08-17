@@ -99,6 +99,10 @@ compases equivalentes y compacta sus repeticiones. Las escenas distintas se
 guardan en `P101..P120` y Daisy reproduce una cadena de hasta 128 secciones;
 antes de sustituir esos patrones la pantalla pide confirmación.
 
+El mapa de control MIDI externo se consulta desde `STATUS > CONTROL MAP > MIDI
+MAP`. Incluye ambos dispositivos, bancos 1–3, capas A/B/C separadas para pads y
+knobs, canales 1–6 y todas las acciones del mapa compilado de DaisyPod3.
+
 El importador admite SMF 0/1 con PPQN. `STD` usa el canal GM de batería y `PRO`
 convierte todos los canales en las 16 pistas percusivas. Daisy dispone de 20
 escenas residentes: si una canción necesita más de 20 compases realmente

@@ -15,6 +15,13 @@ fuera del hilo LVGL, valida longitudes SMF y muestra límites o truncamiento en
 el resumen. El BPM original queda separado del BPM efectivo para poder ver la
 diferencia cuando manda un control físico o digital.
 
+En la celda `STATUS`, `CONTROL MAP > MIDI MAP` muestra el mapa de referencia
+completo de los dos Akai MPD218: dispositivo, banco/programa, canal MIDI, las
+tres capas independientes de pads y knobs, las 16 notas y los 6 CC con su
+acción. El dispositivo 1 ocupa los canales 1/2/3 y el 2 los canales 4/5/6; la
+pantalla recuerda además que el H4MIDI debe dejar pasar reloj y transporte desde
+un único maestro.
+
 No se inicializa el coprocesador inalámbrico de la pantalla y no existe transporte alternativo.
 
 Compilar:

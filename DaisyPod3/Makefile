@@ -1,5 +1,5 @@
 # DrumMachine V2 — DaisyPod3
-# RED808 audio engine + native Daisy Pod controls + USB CDC device.
+# RED808 audio engine + native Pod controls + USB CDC + TRS MIDI input.
 
 TARGET = DrumMachineV2_DaisyPod3
 CPP_SOURCES = main.cpp syscalls.cpp
@@ -20,7 +20,7 @@ LIBDIR += -L$(DAISYSP_DIR)/DaisySP-LGPL/build
 LDFLAGS += -Wl,--no-warn-rwx-segments
 LDFLAGS += -Wl,--allow-multiple-definition
 
-# USB-C CDC is the only control transport in DaisyPod3.
+# USB-C CDC and UART MIDI TRS Type A are concurrent control transports.
 C_DEFS += -DRED808_BOOT_DIAG_MINIMAL=0
 C_DEFS += -DRED808_AUDIO_DIAG_MINIMAL=0
 C_DEFS += -DRED808_BOOT_PROGRESS_DIAG=0

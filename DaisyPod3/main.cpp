@@ -21,8 +21,10 @@
 #include "daisysp.h"
 #include "ff_gen_drv.h"
 #include "../shared/red808_protocol_codes.h"
+#include "mpd218_mapping.h"
 #include <string.h>
 #include <math.h>
+#include <new>
 #include <stdio.h>
 #include <strings.h>
 
@@ -71,6 +73,13 @@ static inline float __fast_expf(float x) {
 using namespace daisy;
 using namespace daisysp;
 
+/* libDaisy's MIDI handler owns a 256-event FIFO (~38 KiB). Keep that FIFO in
+ * the otherwise-unused D2 RAM instead of consuming nearly all of DTCMRAM.
+ * It is constructed after hardware init because this section is NOLOAD. */
+alignas(MidiUartHandler)
+static uint8_t mpdMidiStorage[sizeof(MidiUartHandler)]
+    __attribute__((section(".heap")));
+
 /* ═══════════════════════════════════════════════════════════════════
  *  1. HARDWARE
  * ═══════════════════════════════════════════════════════════════════ */
@@ -84,6 +93,7 @@ struct DaisyPod3Hardware
     Switch button2;
     RgbLed led1;
     RgbLed led2;
+    MidiUartHandler* midi;
 
     void Init()
     {
@@ -106,6 +116,13 @@ struct DaisyPod3Hardware
         seed.adc.Init(adc, 2);
         knob1.Init(seed.adc.GetPtr(0), seed.AudioCallbackRate());
         knob2.Init(seed.adc.GetPtr(1), seed.AudioCallbackRate());
+
+        /* TRS MIDI IN Type A: RX=D14/PB7. TX is deliberately disabled because
+         * D13/PB6 is already the encoder push switch on this custom Pod. */
+        midi = new (mpdMidiStorage) MidiUartHandler();
+        MidiUartHandler::Config midiConfig;
+        midiConfig.transport_config.tx = Pin();
+        midi->Init(midiConfig);
     }
 
     void SetAudioBlockSize(size_t size)
@@ -124,6 +141,7 @@ struct DaisyPod3Hardware
 
     void StartAudio(AudioHandle::AudioCallback callback) { seed.StartAudio(callback); }
     void StartAdc() { seed.adc.Start(); }
+    void StartMidi() { midi->StartReceive(); }
 
     void ProcessAllControls()
     {
@@ -8896,6 +8914,620 @@ static void ApplyPodEncoderFunction(uint8_t function, int increment)
     podStateRevision++;
 }
 
+/* ──────────────────────────────────────────────────────────────────
+ * MERGED MIDI CONTROLLERS (2 devices x 3 programs x 3 A/B/C layers)
+ *
+ * Program 1/2/3 must transmit on MIDI channel 1/2/3 respectively.
+ * The fixed note/CC layout is declared in mpd218_mapping.h. Keeping the
+ * table separate from the dispatcher makes all 198 physical positions easy
+ * to audit and remap without touching the audio engine.
+ * ────────────────────────────────────────────────────────────────── */
+static uint8_t  mpdSelectedTrack[red808_mpd218::kDeviceCount] = {0, 0};
+static uint8_t  mpdSelectedPad[red808_mpd218::kDeviceCount] = {0, 0};
+static uint8_t  mpdSelectedDrumEngine[red808_mpd218::kDeviceCount] = {
+    SYNTH_ENGINE_808, SYNTH_ENGINE_808};
+static uint8_t  mpdSelectedDrumPad[red808_mpd218::kDeviceCount] = {0, 0};
+static uint8_t  mpdSelectedMelodicEngine[red808_mpd218::kDeviceCount] = {
+    SYNTH_ENGINE_303, SYNTH_ENGINE_303};
+static uint8_t  mpdSelectedSynthPreset[red808_mpd218::kDeviceCount] = {0, 0};
+static uint32_t mpdClockStartMs           = 0;
+static uint8_t  mpdClockIntervals         = 0;
+
+static uint16_t MpdRaw1000(uint8_t value)
+{
+    return static_cast<uint16_t>((static_cast<uint32_t>(value) * 1000u + 63u)
+                                 / 127u);
+}
+
+static uint8_t MpdSelectedNativeDrumInstrument(uint8_t device)
+{
+    const uint8_t pad = mpdSelectedDrumPad[device] & 0x0Fu;
+    switch(mpdSelectedDrumEngine[device])
+    {
+        case SYNTH_ENGINE_808: return padTo808[pad];
+        case SYNTH_ENGINE_909: return padTo909[pad];
+        case SYNTH_ENGINE_505: return padTo505[pad];
+        default: return 0;
+    }
+}
+
+static void MpdSendTrackFilter(uint8_t device, float cutoff, float resonance)
+{
+    const uint8_t track = mpdSelectedTrack[device];
+    struct __attribute__((packed)) TrackFilterPayload
+    {
+        uint8_t track;
+        uint8_t type;
+        uint8_t reserved[2];
+        float cutoff;
+        float resonance;
+    } payload = {
+        track,
+        trkFilterType[track] == FTYPE_NONE
+            ? static_cast<uint8_t>(FTYPE_LOWPASS)
+            : trkFilterType[track],
+        {0, 0},
+        cutoff,
+        resonance,
+    };
+    static_assert(sizeof(TrackFilterPayload) == 12,
+                  "MPD track-filter payload layout changed");
+    ApplyPodCommand(CMD_TRACK_FILTER, &payload, sizeof(payload));
+}
+
+static void MpdSendSynthParam(uint8_t engine,
+                              uint8_t instrument,
+                              uint8_t param,
+                              float value)
+{
+    struct __attribute__((packed)) SynthParamPayload
+    {
+        uint8_t engine;
+        uint8_t instrument;
+        uint8_t param;
+        float value;
+    } payload = {engine, instrument, param, value};
+    static_assert(sizeof(SynthParamPayload) == 7,
+                  "MPD synth-param payload layout changed");
+    ApplyPodCommand(CMD_SYNTH_PARAM, &payload, sizeof(payload));
+}
+
+static void MpdLoadSynthPreset(uint8_t engine, uint8_t preset)
+{
+    /* CMD_SYNTH_PRESET intentionally releases every melodic engine for the
+     * single-controller web UI. On the merged MIDI bus that would let device A
+     * cut device B. Reset only the engine whose preset is being changed. */
+    ReleaseSynthEngineState(engine);
+    ApplySynthPreset(engine, preset);
+    podStateRevision++;
+}
+
+static void MpdSelectTrack(uint8_t device, uint8_t track)
+{
+    mpdSelectedTrack[device] = track % DSQ_TRACKS;
+    mpdSelectedPad[device] = mpdSelectedTrack[device];
+    podSelectedPad = mpdSelectedTrack[device];
+    podStateRevision++;
+}
+
+static void MpdApplyPad(uint8_t device,
+                        const red808_mpd218::PadAction& action,
+                        uint8_t velocity,
+                        bool pressed,
+                        uint32_t now)
+{
+    using namespace red808_mpd218;
+
+    /* Only pitched/melodic pads need their release event. */
+    if(!pressed)
+    {
+        if(action.type == PAD_TRIGGER_MELODIC)
+        {
+            const uint8_t release[3] = {
+                mpdSelectedMelodicEngine[device], 0xFFu, action.arg0};
+            ApplyPodCommand(CMD_SYNTH_NOTE_OFF, release, sizeof(release));
+        }
+        return;
+    }
+
+    switch(action.type)
+    {
+        case PAD_TRIGGER_SAMPLE: {
+            const uint8_t trigger[2] = {action.arg0, velocity};
+            ApplyPodCommand(CMD_TRIGGER_LIVE, trigger, sizeof(trigger));
+            mpdSelectedPad[device] = action.arg0;
+            podSelectedPad = action.arg0;
+            if(action.arg0 < DSQ_TRACKS)
+                mpdSelectedTrack[device] = action.arg0;
+            podPadPulseUntilMs = now + 100u;
+            break;
+        }
+        case PAD_TRIGGER_MELODIC: {
+            const uint8_t noteOn[5] = {
+                mpdSelectedMelodicEngine[device],
+                action.arg0,
+                velocity,
+                static_cast<uint8_t>(velocity >= 112u),
+                0u,
+            };
+            ApplyPodCommand(CMD_SYNTH_NOTE_ON_EX, noteOn, sizeof(noteOn));
+            podPadPulseUntilMs = now + 100u;
+            break;
+        }
+        case PAD_SELECT_PATTERN: {
+            const uint8_t pattern = action.arg0 % DSQ_PATTERNS;
+            ApplyPodCommand(CMD_DSQ_SELECT_PATTERN, &pattern, sizeof(pattern));
+            break;
+        }
+        case PAD_TOGGLE_TRACK_MUTE: {
+            const uint8_t track = action.arg0 % DSQ_TRACKS;
+            const uint8_t mute[2] = {
+                track, static_cast<uint8_t>(!dseq.trackMuted[track])};
+            ApplyPodCommand(CMD_TRACK_MUTE, mute, sizeof(mute));
+            ApplyPodCommand(CMD_DSQ_SET_MUTE, mute, sizeof(mute));
+            break;
+        }
+        case PAD_SELECT_TRACK:
+            MpdSelectTrack(device, action.arg0);
+            break;
+        case PAD_TRIGGER_SYNTH: {
+            const uint8_t trigger[3] = {action.arg0, action.arg1, velocity};
+            mpdSelectedDrumEngine[device] = action.arg0;
+            mpdSelectedDrumPad[device] = action.arg1;
+            ApplyPodCommand(CMD_SYNTH_TRIGGER, trigger, sizeof(trigger));
+            podPadPulseUntilMs = now + 100u;
+            break;
+        }
+        case PAD_PLAY_TOGGLE:
+            ApplyPodButtonFunction(POD_FUNC_PLAY_TOGGLE, now);
+            break;
+        case PAD_STOP_ALL:
+            ApplyPodButtonFunction(POD_FUNC_STOP, now);
+            ApplyPodCommand(CMD_SYNTH_NOTE_OFF, nullptr, 0);
+            break;
+        case PAD_PATTERN_PREV:
+            ApplyPodButtonFunction(POD_FUNC_PATTERN_PREV, now);
+            break;
+        case PAD_PATTERN_NEXT:
+            ApplyPodButtonFunction(POD_FUNC_PATTERN_NEXT, now);
+            break;
+        case PAD_TOGGLE_LOOP: {
+            const uint8_t pad = mpdSelectedPad[device];
+            const uint8_t payload[2] = {
+                pad, static_cast<uint8_t>(!padLoop[pad])};
+            ApplyPodCommand(CMD_PAD_LOOP, payload, sizeof(payload));
+            break;
+        }
+        case PAD_TOGGLE_REVERSE: {
+            const uint8_t pad = mpdSelectedPad[device];
+            const uint8_t payload[2] = {
+                pad, static_cast<uint8_t>(!padReverse[pad])};
+            ApplyPodCommand(CMD_PAD_REVERSE, payload, sizeof(payload));
+            break;
+        }
+        case PAD_TOGGLE_STUTTER: {
+            const uint8_t pad = mpdSelectedPad[device];
+            struct __attribute__((packed)) StutterPayload
+            {
+                uint8_t pad;
+                uint8_t enabled;
+                uint16_t interval;
+            } payload = {
+                pad,
+                static_cast<uint8_t>(!padStutterOn[pad]),
+                240u,
+            };
+            ApplyPodCommand(CMD_PAD_STUTTER, &payload, sizeof(payload));
+            break;
+        }
+        case PAD_CLEAR_SELECTED_FX: {
+            const uint8_t pad = mpdSelectedPad[device];
+            ApplyPodCommand(CMD_PAD_CLEAR_FX, &pad, sizeof(pad));
+            break;
+        }
+        case PAD_NONE:
+        default:
+            break;
+    }
+    podStateRevision++;
+}
+
+static float MpdDrumParamValue(uint8_t device, uint8_t param, float normalized)
+{
+    switch(param)
+    {
+        case 0: return 0.01f + normalized * 1.49f;                 /* decay */
+        case 1:
+            /* The 808 cowbell exposes a tune ratio, while pitched drums use Hz. */
+            return mpdSelectedDrumEngine[device] == SYNTH_ENGINE_808
+                       && mpdSelectedDrumPad[device] == 7
+                ? 0.7f + normalized * 0.8f
+                : 30.0f * powf(100.0f, normalized);
+        case 2: return normalized;                                /* tone/drive */
+        case 3: return normalized;                                /* volume */
+        case 4: return normalized;                                /* snappy/sub */
+        case 5: return mpdSelectedDrumPad[device] == 0
+                     ? 1.0f + normalized * 19.0f : normalized;    /* punch/smack */
+        default: return normalized;
+    }
+}
+
+static void MpdApplyMelodicParam(uint8_t device,
+                                 uint8_t slot,
+                                 float normalized)
+{
+    uint8_t param = slot;
+    float value = normalized;
+
+    const uint8_t engine = mpdSelectedMelodicEngine[device];
+    switch(engine)
+    {
+        case SYNTH_ENGINE_303:
+            if(slot == 0) value = 60.0f * powf(200.0f, normalized);
+            else if(slot == 3) value = 0.03f + normalized * 1.97f;
+            break;
+        case SYNTH_ENGINE_WTOSC:
+            if(slot == 1) value = normalized * 2.0f;
+            else if(slot == 2) value = 0.01f + normalized * 3.0f;
+            else if(slot == 4) value = 20.0f * powf(900.0f, normalized);
+            else if(slot == 5) value = 0.01f * powf(2000.0f, normalized);
+            break;
+        case SYNTH_ENGINE_SH101: {
+            static const uint8_t params[6] = {4, 5, 6, 8, 10, 13};
+            param = params[slot];
+            if(slot == 0) value = 20.0f * powf(500.0f, normalized);
+            else if(slot == 1) value = normalized * 0.95f;
+            else if(slot == 3) value = 0.01f + normalized * 2.99f;
+            else if(slot == 4) value = 0.005f + normalized * 1.995f;
+            else if(slot == 5) value = 0.1f * powf(200.0f, normalized);
+            break;
+        }
+        case SYNTH_ENGINE_FM2OP: {
+            static const uint8_t params[6] = {8, 9, 10, 0, 1, 14};
+            param = params[slot];
+            if(slot == 0) value = 0.5f * powf(32.0f, normalized);
+            else if(slot == 1) value = normalized * 20.0f;
+            else if(slot == 3) value = 0.001f + normalized * 1.999f;
+            else if(slot == 4) value = 0.01f + normalized * 4.99f;
+            break;
+        }
+        case SYNTH_ENGINE_PHYS:
+            if(slot == 0 || slot == 5)
+                value = 20.0f * powf(500.0f, normalized);
+            break;
+        default:
+            break;
+    }
+
+    MpdSendSynthParam(engine, mpdSelectedTrack[device], param, value);
+}
+
+static void MpdApplyKnob(uint8_t device,
+                         const red808_mpd218::KnobAction& action,
+                         uint8_t midiValue)
+{
+    using namespace red808_mpd218;
+    const float normalized = static_cast<float>(midiValue) / 127.0f;
+    const uint16_t raw = MpdRaw1000(midiValue);
+    const uint8_t track = mpdSelectedTrack[device];
+
+    switch(action.type)
+    {
+        case KNOB_MASTER_VOLUME:
+            ApplyPodAbsoluteFunction(POD_FUNC_MASTER_VOLUME, raw); break;
+        case KNOB_LIVE_VOLUME:
+            ApplyPodAbsoluteFunction(POD_FUNC_LIVE_VOLUME, raw); break;
+        case KNOB_SEQ_VOLUME:
+            ApplyPodAbsoluteFunction(POD_FUNC_SEQ_VOLUME, raw); break;
+        case KNOB_TEMPO:
+        case KNOB_SEQ_TEMPO:
+            ApplyPodAbsoluteFunction(POD_FUNC_TEMPO, raw); break;
+        case KNOB_DELAY_MIX:
+            ApplyPodAbsoluteFunction(POD_FUNC_DELAY_MIX, raw); break;
+        case KNOB_REVERB_MIX:
+            ApplyPodAbsoluteFunction(POD_FUNC_REVERB_MIX, raw); break;
+        case KNOB_FILTER_CUTOFF:
+            ApplyPodAbsoluteFunction(POD_FUNC_FILTER_CUTOFF, raw); break;
+        case KNOB_FILTER_RESONANCE:
+            ApplyPodAbsoluteFunction(POD_FUNC_FILTER_RESONANCE, raw); break;
+        case KNOB_DISTORTION:
+            ApplyPodAbsoluteFunction(POD_FUNC_DISTORTION, raw); break;
+        case KNOB_BIT_DEPTH:
+            ApplyPodAbsoluteFunction(POD_FUNC_BIT_DEPTH, raw); break;
+        case KNOB_SAMPLE_RATE:
+            ApplyPodAbsoluteFunction(POD_FUNC_SAMPLE_RATE, raw); break;
+        case KNOB_FILTER_TYPE:
+            ApplyPodAbsoluteFunction(POD_FUNC_FILTER_TYPE, raw); break;
+        case KNOB_FLANGER_DEPTH:
+            ApplyPodAbsoluteFunction(POD_FUNC_FLANGER_DEPTH, raw); break;
+        case KNOB_PHASER_DEPTH:
+            ApplyPodAbsoluteFunction(POD_FUNC_PHASER_DEPTH, raw); break;
+        case KNOB_WAVEFOLDER:
+            ApplyPodAbsoluteFunction(POD_FUNC_WAVEFOLDER_GAIN, raw); break;
+        case KNOB_CRUSH_MACRO:
+            ApplyPodAbsoluteFunction(POD_FUNC_CRUSH_MACRO, raw); break;
+        case KNOB_LIVE_PITCH: {
+            const float pitch = 0.5f * powf(4.0f, normalized);
+            ApplyPodCommand(CMD_LIVE_PITCH, &pitch, sizeof(pitch));
+            break;
+        }
+        case KNOB_SELECT_PAD:
+            ApplyPodAbsoluteFunction(POD_FUNC_SELECT_PAD, raw);
+            MpdSelectTrack(device, podSelectedPad);
+            break;
+        case KNOB_TRACK_VOLUME: {
+            const uint8_t payload[2] = {
+                track, static_cast<uint8_t>(normalized * 150.0f + 0.5f)};
+            ApplyPodCommand(CMD_TRACK_VOLUME, payload, sizeof(payload));
+            break;
+        }
+        case KNOB_TRACK_PAN: {
+            const int8_t pan = static_cast<int8_t>(normalized * 200.0f - 100.0f);
+            const uint8_t payload[2] = {track, static_cast<uint8_t>(pan)};
+            ApplyPodCommand(CMD_TRACK_PAN, payload, sizeof(payload));
+            break;
+        }
+        case KNOB_TRACK_REVERB_SEND:
+        case KNOB_TRACK_DELAY_SEND:
+        case KNOB_TRACK_CHORUS_SEND: {
+            const uint8_t payload[2] = {
+                track, static_cast<uint8_t>(normalized * 100.0f + 0.5f)};
+            const uint8_t cmd = action.type == KNOB_TRACK_REVERB_SEND
+                ? CMD_TRACK_REVERB_SEND
+                : action.type == KNOB_TRACK_DELAY_SEND
+                    ? CMD_TRACK_DELAY_SEND : CMD_TRACK_CHORUS_SEND;
+            ApplyPodCommand(cmd, payload, sizeof(payload));
+            break;
+        }
+        case KNOB_TRACK_PITCH: {
+            struct __attribute__((packed)) TrackPitchPayload
+            {
+                uint8_t track;
+                uint8_t reserved;
+                int16_t cents;
+            } payload = {
+                track, 0,
+                static_cast<int16_t>(normalized * 2400.0f - 1200.0f)};
+            ApplyPodCommand(CMD_TRACK_PITCH, &payload, sizeof(payload));
+            break;
+        }
+        case KNOB_TRACK_FILTER_CUTOFF: {
+            const float cutoff = 20.0f * powf(1000.0f, normalized);
+            const float q = trkFilterQ[track] >= 0.3f ? trkFilterQ[track] : 0.707f;
+            MpdSendTrackFilter(device, cutoff, q);
+            break;
+        }
+        case KNOB_TRACK_FILTER_RESONANCE: {
+            const float cutoff = trkFilterCut[track] >= 20.0f
+                ? trkFilterCut[track] : 12000.0f;
+            MpdSendTrackFilter(device, cutoff, 0.3f + normalized * 27.7f);
+            break;
+        }
+        case KNOB_TRACK_DISTORTION: {
+            struct __attribute__((packed)) TrackDistPayload
+            {
+                uint8_t track;
+                uint8_t mode;
+                uint8_t reserved[2];
+                float amount;
+            } payload = {track, DMODE_SOFT, {0, 0}, normalized};
+            ApplyPodCommand(CMD_TRACK_DISTORTION, &payload, sizeof(payload));
+            break;
+        }
+        case KNOB_TRACK_BIT_DEPTH: {
+            const uint8_t payload[2] = {
+                track,
+                static_cast<uint8_t>(16.0f - normalized * 12.0f + 0.5f)};
+            ApplyPodCommand(CMD_TRACK_BITCRUSH, payload, sizeof(payload));
+            break;
+        }
+        case KNOB_TRACK_EQ_LOW:
+        case KNOB_TRACK_EQ_HIGH: {
+            const int8_t db = static_cast<int8_t>(normalized * 24.0f - 12.0f);
+            const uint8_t payload[2] = {track, static_cast<uint8_t>(db)};
+            ApplyPodCommand(action.type == KNOB_TRACK_EQ_LOW
+                                ? CMD_TRACK_EQ_LOW : CMD_TRACK_EQ_HIGH,
+                            payload, sizeof(payload));
+            break;
+        }
+        case KNOB_SEQ_SWING: {
+            const uint8_t value = static_cast<uint8_t>(normalized * 100.0f + 0.5f);
+            ApplyPodCommand(CMD_DSQ_SET_SWING, &value, sizeof(value));
+            break;
+        }
+        case KNOB_HUMANIZE_TIMING: {
+            const uint8_t payload[2] = {
+                static_cast<uint8_t>(normalized * 20.0f + 0.5f),
+                dseq.humanizeVelAmt};
+            ApplyPodCommand(CMD_DSQ_SET_HUMANIZE, payload, sizeof(payload));
+            break;
+        }
+        case KNOB_HUMANIZE_VELOCITY: {
+            const uint8_t payload[2] = {
+                dseq.humanizeTimingMs,
+                static_cast<uint8_t>(normalized * 50.0f + 0.5f)};
+            ApplyPodCommand(CMD_DSQ_SET_HUMANIZE, payload, sizeof(payload));
+            break;
+        }
+        case KNOB_PATTERN_SELECT: {
+            const uint8_t pattern = static_cast<uint8_t>(
+                normalized * static_cast<float>(DSQ_PATTERNS - 1) + 0.5f);
+            ApplyPodCommand(CMD_DSQ_SELECT_PATTERN, &pattern, sizeof(pattern));
+            break;
+        }
+        case KNOB_TRACK_SELECT:
+            MpdSelectTrack(device, static_cast<uint8_t>(normalized
+                           * static_cast<float>(DSQ_TRACKS - 1) + 0.5f));
+            break;
+        case KNOB_DRUM_PARAM_1:
+        case KNOB_DRUM_PARAM_2:
+        case KNOB_DRUM_PARAM_3:
+        case KNOB_DRUM_PARAM_4:
+        case KNOB_DRUM_PARAM_5:
+        case KNOB_DRUM_PARAM_6: {
+            const uint8_t param = static_cast<uint8_t>(
+                action.type - KNOB_DRUM_PARAM_1);
+            MpdSendSynthParam(mpdSelectedDrumEngine[device],
+                              MpdSelectedNativeDrumInstrument(device),
+                              param,
+                              MpdDrumParamValue(device, param, normalized));
+            break;
+        }
+        case KNOB_MELODIC_PARAM_1:
+        case KNOB_MELODIC_PARAM_2:
+        case KNOB_MELODIC_PARAM_3:
+        case KNOB_MELODIC_PARAM_4:
+        case KNOB_MELODIC_PARAM_5:
+        case KNOB_MELODIC_PARAM_6:
+            MpdApplyMelodicParam(device, static_cast<uint8_t>(
+                action.type - KNOB_MELODIC_PARAM_1), normalized);
+            break;
+        case KNOB_SYNTH_ENGINE: {
+            static const uint8_t engines[5] = {
+                SYNTH_ENGINE_303, SYNTH_ENGINE_WTOSC, SYNTH_ENGINE_SH101,
+                SYNTH_ENGINE_FM2OP, SYNTH_ENGINE_PHYS};
+            const uint8_t index = static_cast<uint8_t>(normalized * 4.0f + 0.5f);
+            const uint8_t previousEngine = mpdSelectedMelodicEngine[device];
+            if(previousEngine != engines[index])
+                ReleaseSynthEngineState(previousEngine);
+            mpdSelectedMelodicEngine[device] = engines[index];
+            MpdLoadSynthPreset(engines[index], mpdSelectedSynthPreset[device]);
+            break;
+        }
+        case KNOB_SYNTH_PRESET: {
+            mpdSelectedSynthPreset[device] = static_cast<uint8_t>(
+                normalized * 4.0f + 0.5f);
+            MpdLoadSynthPreset(mpdSelectedMelodicEngine[device],
+                               mpdSelectedSynthPreset[device]);
+            break;
+        }
+        case KNOB_CHORUS_MIX: {
+            const uint8_t enabled = normalized > 0.005f ? 1u : 0u;
+            ApplyPodCommand(CMD_CHORUS_ACTIVE, &enabled, sizeof(enabled));
+            ApplyPodCommand(CMD_CHORUS_MIX, &normalized, sizeof(normalized));
+            break;
+        }
+        case KNOB_TREMOLO_DEPTH: {
+            const uint8_t enabled = normalized > 0.005f ? 1u : 0u;
+            ApplyPodCommand(CMD_TREMOLO_ACTIVE, &enabled, sizeof(enabled));
+            ApplyPodCommand(CMD_TREMOLO_DEPTH, &normalized, sizeof(normalized));
+            break;
+        }
+        case KNOB_AUTOWAH_MIX: {
+            const uint8_t enabled = normalized > 0.005f ? 1u : 0u;
+            ApplyPodCommand(CMD_AUTOWAH_ACTIVE, &enabled, sizeof(enabled));
+            ApplyPodCommand(CMD_AUTOWAH_MIX, &normalized, sizeof(normalized));
+            break;
+        }
+        case KNOB_STEREO_WIDTH: {
+            const uint8_t width = static_cast<uint8_t>(normalized * 200.0f + 0.5f);
+            ApplyPodCommand(CMD_STEREO_WIDTH, &width, sizeof(width));
+            break;
+        }
+        case KNOB_NONE:
+        default:
+            break;
+    }
+    podStateRevision++;
+}
+
+static void MpdHandleClock(uint32_t now)
+{
+    if(mpdClockStartMs == 0u)
+    {
+        mpdClockStartMs = now;
+        mpdClockIntervals = 0;
+        return;
+    }
+
+    if(++mpdClockIntervals >= 24u)
+    {
+        const uint32_t elapsed = now - mpdClockStartMs;
+        mpdClockStartMs = now;
+        mpdClockIntervals = 0;
+        if(elapsed >= 80u && elapsed <= 1500u)
+        {
+            const float bpm = clampF(60000.0f / static_cast<float>(elapsed),
+                                     40.0f, 300.0f);
+            ApplyPodCommand(CMD_TEMPO, &bpm, sizeof(bpm));
+        }
+    }
+}
+
+static void ProcessMpdMidi()
+{
+    pod.midi->Listen();
+    uint8_t budget = 192;
+    while(pod.midi->HasEvents() && budget-- > 0u)
+    {
+        MidiEvent event = pod.midi->PopEvent();
+        uint8_t device = 0, bank = 0, layer = 0, index = 0;
+        const uint32_t now = hw.system.GetNow();
+
+        switch(event.type)
+        {
+            case NoteOn:
+            case NoteOff: {
+                const bool pressed = event.type == NoteOn && event.data[1] != 0u;
+                if(red808_mpd218::DecodePad(static_cast<uint8_t>(event.channel),
+                                            event.data[0], device, bank,
+                                            layer, index))
+                    MpdApplyPad(device,
+                                red808_mpd218::kPadMap[bank][layer][index],
+                                event.data[1], pressed, now);
+                break;
+            }
+            case ControlChange:
+                if(red808_mpd218::DecodeKnob(static_cast<uint8_t>(event.channel),
+                                             event.data[0], device, bank,
+                                             layer, index))
+                    MpdApplyKnob(device,
+                                 red808_mpd218::kKnobMap[bank][layer][index],
+                                 event.data[1]);
+                break;
+            case ChannelMode:
+                if(event.cm_type == AllSoundOff || event.cm_type == AllNotesOff)
+                {
+                    uint8_t modeDevice = 0, modeBank = 0;
+                    if(red808_mpd218::DecodeDeviceAndBank(
+                           static_cast<uint8_t>(event.channel),
+                           modeDevice, modeBank))
+                    {
+                        (void)modeBank;
+                        const uint8_t release[2] = {
+                            mpdSelectedMelodicEngine[modeDevice], 0xFFu};
+                        ApplyPodCommand(CMD_SYNTH_NOTE_OFF,
+                                        release, sizeof(release));
+                    }
+                }
+                break;
+            case SystemRealTime:
+                if(event.srt_type == TimingClock)
+                    MpdHandleClock(now);
+                else if(event.srt_type == Start || event.srt_type == Continue)
+                {
+                    const uint8_t play = 1u;
+                    ApplyPodCommand(CMD_DSQ_CONTROL, &play, sizeof(play));
+                }
+                else if(event.srt_type == Stop)
+                {
+                    const uint8_t stop = 0u;
+                    ApplyPodCommand(CMD_DSQ_CONTROL, &stop, sizeof(stop));
+                }
+                else if(event.srt_type == Reset)
+                {
+                    const uint8_t reset = 2u;
+                    ApplyPodCommand(CMD_DSQ_CONTROL, &reset, sizeof(reset));
+                    ApplyPodCommand(CMD_TRIGGER_STOP_ALL, nullptr, 0);
+                    ApplyPodCommand(CMD_SYNTH_NOTE_OFF, nullptr, 0);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 static bool PodLedIsActive(uint8_t function, uint32_t now)
 {
     switch(function)
@@ -10132,6 +10764,8 @@ int main()
     DsqEnsureAudibleSources();
     Log("DsqInit: %d patrones x %d tracks x %d steps en SDRAM",
         DSQ_PATTERNS, DSQ_TRACKS, DSQ_MAX_STEPS);
+    pod.StartMidi();
+    Log("MIDI merge listo: 2 dispositivos x 3 bancos x 3 capas");
     if(kStartupShowcaseDemo){
         BuildStartupShowcaseProgram();
         Log("Showcase programado: 8 escenas / 32 compases / sample-first");
@@ -10164,8 +10798,9 @@ int main()
     /* ── Main loop ── */
     while(1){
 
-        /* Único enlace externo del producto: USB-C CDC con el P4. */
+        /* Control simultaneo: USB-C CDC con el P4 + MIDI TRS Type A. */
         ProcessDaisyUsb();
+        ProcessMpdMidi();
         ProcessPodControls(hw.system.GetNow());
 
         /* ── LED diagnóstico ── */
