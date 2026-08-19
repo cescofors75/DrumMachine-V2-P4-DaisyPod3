@@ -2096,7 +2096,7 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_add_event_cb(s_pad_inst_modal, pad_inst_modal_close_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(s_pad_inst_modal);
-    lv_obj_set_size(card, 880, 500);
+    lv_obj_set_size(card, 984, 560);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
@@ -2133,10 +2133,10 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
 
     const int pad_grid_x0 = 32;
     const int pad_grid_y0 = 138;
-    const int pad_btn_w = 56;
-    const int pad_btn_h = 30;
-    const int pad_gap_x = 8;
-    const int pad_gap_y = 8;
+    const int pad_btn_w = 64;
+    const int pad_btn_h = 34;
+    const int pad_gap_x = 10;
+    const int pad_gap_y = 10;
     for (int i = 0; i < 16; i++) {
         lv_obj_t* pb = lv_btn_create(card);
         s_pad_inst_modal_pad_btns[i] = pb;
@@ -2145,6 +2145,17 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
         lv_obj_set_size(pb, pad_btn_w, pad_btn_h);
         lv_obj_set_pos(pb, pad_grid_x0 + col * (pad_btn_w + pad_gap_x), pad_grid_y0 + row * (pad_btn_h + pad_gap_y));
         apply_control_button_style(pb, RED808_BORDER, false, 8);
+        // Franja de color a la izquierda con el mismo track-color que usa el
+        // pad en la pantalla LIVE, para reconocer el pad de un vistazo.
+        lv_obj_t* strip = lv_obj_create(pb);
+        lv_obj_set_size(strip, 4, pad_btn_h);
+        lv_obj_set_pos(strip, 0, 0);
+        lv_obj_set_style_bg_color(strip, ui_track_color(i), 0);
+        lv_obj_set_style_bg_opa(strip, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(strip, 0, 0);
+        lv_obj_set_style_radius(strip, 0, 0);
+        lv_obj_clear_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(strip, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_t* pl = lv_label_create(pb);
         lv_label_set_text_fmt(pl, "%02d", i + 1);
         lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
@@ -2158,19 +2169,36 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_set_style_text_color(pad_hdr, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(pad_hdr, pad_grid_x0, pad_grid_y0 - 20);
 
-    const int grid_x0 = 326;
+    const int grid_x0 = 350;
     const int grid_y0 = 138;
     const int grid_cols = 4;
-    const int btn_w = 104;
-    const int btn_h = 38;
-    const int gap_x = 8;
-    const int gap_y = 8;
+    const int btn_w = 116;
+    const int btn_h = 46;
+    const int gap_x = 10;
+    const int gap_y = 10;
 
     lv_obj_t* inst_hdr = lv_label_create(card);
     lv_label_set_text(inst_hdr, "INSTRUMENT");
     lv_obj_set_style_text_font(inst_hdr, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(inst_hdr, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(inst_hdr, grid_x0, grid_y0 - 20);
+
+    // Fila 0 (Sampler/808/909/505) = "SAMPLE + DRUM", fila 1 (303/WT/FM2/SH101)
+    // = "MELODIC". La franja de color a la izquierda de cada botón hace visible
+    // esa agrupación de un vistazo, en vez de que las 8 casillas se vean iguales.
+    // No 'static' on the colors: RED808_ACCENT2/CYAN resolve the active theme
+    // at call time, and a static local would freeze on whatever theme was
+    // active the first time this modal opened.
+    const lv_color_t inst_row_colors[2] = { RED808_ACCENT2, RED808_CYAN };
+    static const char* inst_row_names[2] = { "SAMPLE + DRUM", "MELODIC" };
+    for (int row = 0; row < 2; row++) {
+        lv_obj_t* rl = lv_label_create(card);
+        lv_label_set_text(rl, inst_row_names[row]);
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(rl, inst_row_colors[row], 0);
+        lv_obj_set_pos(rl, grid_x0 + grid_cols * (btn_w + gap_x) + 6,
+                        grid_y0 + row * (btn_h + gap_y) + btn_h / 2 - 7);
+    }
 
     for (int i = 0; i < 8; i++) {
         lv_obj_t* ib = lv_btn_create(card);
@@ -2180,6 +2208,15 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
         lv_obj_set_size(ib, btn_w, btn_h);
         lv_obj_set_pos(ib, grid_x0 + col * (btn_w + gap_x), grid_y0 + row * (btn_h + gap_y));
         apply_control_button_style(ib, RED808_BORDER, false, 10);
+        lv_obj_t* strip = lv_obj_create(ib);
+        lv_obj_set_size(strip, 4, btn_h);
+        lv_obj_set_pos(strip, 0, 0);
+        lv_obj_set_style_bg_color(strip, inst_row_colors[row], 0);
+        lv_obj_set_style_bg_opa(strip, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(strip, 0, 0);
+        lv_obj_set_style_radius(strip, 0, 0);
+        lv_obj_clear_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(strip, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_t* il = lv_label_create(ib);
         lv_label_set_text(il, PAD_INST_NAMES[i]);
         lv_obj_set_style_text_font(il, &lv_font_montserrat_14, 0);
@@ -2243,7 +2280,7 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     }
 
     lv_obj_t* original_btn = lv_btn_create(card);
-    lv_obj_set_size(original_btn, 180, 44);
+    lv_obj_set_size(original_btn, 200, 48);
     lv_obj_align(original_btn, LV_ALIGN_BOTTOM_LEFT, 18, -14);
     apply_control_button_style(original_btn, RED808_ACCENT2, false, 10);
     lv_obj_t* original_lbl = lv_label_create(original_btn);
@@ -2253,8 +2290,8 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_add_event_cb(original_btn, pad_inst_sampler_original_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* preview_btn = lv_btn_create(card);
-    lv_obj_set_size(preview_btn, 160, 44);
-    lv_obj_align(preview_btn, LV_ALIGN_BOTTOM_MID, -90, -14);
+    lv_obj_set_size(preview_btn, 180, 48);
+    lv_obj_align(preview_btn, LV_ALIGN_BOTTOM_MID, -100, -14);
     apply_control_button_style(preview_btn, RED808_SURFACE, false, 10);
     lv_obj_set_style_border_color(preview_btn, RED808_CYAN, 0);
     lv_obj_set_style_border_width(preview_btn, 2, 0);
@@ -2266,8 +2303,8 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_add_event_cb(preview_btn, pad_inst_modal_preview_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* assign_btn = lv_btn_create(card);
-    lv_obj_set_size(assign_btn, 160, 44);
-    lv_obj_align(assign_btn, LV_ALIGN_BOTTOM_MID, 90, -14);
+    lv_obj_set_size(assign_btn, 180, 48);
+    lv_obj_align(assign_btn, LV_ALIGN_BOTTOM_MID, 100, -14);
     apply_control_button_style(assign_btn, RED808_SUCCESS, false, 10);
     lv_obj_set_style_border_color(assign_btn, RED808_CYAN, 0);
     lv_obj_set_style_border_width(assign_btn, 2, 0);
@@ -2279,7 +2316,7 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_add_event_cb(assign_btn, pad_inst_modal_assign_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* close_btn = lv_btn_create(card);
-    lv_obj_set_size(close_btn, 110, 44);
+    lv_obj_set_size(close_btn, 130, 48);
     lv_obj_align(close_btn, LV_ALIGN_BOTTOM_RIGHT, -18, -14);
     apply_control_button_style(close_btn, RED808_BORDER, false, 10);
     lv_obj_t* close_lbl = lv_label_create(close_btn);
@@ -4185,7 +4222,74 @@ static void grid_pad_kit_select_cb(lv_event_t* e) {
     pad_inst_modal_refresh();
 }
 
-// PAD MODE modal — solo selector de visualización (1/2/4/8/16 pads)
+// Mini preview icon: draws the actual cols x rows arrangement each pad-grid
+// mode produces (mirrors apply_pad_layout's cols/count table) so the picker
+// shows what the layout looks like instead of just naming it. Mode 0 (the
+// compact non-fullscreen layout) additionally renders a dimmed panel on the
+// right, representing the control deck that stays visible in that mode.
+static void build_pad_grid_icon(lv_obj_t* parent, int x, int y, int mode) {
+    const int box_w = 64, box_h = 36;
+    lv_obj_t* box = lv_obj_create(parent);
+    lv_obj_set_size(box, box_w, box_h);
+    lv_obj_set_pos(box, x, y);
+    lv_obj_set_style_bg_color(box, RED808_BG, 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(box, RED808_BORDER, 0);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_radius(box, 4, 0);
+    lv_obj_set_style_pad_all(box, 3, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+
+    int cols, rows, count;
+    bool full;
+    switch (mode) {
+        default:
+        case 0: cols = 4; rows = 4; count = 16; full = false; break;
+        case 1: cols = 4; rows = 4; count = 16; full = true;  break;
+        case 2: cols = 4; rows = 2; count = 8;  full = true;  break;
+        case 3: cols = 2; rows = 2; count = 4;  full = true;  break;
+        case 4: cols = 2; rows = 1; count = 2;  full = true;  break;
+        case 5: cols = 1; rows = 1; count = 1;  full = true;  break;
+    }
+
+    const int drawable_w = box_w - 6, drawable_h = box_h - 6, gap = 1;
+    int grid_w = full ? drawable_w : (int)(drawable_w * 0.58f);
+    int cw = (grid_w - (cols - 1) * gap) / cols;
+    int ch = (drawable_h - (rows - 1) * gap) / rows;
+    if (cw < 2) cw = 2;
+    if (ch < 2) ch = 2;
+
+    for (int i = 0; i < count; i++) {
+        int c = i % cols, r = i / cols;
+        lv_obj_t* cell = lv_obj_create(box);
+        lv_obj_set_size(cell, cw, ch);
+        lv_obj_set_pos(cell, c * (cw + gap), r * (ch + gap));
+        lv_obj_set_style_bg_color(cell, RED808_ACCENT2, 0);
+        lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(cell, 0, 0);
+        lv_obj_set_style_radius(cell, 1, 0);
+        lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+    }
+    if (!full) {
+        int panel_x = grid_w + 4;
+        int panel_w = drawable_w - grid_w - 4;
+        if (panel_w < 4) panel_w = 4;
+        lv_obj_t* panel = lv_obj_create(box);
+        lv_obj_set_size(panel, panel_w, drawable_h);
+        lv_obj_set_pos(panel, panel_x, 0);
+        lv_obj_set_style_bg_color(panel, RED808_ACCENT2, 0);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_30, 0);
+        lv_obj_set_style_border_width(panel, 0, 0);
+        lv_obj_set_style_radius(panel, 1, 0);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+// PAD MODE modal — selector de visualización (1/2/4/8/16 pads), con icono de
+// previsualización real de cada layout junto al nombre.
 static void grid_pad_mode_cb(lv_event_t* e) {
     if (s_pad_mode_modal) { lv_obj_del(s_pad_mode_modal); s_pad_mode_modal = NULL; return; }
 
@@ -4203,7 +4307,7 @@ static void grid_pad_mode_cb(lv_event_t* e) {
     }, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(s_pad_mode_modal);
-    lv_obj_set_size(card, 360, 400);
+    lv_obj_set_size(card, 420, 400);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -4227,14 +4331,15 @@ static void grid_pad_mode_cb(lv_event_t* e) {
     for (int i = 0; i < 6; i++) {
         bool sel = (i == s_pad_mode);
         lv_obj_t* btn = lv_btn_create(card);
-        lv_obj_set_size(btn, 320, 44);
+        lv_obj_set_size(btn, 392, 44);
         lv_obj_set_pos(btn, 6, 44 + i*52);
         apply_control_button_style(btn, sel ? RED808_ACCENT2 : RED808_SURFACE, sel, 10);
+        build_pad_grid_icon(btn, 8, 4, i);
         lv_obj_t* lbl = lv_label_create(btn);
         lv_label_set_text(lbl, mode_labels[i]);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(lbl, RED808_TEXT, 0);
-        lv_obj_center(lbl);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 84, 0);
         lv_obj_add_event_cb(btn, pad_mode_select_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
 }
