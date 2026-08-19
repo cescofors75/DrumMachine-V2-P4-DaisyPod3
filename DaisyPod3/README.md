@@ -65,6 +65,26 @@ Quedan fuera de esta cola, deliberadamente:
   único campo escalar en vez de una voz/motor completo con varios campos
   en un orden concreto, así que una lectura a medias es tanto más rara
   como mucho menos audible.
+- **`RunStartup808SelfTest`** (autotest de arranque, desactivado por
+  defecto vía `RED808_STARTUP_808_SELF_TEST=0` en el `Makefile`): recorre
+  todos los pads/instrumentos desde el bucle principal llamando a
+  `TriggerPad`/`Trigger`/`NoteOn`/`NoteOff` directamente, sin pasar por
+  `AudioCmdPush`. Es deuda técnica conocida y documentada in situ (no un
+  descuido): son ~20 sitios de llamada repartidos en una máquina de
+  estados de 11 fases que solo se ejecuta si alguien activa ese flag para
+  bring-up de hardware — migrarla a ciegas, sin poder verificarla más que
+  reflasheando, no compensaba el riesgo de un error de copia/pega. Si se
+  activa el flag, cualquier glitch durante el self-test no dice nada sobre
+  la cola de audio: ese camino no la usa.
+
+Sí se corrigió `Synth808TriggerByPad` (usada solo por el flag de debug
+`kTriggerSynthOnLiveCmd`, `false` en producción, que superpone un golpe de
+synth808 sobre el disparo normal de un pad en vivo): antes llamaba a
+`synth808.Trigger()` directo desde `ProcessCommand()`; ahora encola un
+`AudioCmd` como todo lo demás. A diferencia del self-test de arranque, este
+camino comparte hot path con `CMD_TRIGGER_LIVE` en tiempo real, así que si
+alguna vez se reactiva el flag para depurar, no debía quedar como el único
+disparo en vivo fuera de la cola.
 
 Esta migración se verificó con una compilación limpia (`make`, sin
 warnings) y una revisión manual campo a campo contra el código original,

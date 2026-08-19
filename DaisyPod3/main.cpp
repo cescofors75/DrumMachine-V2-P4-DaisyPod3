@@ -2267,14 +2267,6 @@ static const uint8_t padTo303Midi[16] = {
     64, 67, 69, 72
 };
 
-static inline void Synth808TriggerByPad(uint8_t padIdx, float velocity)
-{
-    if(padIdx < 16)
-        synth808.Trigger(padTo808[padIdx], velocity);
-    else
-        synth808.Trigger(TR808::INST_KICK, velocity); /* fallback */
-}
-
 /* Bitmask: qué engines están activos */
 static constexpr float kDrumBusHeadroom = 0.70f;  // evita clipping al mezclar 808/909/505
 static uint16_t synthActiveMask = 0x01FF;  /* all 9 engines active */
@@ -2597,6 +2589,18 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
  *  5) TB303 notas (una a una)
  *  6) Samplers WAV XTRA (pads 16..23, al final)
  * ═══════════════════════════════════════════════════════════════════ */
+/* Diagnostic only, off by default (RED808_STARTUP_808_SELF_TEST=0 in the
+ * Makefile) — a hardware bring-up self-test that steps through every pad/
+ * instrument from the main loop. Unlike the rest of main-loop trigger paths,
+ * it calls TriggerPad()/synth Trigger()/acid303 NoteOn()/NoteOff() directly
+ * instead of going through AudioCmdPush(), so it does NOT benefit from the
+ * lock-free audio command queue and can still race AudioCallback. Left this
+ * way deliberately: migrating ~20 call sites across an 11-phase state
+ * machine that only ever runs when a developer flips this build flag for
+ * bring-up testing isn't worth the risk of a copy/paste mistake in code that
+ * can only be exercised by reflashing hardware. If you enable this flag,
+ * treat any audio glitch during the self-test as inconclusive for judging
+ * the queue itself — it doesn't go through it. */
 static void RunStartup808SelfTest(uint32_t nowMs)
 {
     if(!kStartup808SelfTest || kStartupShowcaseDemo)
@@ -4255,6 +4259,21 @@ static void AudioCmdApplySynthTrigger(const AudioCmd& c)
         case SYNTH_ENGINE_505: synth505.Trigger(c.instrument, vel); break;
         default: break;
     }
+}
+
+/* Used only by the (production-disabled) kTriggerSynthOnLiveCmd debug path:
+ * layers a synth808 hit on top of a sampler pad-trigger. Moved below the
+ * AudioCmd queue (was defined near the top of the file, calling
+ * synth808.Trigger() straight from the main loop) so it can queue through
+ * it instead of racing AudioCallback like the rest of main-loop triggers. */
+static inline void Synth808TriggerByPad(uint8_t padIdx, float velocity)
+{
+    AudioCmd cmd{};
+    cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+    cmd.engine = SYNTH_ENGINE_808;
+    cmd.instrument = (padIdx < 16) ? padTo808[padIdx] : TR808::INST_KICK;
+    cmd.velocity = (uint8_t)clampF(velocity * 127.0f, 0.0f, 127.0f);
+    AudioCmdPush(cmd);
 }
 
 static void AudioCmdApplyNoteOn(const AudioCmd& c)
