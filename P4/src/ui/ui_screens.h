@@ -69,6 +69,10 @@ void ui_sequencer_load_external_pattern(const bool steps[16][64], int raw_len);
 // applied to the LVGL widgets from the LVGL task.
 void ui_live_set_sync_p4(bool on);
 
+// Flash a LIVE pad from outside the UI (e.g. a mapped AKAI MPD218 hit
+// forwarded by DaisyPod3). Safe to call from any task.
+void ui_external_pad_flash(uint8_t pad, uint8_t velocity);
+
 // Apply authoritative per-track synth engine state (track 0..15).
 // Engine mapping matches setTrackSynthEngine: -1 sampler, 0..6 synth engines.
 // Safe to call from any task: the payload is latched and applied to the

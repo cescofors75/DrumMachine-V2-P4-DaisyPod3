@@ -92,6 +92,10 @@ class DaisyUsbTransport
     void synthPreset(uint8_t engine, uint8_t preset);
     bool uploadSong(const SongEntry* entries, uint8_t count);
     bool controlSong(uint8_t action); // 0=stop, 1=play, 2=reset
+    bool sendMidiMap(const MidiMapEntry* entries, uint8_t count);
+    // Pops the next raw MIDI event polled from the Daisy MPD218 monitor.
+    // Producer (handleResponse) and consumer both run from loop().
+    bool popMidiEvent(MidiMonitorEvent& event);
 
     bool connected() const { return state_.engine_responding; }
     const TransportState& state() const { return state_; }
@@ -126,6 +130,10 @@ class DaisyUsbTransport
     uint32_t last_position_ms_ = 0;
     uint32_t last_status_ms_ = 0;
     uint32_t last_pod_state_ms_ = 0;
+    uint32_t last_midi_events_ms_ = 0;
+    MidiMonitorEvent midi_events_[64] = {};
+    uint8_t midi_events_head_ = 0;
+    uint8_t midi_events_tail_ = 0;
     bool pending_query_ = false;
     uint8_t pending_query_command_ = 0;
     uint16_t pending_query_sequence_ = 0;

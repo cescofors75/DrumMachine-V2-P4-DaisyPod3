@@ -100,8 +100,15 @@ guardan en `P101..P120` y Daisy reproduce una cadena de hasta 128 secciones;
 antes de sustituir esos patrones la pantalla pide confirmación.
 
 El mapa de control MIDI externo se consulta desde `STATUS > CONTROL MAP > MIDI
-MAP`. Incluye ambos dispositivos, bancos 1–3, capas A/B/C separadas para pads y
-knobs, canales 1–6 y todas las acciones del mapa compilado de DaisyPod3.
+MAP`. La pantalla replica el MPD218 (16 pads con PAD 13-16 arriba y 6 knobs en
+filas 5·6 / 3·4 / 1·2) e incluye ambos dispositivos, bancos 1–3, capas A/B/C
+separadas para pads y knobs y todas las acciones del mapa compilado de
+DaisyPod3. La tecla roja `LEARN` captura el siguiente evento del AKAI (nota o
+CC, en cualquier canal) y abre el selector de asignación: samples, 808/909/505,
+patrones, mutes, transporte o acciones de knob. Las asignaciones se guardan en
+la NVS de P4, se reenvían a Daisy en cada conexión y mandan sobre el mapa de
+fábrica; al tocar el pad mapeado del AKAI suena la Daisy y el pad se ilumina
+tanto en la pantalla LIVE del P4 como en la vista MPD218.
 
 El importador admite SMF 0/1 con PPQN. `STD` usa el canal GM de batería y `PRO`
 convierte todos los canales en las 16 pistas percusivas. Daisy dispone de 20

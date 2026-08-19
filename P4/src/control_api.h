@@ -2,8 +2,18 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "master/protocol.h"
 
 namespace mem_midi { struct MidiSongData; }
+
+// Event captured by MIDI LEARN (first note-on or CC after arming).
+struct MidiLearnCapture
+{
+    uint8_t channel; // 0-15
+    uint8_t kind;    // MIDI_MAP_KIND_NOTE / MIDI_MAP_KIND_CC
+    uint8_t number;  // note or CC number
+    uint8_t value;   // velocity / CC value at capture time
+};
 
 void control_init();
 void control_process();
@@ -104,6 +114,22 @@ void control_send_melody_clear();
 void control_send_melody_assign_pad(uint8_t pad, uint8_t engine,
                                     uint8_t octave);
 void control_request_sync();
+
+// ── User MIDI map / LEARN (AKAI MPD218) ─────────────────────────────
+void control_midi_learn_arm(bool armed);
+bool control_midi_learn_armed();
+uint32_t control_midi_capture_revision();
+MidiLearnCapture control_midi_capture();
+uint32_t control_midi_activity_revision();
+void control_midi_last_activity(uint8_t& status, uint8_t& data0,
+                                uint8_t& data1);
+uint8_t control_midi_map_count();
+bool control_midi_map_get(uint8_t index, MidiMapEntry& out);
+bool control_midi_map_find(uint8_t channel, uint8_t kind, uint8_t number,
+                           MidiMapEntry& out);
+bool control_midi_map_assign(const MidiMapEntry& entry);
+bool control_midi_map_clear(uint8_t channel, uint8_t kind, uint8_t number);
+bool control_midi_map_clear_all();
 
 void local_apply_message(uint8_t type, uint8_t id, uint8_t value);
 void local_push_pattern(int pattern, const bool steps[16][16]);

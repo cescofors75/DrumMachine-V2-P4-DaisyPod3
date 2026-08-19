@@ -463,6 +463,8 @@ typedef struct __attribute__((packed)) {
 #define CMD_DIAG_PERF_STRESS  0xE5  // Daisy performance stress mode / metrics reset
 #define CMD_POD_GET_STATE     0xE6  // Get physical Pod controls/config (Daisy authoritative)
 #define CMD_POD_SET_CONFIG    0xE7  // Set Pod assignments; Daisy returns canonical state
+#define CMD_MIDI_GET_EVENTS   0xE8  // Drain MPD218 MIDI monitor → [count(1), {status,d0,d1}×count]
+#define CMD_MIDI_MAP_SET      0xE9  // User MIDI map upload: [count(1), MidiMapEntry×count], no response
 #define CMD_PING              0xEE  // Ping/Pong
 #define CMD_RESET             0xEF  // Full DSP reset
 
@@ -471,6 +473,39 @@ typedef struct __attribute__((packed)) {
 #define RED808_PROTOCOL_VERSION       0x0203u
 #define RED808_CAP_EXTENDED_PONG      0x0001u
 #define RED808_CAP_USB_RX_DIAGNOSTICS 0x0002u
+#define RED808_CAP_MIDI_MONITOR       0x0004u
+
+// ── MIDI monitor / user MIDI map (CMD_MIDI_GET_EVENTS / CMD_MIDI_MAP_SET) ──
+// Raw events from the TRS MIDI merge bus (AKAI MPD218 x2 via H4MIDI). The
+// status byte keeps the wire encoding: 0x9n note-on, 0x8n note-off, 0xBn CC,
+// with n = zero-based channel. data1 of a note-on may be 0 (running-status
+// note-off convention is preserved as sent by the controller).
+typedef struct __attribute__((packed)) {
+    uint8_t status;
+    uint8_t data0;   // note or CC number
+    uint8_t data1;   // velocity or CC value
+} MidiMonitorEvent;
+
+#define MIDI_MON_EVENTS_PER_POLL 32  // max events per CMD_MIDI_GET_EVENTS response
+
+#define MIDI_MAP_KIND_NOTE 0
+#define MIDI_MAP_KIND_CC   1
+
+// One learned assignment. For kind NOTE `action` is a red808_mpd218
+// PadActionType (arg0/arg1 follow PadAction); for kind CC it is a
+// KnobActionType. Entries match on exact (channel, kind, number) and take
+// precedence over the compiled MPD218 factory map, so any controller preset
+// (including channels outside 1..6) can be learned.
+typedef struct __attribute__((packed)) {
+    uint8_t channel;  // 0-15 zero-based
+    uint8_t kind;     // MIDI_MAP_KIND_*
+    uint8_t number;   // note or CC number 0-127
+    uint8_t action;   // PadActionType / KnobActionType
+    uint8_t arg0;
+    uint8_t arg1;
+} MidiMapEntry;
+
+#define MIDI_MAP_MAX_ENTRIES 64  // payload 1 + 64*6 = 385 bytes ≤ SPI_MAX_PAYLOAD
 
 typedef struct __attribute__((packed)) {
     uint32_t echoMs;

@@ -8,6 +8,8 @@
 #include "pattern_store.h"
 #include "mem_midi_loader.h"
 #include "pod_config_store.h"
+#include "midi_map_store.h"
+#include "../../DaisyPod3/mpd218_mapping.h"
 #include "ui/ui_screens.h"
 #include "../include/ui_events.h"
 #include <Arduino.h>
@@ -60,6 +62,102 @@ struct VariationSnapshot
 VariationSnapshot variationBackup;
 bool patternBankReady = false;
 uint8_t factoryPatternsFound = 0;
+
+// ── User MIDI map (AKAI MPD218 LEARN) ────────────────────────────────
+// P4 owns the persisted map; DaisyPod3 receives a copy (CMD_MIDI_MAP_SET)
+// so triggers keep their low-latency path on the audio engine. The UI
+// (LVGL task) only reads snapshots or flips the atomics; the map itself is
+// mutated from UI callbacks and re-uploaded whole, mirroring how the pod
+// config flows through the system.
+MidiMapEntry midiMap[MIDI_MAP_MAX_ENTRIES] = {};
+uint8_t midiMapCount = 0;
+std::atomic<bool> midiLearnArmed{false};
+std::atomic<uint32_t> midiCaptureRevision{0};
+MidiLearnCapture midiCapture = {};
+std::atomic<uint32_t> midiActivityRevision{0};
+MidiMonitorEvent midiActivity = {};
+
+void SendMidiMapToDaisy()
+{
+    daisyUsb.sendMidiMap(midiMap, midiMapCount);
+}
+
+int MidiMapIndexOf(uint8_t channel, uint8_t kind, uint8_t number)
+{
+    for(uint8_t i = 0; i < midiMapCount; ++i)
+        if(midiMap[i].channel == channel && midiMap[i].kind == kind
+           && midiMap[i].number == number)
+            return i;
+    return -1;
+}
+
+// Resolves which of the 16 visible pads a note event would light up,
+// honoring the learned map first and the compiled MPD218 tables second.
+int MidiNoteToUiPad(uint8_t channel, uint8_t note)
+{
+    using namespace red808_mpd218;
+    uint8_t action = PAD_NONE, arg0 = 0, arg1 = 0;
+    const int learned = MidiMapIndexOf(channel, MIDI_MAP_KIND_NOTE, note);
+    if(learned >= 0)
+    {
+        action = midiMap[learned].action;
+        arg0 = midiMap[learned].arg0;
+        arg1 = midiMap[learned].arg1;
+    }
+    else
+    {
+        uint8_t device = 0, bank = 0, layer = 0, index = 0;
+        if(!DecodePad(channel, note, device, bank, layer, index))
+            return -1;
+        const PadAction& pad = kPadMap[bank][layer][index];
+        action = pad.type;
+        arg0 = pad.arg0;
+        arg1 = pad.arg1;
+    }
+    switch(action)
+    {
+        case PAD_TRIGGER_SAMPLE:
+        case PAD_SELECT_TRACK:
+        case PAD_TOGGLE_TRACK_MUTE:
+            return arg0 < 16 ? arg0 : -1;
+        case PAD_TRIGGER_SYNTH:
+            return arg1 < 16 ? arg1 : -1;
+        default:
+            return -1;
+    }
+}
+
+void ProcessMidiMonitor()
+{
+    MidiMonitorEvent event;
+    while(daisyUsb.popMidiEvent(event))
+    {
+        const uint8_t type = event.status & 0xF0u;
+        const uint8_t channel = event.status & 0x0Fu;
+        midiActivity = event;
+        midiActivityRevision.fetch_add(1, std::memory_order_release);
+
+        const bool noteOn = type == 0x90u && event.data1 > 0;
+        const bool cc = type == 0xB0u;
+        if(midiLearnArmed.load(std::memory_order_acquire) && (noteOn || cc))
+        {
+            midiCapture.channel = channel;
+            midiCapture.kind = noteOn ? MIDI_MAP_KIND_NOTE : MIDI_MAP_KIND_CC;
+            midiCapture.number = event.data0;
+            midiCapture.value = event.data1;
+            midiLearnArmed.store(false, std::memory_order_release);
+            midiCaptureRevision.fetch_add(1, std::memory_order_release);
+            continue;
+        }
+
+        if(noteOn)
+        {
+            const int pad = MidiNoteToUiPad(channel, event.data0);
+            if(pad >= 0)
+                ui_external_pad_flash(static_cast<uint8_t>(pad), event.data1);
+        }
+    }
+}
 
 template<typename T>
 T Clamp(T value, T low, T high)
@@ -360,6 +458,8 @@ void control_init()
         if(hasHit) factoryPatternsFound++;
     }
     patternBankReady = factoryPatternsFound == FACTORY_PATTERN_COUNT;
+    midiMapCount = 0;
+    midi_map_store_load(midiMap, midiMapCount);
     daisyUsb.begin();
 }
 
@@ -487,9 +587,97 @@ void control_process()
             pod_config_store_save(savedConfig);
         }
         SendWithRetry(CMD_POD_SET_CONFIG, &savedConfig, sizeof(savedConfig));
+        SendMidiMapToDaisy();
     }
     engineWasConnected = transport.engine_responding;
+    ProcessMidiMonitor();
     SequencerInstance().update();
+}
+
+// ── User MIDI map / LEARN API ────────────────────────────────────────
+void control_midi_learn_arm(bool armed)
+{
+    midiLearnArmed.store(armed, std::memory_order_release);
+}
+
+bool control_midi_learn_armed()
+{
+    return midiLearnArmed.load(std::memory_order_acquire);
+}
+
+uint32_t control_midi_capture_revision()
+{
+    return midiCaptureRevision.load(std::memory_order_acquire);
+}
+
+MidiLearnCapture control_midi_capture() { return midiCapture; }
+
+uint32_t control_midi_activity_revision()
+{
+    return midiActivityRevision.load(std::memory_order_acquire);
+}
+
+void control_midi_last_activity(uint8_t& status, uint8_t& data0,
+                                uint8_t& data1)
+{
+    status = midiActivity.status;
+    data0 = midiActivity.data0;
+    data1 = midiActivity.data1;
+}
+
+uint8_t control_midi_map_count() { return midiMapCount; }
+
+bool control_midi_map_get(uint8_t index, MidiMapEntry& out)
+{
+    if(index >= midiMapCount) return false;
+    out = midiMap[index];
+    return true;
+}
+
+bool control_midi_map_find(uint8_t channel, uint8_t kind, uint8_t number,
+                           MidiMapEntry& out)
+{
+    const int index = MidiMapIndexOf(channel, kind, number);
+    if(index < 0) return false;
+    out = midiMap[index];
+    return true;
+}
+
+bool control_midi_map_assign(const MidiMapEntry& entry)
+{
+    if(entry.channel > 15u || entry.number > 127u) return false;
+    if(entry.kind != MIDI_MAP_KIND_NOTE && entry.kind != MIDI_MAP_KIND_CC)
+        return false;
+    int index = MidiMapIndexOf(entry.channel, entry.kind, entry.number);
+    if(index < 0)
+    {
+        if(midiMapCount >= MIDI_MAP_MAX_ENTRIES) return false;
+        index = midiMapCount++;
+    }
+    midiMap[index] = entry;
+    midi_map_store_save(midiMap, midiMapCount);
+    SendMidiMapToDaisy();
+    return true;
+}
+
+bool control_midi_map_clear(uint8_t channel, uint8_t kind, uint8_t number)
+{
+    const int index = MidiMapIndexOf(channel, kind, number);
+    if(index < 0) return false;
+    for(uint8_t i = index; i + 1 < midiMapCount; ++i)
+        midiMap[i] = midiMap[i + 1];
+    midiMapCount--;
+    midi_map_store_save(midiMap, midiMapCount);
+    SendMidiMapToDaisy();
+    return true;
+}
+
+bool control_midi_map_clear_all()
+{
+    midiMapCount = 0;
+    midi_map_store_save(midiMap, midiMapCount);
+    SendMidiMapToDaisy();
+    return true;
 }
 
 bool control_available() { return daisyUsb.connected(); }

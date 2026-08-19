@@ -169,6 +169,15 @@ static inline void ui_pad_flash_start(uint8_t pad, uint8_t velocity) {
     s_pad_flash_start_ms[pad] = millis();
 }
 
+// Called from control_process() (loop task) when a MIDI event resolved to a
+// pad: mirrors the LIVE pad flash used by touch/sequencer hits. The volatile
+// latch arrays make this safe across tasks; the LVGL task paints the fade.
+void ui_external_pad_flash(uint8_t pad, uint8_t velocity) {
+    if (pad >= 16) return;
+    ui_pad_flash_start(pad, velocity);
+    p4.pad_flash_until[pad] = millis() + 120;
+}
+
 static inline uint8_t ui_live_pad_velocity(void);
 
 static unsigned long ui_nr_interval_ms(void) {
@@ -726,18 +735,35 @@ static lv_obj_t* s_pad_inst_modal_kit_btns[3][5] = {};   // [engine 0=808/1=909/
 static lv_obj_t* s_pad_inst_modal_kit_lbl_eng[3] = {};   // labels "808"/"909"/"505"
 static lv_obj_t* s_pod_status_modal = NULL;
 static lv_obj_t* s_pod_status_label = NULL;
+// ── AKAI MPD218 MIDI MAP + LEARN ─────────────────────────────────────
 static lv_obj_t* s_mpd_map_modal = NULL;
 static lv_obj_t* s_mpd_map_summary_label = NULL;
-static lv_obj_t* s_mpd_device_buttons[red808_mpd218::kDeviceCount] = {};
-static lv_obj_t* s_mpd_bank_buttons[red808_mpd218::kBankCount] = {};
-static lv_obj_t* s_mpd_pad_layer_buttons[red808_mpd218::kLayerCount] = {};
-static lv_obj_t* s_mpd_knob_layer_buttons[red808_mpd218::kLayerCount] = {};
-static lv_obj_t* s_mpd_pad_labels[red808_mpd218::kPadsPerLayer] = {};
-static lv_obj_t* s_mpd_knob_labels[red808_mpd218::kKnobsPerLayer] = {};
+static lv_obj_t* s_mpd_activity_label = NULL;
+static lv_obj_t* s_mpd_pad_cells[16] = {};
+static lv_obj_t* s_mpd_pad_labels[16] = {};
+static lv_obj_t* s_mpd_knob_cells[6] = {};
+static lv_obj_t* s_mpd_knob_arcs[6] = {};
+static lv_obj_t* s_mpd_knob_labels[6] = {};
+static lv_obj_t* s_mpd_learn_btn = NULL;
+static lv_obj_t* s_mpd_learn_label = NULL;
+static lv_obj_t* s_mpd_dev_btn = NULL;
+static lv_obj_t* s_mpd_prog_btn = NULL;
+static lv_obj_t* s_mpd_padbank_btn = NULL;
+static lv_obj_t* s_mpd_ctrlbank_btn = NULL;
 static uint8_t s_mpd_device = 0;
 static uint8_t s_mpd_bank = 0;
 static uint8_t s_mpd_pad_layer = 0;
 static uint8_t s_mpd_knob_layer = 0;
+static uint32_t s_mpd_seen_capture_rev = 0;
+static uint32_t s_mpd_seen_activity_rev = 0;
+static unsigned long s_mpd_pad_glow_until[16] = {};
+static unsigned long s_mpd_knob_glow_until[6] = {};
+// Assignment picker (opened by LEARN capture or by tapping a pad/knob cell)
+static lv_obj_t* s_mpd_assign_modal = NULL;
+static lv_obj_t* s_mpd_assign_grid = NULL;
+static lv_obj_t* s_mpd_assign_cat_btns[7] = {};
+static MidiLearnCapture s_mpd_assign_capture = {};
+static uint8_t s_mpd_assign_category = 0;
 static constexpr uint8_t POD_CONTROL_ROW_COUNT = 11;
 static lv_obj_t* s_pod_control_value_labels[POD_CONTROL_ROW_COUNT] = {};
 static lv_obj_t* s_pod_function_modal = NULL;
@@ -2730,8 +2756,28 @@ static void pod_led_color_cycle_cb(lv_event_t* e) {
 }
 
 // =============================================================================
-// AKAI MPD218 MIDI MAP — the same fixed table consumed by DaisyPod3
+// AKAI MPD218 MIDI MAP — device-style view + MIDI LEARN
+// The layout mirrors the physical MPD218: 6 knobs (rows 5·6 / 3·4 / 1·2) on
+// the left, the 4x4 pad matrix on the right (PAD 13..16 on top like the
+// hardware), PROG / PAD BANK / CTRL BANK cycle buttons and a red LEARN key.
+// LEARN captures the next note/CC polled from DaisyPod3's MIDI monitor and
+// opens the assignment picker; assignments persist in P4 NVS and are pushed
+// to Daisy so the trigger path stays on the audio engine.
 // =============================================================================
+
+// Fixed device-replica palette: the modal deliberately looks like the black
+// MPD218 regardless of the active UI theme. Selection/learned accents come
+// from the theme so they stay legible on every preset.
+#define MPD_BODY_BG      lv_color_hex(0x0D0D0D)
+#define MPD_PANEL_BG     lv_color_hex(0x161616)
+#define MPD_PAD_BG       lv_color_hex(0x050505)
+#define MPD_PAD_RIM      lv_color_hex(0xB61A1A)
+#define MPD_PAD_GLOW     lv_color_hex(0xFF3B2F)
+#define MPD_TEXT_MAIN    lv_color_hex(0xEDEDED)
+#define MPD_TEXT_FAINT   lv_color_hex(0x8F8F8F)
+#define MPD_LEARN_RED    lv_color_hex(0xD42B1E)
+#define MPD_LEARNED_MARK lv_color_hex(0x35C8FF)
+
 static const char* const MPD_BANK_NAMES[red808_mpd218::kBankCount] = {
     "LIVE / MASTER", "SEQUENCER", "SYNTHS"
 };
@@ -2772,6 +2818,21 @@ static_assert(sizeof(MPD_KNOB_ACTION_NAMES) / sizeof(MPD_KNOB_ACTION_NAMES[0])
               == red808_mpd218::KNOB_STEREO_WIDTH + 1,
               "MPD knob labels must follow KnobActionType");
 
+static const uint8_t MPD_TRANSPORT_ACTIONS[8] = {
+    red808_mpd218::PAD_PLAY_TOGGLE, red808_mpd218::PAD_STOP_ALL,
+    red808_mpd218::PAD_PATTERN_PREV, red808_mpd218::PAD_PATTERN_NEXT,
+    red808_mpd218::PAD_TOGGLE_LOOP, red808_mpd218::PAD_TOGGLE_REVERSE,
+    red808_mpd218::PAD_TOGGLE_STUTTER, red808_mpd218::PAD_CLEAR_SELECTED_FX
+};
+static const char* const MPD_TRANSPORT_NAMES[8] = {
+    "PLAY / PAUSE", "STOP + PANIC", "PATTERN -", "PATTERN +",
+    "PAD LOOP", "PAD REVERSE", "PAD STUTTER", "CLEAR PAD FX"
+};
+
+static const char* const MPD_ASSIGN_CATEGORIES[7] = {
+    "SAMPLES", "TR-808", "TR-909", "TR-505", "PATRON", "MUTE", "TRANSP."
+};
+
 static void mpd_note_name(uint8_t note, char* out, size_t outSize) {
     static const char* const names[12] = {
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
@@ -2779,31 +2840,31 @@ static void mpd_note_name(uint8_t note, char* out, size_t outSize) {
     snprintf(out, outSize, "%s%d", names[note % 12], (int)(note / 12) - 1);
 }
 
-static void mpd_pad_action_text(const red808_mpd218::PadAction& action,
+static void mpd_pad_action_text(uint8_t type, uint8_t arg0, uint8_t arg1,
                                 char* out, size_t outSize) {
     using namespace red808_mpd218;
-    switch (action.type) {
+    switch (type) {
         case PAD_TRIGGER_SAMPLE:
-            snprintf(out, outSize, "SAMPLE %02u", (unsigned)action.arg0 + 1u);
+            snprintf(out, outSize, "SAMPLE %02u", (unsigned)arg0 + 1u);
             break;
         case PAD_TRIGGER_MELODIC: {
             char note[6] = {};
-            mpd_note_name(action.arg0, note, sizeof(note));
+            mpd_note_name(arg0, note, sizeof(note));
             snprintf(out, outSize, "MELODIC %s", note);
             break;
         }
         case PAD_SELECT_PATTERN:
-            snprintf(out, outSize, "PATTERN %02u", (unsigned)action.arg0 + 1u);
+            snprintf(out, outSize, "PATTERN %02u", (unsigned)arg0 + 1u);
             break;
         case PAD_TOGGLE_TRACK_MUTE:
-            snprintf(out, outSize, "MUTE TRACK %02u", (unsigned)action.arg0 + 1u);
+            snprintf(out, outSize, "MUTE TRK %02u", (unsigned)arg0 + 1u);
             break;
         case PAD_SELECT_TRACK:
-            snprintf(out, outSize, "SELECT TRACK %02u", (unsigned)action.arg0 + 1u);
+            snprintf(out, outSize, "SEL TRK %02u", (unsigned)arg0 + 1u);
             break;
         case PAD_TRIGGER_SYNTH: {
-            const uint8_t engine = action.arg0 < 3 ? action.arg0 : 0;
-            const uint8_t pad = action.arg1 < 16 ? action.arg1 : 0;
+            const uint8_t engine = arg0 < 3 ? arg0 : 0;
+            const uint8_t pad = arg1 < 16 ? arg1 : 0;
             static const char* const engines[3] = {"808", "909", "505"};
             snprintf(out, outSize, "%s %s", engines[engine],
                      MPD_DRUM_PAD_NAMES[engine][pad]);
@@ -2821,129 +2882,551 @@ static void mpd_pad_action_text(const red808_mpd218::PadAction& action,
     }
 }
 
-static void mpd_map_set_selector_style(lv_obj_t* button, bool selected) {
-    if (!button) return;
-    lv_obj_set_style_bg_color(button,
-        selected ? RED808_ACCENT : RED808_SURFACE, 0);
-    lv_obj_set_style_border_color(button,
-        selected ? RED808_CYAN : RED808_BORDER, 0);
-    lv_obj_set_style_border_width(button, selected ? 3 : 1, 0);
-    lv_obj_t* label = lv_obj_get_child(button, 0);
-    if (label) lv_obj_set_style_text_color(label,
-        selected ? lv_color_white() : RED808_TEXT_DIM, 0);
+// Selected MIDI channel, zero-based (DEV1 → CH 1/2/3, DEV2 → CH 4/5/6).
+static uint8_t mpd_map_channel(void) {
+    return (uint8_t)(red808_mpd218::kFirstMidiChannel
+                     + s_mpd_device * red808_mpd218::kChannelsPerDevice
+                     + s_mpd_bank);
 }
+
+static void mpd_map_refresh(void);
+static void mpd_assign_modal_open(const MidiLearnCapture& capture);
+static void mpd_assign_modal_close(void);
+
+// ── Assignment picker ────────────────────────────────────────────────────────
+
+static void mpd_assign_feedback(const char* text, lv_color_t color) {
+    if (!s_mpd_activity_label) return;
+    lv_label_set_text(s_mpd_activity_label, text);
+    lv_obj_set_style_text_color(s_mpd_activity_label, color, 0);
+}
+
+static void mpd_assign_modal_close(void) {
+    if (s_mpd_assign_modal) lv_obj_del(s_mpd_assign_modal);
+    s_mpd_assign_modal = NULL;
+    s_mpd_assign_grid = NULL;
+    memset(s_mpd_assign_cat_btns, 0, sizeof(s_mpd_assign_cat_btns));
+}
+
+static bool mpd_assign_current_action(uint8_t& type, uint8_t& arg0,
+                                      uint8_t& arg1) {
+    MidiMapEntry learned{};
+    if (control_midi_map_find(s_mpd_assign_capture.channel,
+                              s_mpd_assign_capture.kind,
+                              s_mpd_assign_capture.number, learned)) {
+        type = learned.action; arg0 = learned.arg0; arg1 = learned.arg1;
+        return true;
+    }
+    uint8_t device = 0, bank = 0, layer = 0, index = 0;
+    if (s_mpd_assign_capture.kind == MIDI_MAP_KIND_NOTE) {
+        if (red808_mpd218::DecodePad(s_mpd_assign_capture.channel,
+                                     s_mpd_assign_capture.number,
+                                     device, bank, layer, index)) {
+            const red808_mpd218::PadAction& pad =
+                red808_mpd218::kPadMap[bank][layer][index];
+            type = pad.type; arg0 = pad.arg0; arg1 = pad.arg1;
+            return true;
+        }
+    } else if (red808_mpd218::DecodeKnob(s_mpd_assign_capture.channel,
+                                         s_mpd_assign_capture.number,
+                                         device, bank, layer, index)) {
+        type = (uint8_t)red808_mpd218::kKnobMap[bank][layer][index].type;
+        arg0 = 0; arg1 = 0;
+        return true;
+    }
+    return false;
+}
+
+static void mpd_assign_apply(uint8_t action, uint8_t arg0, uint8_t arg1) {
+    MidiMapEntry entry{};
+    entry.channel = s_mpd_assign_capture.channel;
+    entry.kind = s_mpd_assign_capture.kind;
+    entry.number = s_mpd_assign_capture.number;
+    entry.action = action;
+    entry.arg0 = arg0;
+    entry.arg1 = arg1;
+    char what[40] = {};
+    if (entry.kind == MIDI_MAP_KIND_NOTE)
+        mpd_pad_action_text(action, arg0, arg1, what, sizeof(what));
+    else
+        snprintf(what, sizeof(what), "%s",
+                 action <= red808_mpd218::KNOB_STEREO_WIDTH
+                     ? MPD_KNOB_ACTION_NAMES[action] : "NONE");
+    char message[72] = {};
+    if (control_midi_map_assign(entry))
+        snprintf(message, sizeof(message), "MAPEADO  CH%u %s%u  >  %s",
+                 (unsigned)entry.channel + 1u,
+                 entry.kind == MIDI_MAP_KIND_NOTE ? "N" : "CC",
+                 (unsigned)entry.number, what);
+    else
+        snprintf(message, sizeof(message), "MAPA LLENO (%u ENTRADAS)",
+                 (unsigned)MIDI_MAP_MAX_ENTRIES);
+    mpd_assign_feedback(message, MPD_LEARNED_MARK);
+    mpd_assign_modal_close();
+    mpd_map_refresh();
+}
+
+static void mpd_assign_option_cb(lv_event_t* e) {
+    const uint32_t packed = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    const uint8_t category = (uint8_t)(packed >> 8);
+    const uint8_t index = (uint8_t)(packed & 0xFFu);
+    using namespace red808_mpd218;
+    if (s_mpd_assign_capture.kind == MIDI_MAP_KIND_CC) {
+        mpd_assign_apply(index, 0, 0); // index == KnobActionType
+        return;
+    }
+    switch (category) {
+        case 0: mpd_assign_apply(PAD_TRIGGER_SAMPLE, index, 0); break;
+        case 1: mpd_assign_apply(PAD_TRIGGER_SYNTH, 0, index); break;
+        case 2: mpd_assign_apply(PAD_TRIGGER_SYNTH, 1, index); break;
+        case 3: mpd_assign_apply(PAD_TRIGGER_SYNTH, 2, index); break;
+        case 4: mpd_assign_apply(PAD_SELECT_PATTERN, index, 0); break;
+        case 5: mpd_assign_apply(PAD_TOGGLE_TRACK_MUTE, index, 0); break;
+        case 6:
+            if (index < 8) mpd_assign_apply(MPD_TRANSPORT_ACTIONS[index], 0, 0);
+            break;
+        default: break;
+    }
+}
+
+static void mpd_assign_build_options(void) {
+    if (!s_mpd_assign_grid) return;
+    lv_obj_clean(s_mpd_assign_grid);
+
+    uint8_t currentType = 0xFF, currentA0 = 0, currentA1 = 0;
+    mpd_assign_current_action(currentType, currentA0, currentA1);
+
+    auto makeOption = [&](const char* text, uint32_t packed, bool active) {
+        lv_obj_t* button = lv_btn_create(s_mpd_assign_grid);
+        lv_obj_set_size(button, 208, 52);
+        apply_control_button_style(button,
+            active ? RED808_CYAN : RED808_ACCENT2, active, 8);
+        lv_obj_t* label = lv_label_create(button);
+        lv_label_set_text(label, text);
+        lv_obj_set_width(label, 196);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label,
+            active ? lv_color_white() : RED808_TEXT, 0);
+        lv_obj_center(label);
+        lv_obj_add_event_cb(button, mpd_assign_option_cb, LV_EVENT_CLICKED,
+                            (void*)(uintptr_t)packed);
+    };
+
+    using namespace red808_mpd218;
+    if (s_mpd_assign_capture.kind == MIDI_MAP_KIND_CC) {
+        for (uint8_t action = KNOB_MASTER_VOLUME;
+             action <= KNOB_STEREO_WIDTH; ++action) {
+            makeOption(MPD_KNOB_ACTION_NAMES[action], action,
+                       currentType == action);
+        }
+        return;
+    }
+
+    char text[48] = {};
+    switch (s_mpd_assign_category) {
+        case 0:
+            for (uint8_t i = 0; i < 16; ++i) {
+                if (p4.sample_name[i][0] != '\0')
+                    snprintf(text, sizeof(text), "S%02u  %s", i + 1u,
+                             p4.sample_name[i]);
+                else
+                    snprintf(text, sizeof(text), "SAMPLE %02u", i + 1u);
+                makeOption(text, (0u << 8) | i,
+                           currentType == PAD_TRIGGER_SAMPLE && currentA0 == i);
+            }
+            break;
+        case 1:
+        case 2:
+        case 3: {
+            const uint8_t engine = s_mpd_assign_category - 1;
+            static const char* const engines[3] = {"808", "909", "505"};
+            for (uint8_t i = 0; i < 16; ++i) {
+                snprintf(text, sizeof(text), "%s %s", engines[engine],
+                         MPD_DRUM_PAD_NAMES[engine][i]);
+                makeOption(text, ((uint32_t)s_mpd_assign_category << 8) | i,
+                           currentType == PAD_TRIGGER_SYNTH
+                               && currentA0 == engine && currentA1 == i);
+            }
+            break;
+        }
+        case 4:
+            for (uint8_t i = 0; i < 16; ++i) {
+                snprintf(text, sizeof(text), "PATTERN %02u", i + 1u);
+                makeOption(text, (4u << 8) | i,
+                           currentType == PAD_SELECT_PATTERN && currentA0 == i);
+            }
+            break;
+        case 5:
+            for (uint8_t i = 0; i < 16; ++i) {
+                snprintf(text, sizeof(text), "MUTE TRACK %02u", i + 1u);
+                makeOption(text, (5u << 8) | i,
+                           currentType == PAD_TOGGLE_TRACK_MUTE
+                               && currentA0 == i);
+            }
+            break;
+        case 6:
+            for (uint8_t i = 0; i < 8; ++i)
+                makeOption(MPD_TRANSPORT_NAMES[i], (6u << 8) | i,
+                           currentType == MPD_TRANSPORT_ACTIONS[i]);
+            break;
+        default: break;
+    }
+}
+
+static void mpd_assign_category_cb(lv_event_t* e) {
+    const uint8_t category = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    if (category >= 7) return;
+    s_mpd_assign_category = category;
+    for (uint8_t i = 0; i < 7; ++i) {
+        lv_obj_t* button = s_mpd_assign_cat_btns[i];
+        if (!button) continue;
+        const bool selected = i == s_mpd_assign_category;
+        lv_obj_set_style_bg_color(button,
+            selected ? RED808_ACCENT : MPD_PANEL_BG, 0);
+        lv_obj_set_style_bg_grad_color(button,
+            selected ? RED808_ACCENT : MPD_PANEL_BG, 0);
+        lv_obj_t* label = lv_obj_get_child(button, 0);
+        if (label) lv_obj_set_style_text_color(label,
+            selected ? lv_color_white() : MPD_TEXT_FAINT, 0);
+    }
+    mpd_assign_build_options();
+}
+
+static void mpd_assign_remove_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (control_midi_map_clear(s_mpd_assign_capture.channel,
+                               s_mpd_assign_capture.kind,
+                               s_mpd_assign_capture.number))
+        mpd_assign_feedback("ASIGNACION ELIMINADA — vuelve el mapa de fabrica",
+                            RED808_WARNING);
+    else
+        mpd_assign_feedback("SIN ASIGNACION PROPIA — ya usa el mapa de fabrica",
+                            MPD_TEXT_FAINT);
+    mpd_assign_modal_close();
+    mpd_map_refresh();
+}
+
+static void mpd_assign_cancel_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    mpd_assign_modal_close();
+}
+
+static void mpd_assign_modal_open(const MidiLearnCapture& capture) {
+    mpd_assign_modal_close();
+    s_mpd_assign_capture = capture;
+    if (s_mpd_assign_capture.kind == MIDI_MAP_KIND_NOTE
+        && s_mpd_assign_category > 6)
+        s_mpd_assign_category = 0;
+
+    s_mpd_assign_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_mpd_assign_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_mpd_assign_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_mpd_assign_modal, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_mpd_assign_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_mpd_assign_modal, 0, 0);
+    lv_obj_clear_flag(s_mpd_assign_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_mpd_assign_modal, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* card = lv_obj_create(s_mpd_assign_modal);
+    lv_obj_set_size(card, 952, 552);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, MPD_BODY_BG, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    char captured[64] = {};
+    if (capture.kind == MIDI_MAP_KIND_NOTE) {
+        char note[6] = {};
+        mpd_note_name(capture.number, note, sizeof(note));
+        snprintf(captured, sizeof(captured),
+                 "ASIGNAR  ·  CH %u  ·  NOTA %u (%s)  ·  VEL %u",
+                 (unsigned)capture.channel + 1u, (unsigned)capture.number,
+                 note, (unsigned)capture.value);
+    } else {
+        snprintf(captured, sizeof(captured),
+                 "ASIGNAR  ·  CH %u  ·  CC %u  ·  VALOR %u",
+                 (unsigned)capture.channel + 1u, (unsigned)capture.number,
+                 (unsigned)capture.value);
+    }
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, captured);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 18, 12);
+
+    int gridTop = 56;
+    if (capture.kind == MIDI_MAP_KIND_NOTE) {
+        for (uint8_t i = 0; i < 7; ++i) {
+            lv_obj_t* button = lv_btn_create(card);
+            lv_obj_set_size(button, 126, 38);
+            lv_obj_set_pos(button, 18 + i * 132, 50);
+            apply_control_button_style(button, RED808_ACCENT2, false, 8);
+            lv_obj_t* label = lv_label_create(button);
+            lv_label_set_text(label, MPD_ASSIGN_CATEGORIES[i]);
+            lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+            lv_obj_center(label);
+            lv_obj_add_event_cb(button, mpd_assign_category_cb,
+                                LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+            s_mpd_assign_cat_btns[i] = button;
+        }
+        gridTop = 98;
+    }
+
+    s_mpd_assign_grid = lv_obj_create(card);
+    lv_obj_set_size(s_mpd_assign_grid, 916, 484 - gridTop);
+    lv_obj_set_pos(s_mpd_assign_grid, 18, gridTop);
+    lv_obj_set_style_bg_opa(s_mpd_assign_grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_mpd_assign_grid, 0, 0);
+    lv_obj_set_style_pad_all(s_mpd_assign_grid, 4, 0);
+    lv_obj_set_style_pad_row(s_mpd_assign_grid, 8, 0);
+    lv_obj_set_style_pad_column(s_mpd_assign_grid, 8, 0);
+    lv_obj_set_flex_flow(s_mpd_assign_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_scroll_dir(s_mpd_assign_grid, LV_DIR_VER);
+
+    lv_obj_t* remove = lv_btn_create(card);
+    lv_obj_set_size(remove, 260, 44);
+    lv_obj_set_pos(remove, 18, 494);
+    apply_control_button_style(remove, RED808_WARNING, false, 10);
+    lv_obj_t* removeLabel = lv_label_create(remove);
+    lv_label_set_text(removeLabel, "QUITAR ASIGNACION");
+    lv_obj_set_style_text_font(removeLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(removeLabel);
+    lv_obj_add_event_cb(remove, mpd_assign_remove_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* cancel = lv_btn_create(card);
+    lv_obj_set_size(cancel, 160, 44);
+    lv_obj_set_pos(cancel, 774, 494);
+    apply_control_button_style(cancel, RED808_BORDER, false, 10);
+    lv_obj_t* cancelLabel = lv_label_create(cancel);
+    lv_label_set_text(cancelLabel, "CANCELAR");
+    lv_obj_set_style_text_font(cancelLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancelLabel);
+    lv_obj_add_event_cb(cancel, mpd_assign_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    if (capture.kind == MIDI_MAP_KIND_NOTE) {
+        // Re-select the active category so its button paints highlighted.
+        for (uint8_t i = 0; i < 7; ++i) {
+            lv_obj_t* button = s_mpd_assign_cat_btns[i];
+            if (!button) continue;
+            const bool selected = i == s_mpd_assign_category;
+            lv_obj_set_style_bg_color(button,
+                selected ? RED808_ACCENT : MPD_PANEL_BG, 0);
+            lv_obj_set_style_bg_grad_color(button,
+                selected ? RED808_ACCENT : MPD_PANEL_BG, 0);
+            lv_obj_t* label = lv_obj_get_child(button, 0);
+            if (label) lv_obj_set_style_text_color(label,
+                selected ? lv_color_white() : MPD_TEXT_FAINT, 0);
+        }
+    }
+    mpd_assign_build_options();
+}
+
+// ── Device view ──────────────────────────────────────────────────────────────
 
 static void mpd_map_refresh(void) {
     using namespace red808_mpd218;
     if (!s_mpd_map_modal) return;
 
-    for (uint8_t i = 0; i < kDeviceCount; ++i)
-        mpd_map_set_selector_style(s_mpd_device_buttons[i], i == s_mpd_device);
-    for (uint8_t i = 0; i < kBankCount; ++i)
-        mpd_map_set_selector_style(s_mpd_bank_buttons[i], i == s_mpd_bank);
-    for (uint8_t i = 0; i < kLayerCount; ++i) {
-        mpd_map_set_selector_style(s_mpd_pad_layer_buttons[i],
-                                   i == s_mpd_pad_layer);
-        mpd_map_set_selector_style(s_mpd_knob_layer_buttons[i],
-                                   i == s_mpd_knob_layer);
-    }
-
-    const uint8_t channel = static_cast<uint8_t>(
-        1u + s_mpd_device * kChannelsPerDevice + s_mpd_bank);
+    const uint8_t channel = mpd_map_channel();
     const uint8_t noteBase = kPadNoteBase[s_mpd_pad_layer];
     const uint8_t ccBase = kKnobCcBase[s_mpd_knob_layer];
+
+    if (s_mpd_dev_btn) {
+        lv_obj_t* label = lv_obj_get_child(s_mpd_dev_btn, 0);
+        if (label) lv_label_set_text_fmt(label, "DEVICE %u",
+                                         (unsigned)s_mpd_device + 1u);
+    }
+    if (s_mpd_prog_btn) {
+        lv_obj_t* label = lv_obj_get_child(s_mpd_prog_btn, 0);
+        if (label) lv_label_set_text_fmt(label, "PROG %u",
+                                         (unsigned)s_mpd_bank + 1u);
+    }
+    if (s_mpd_padbank_btn) {
+        lv_obj_t* label = lv_obj_get_child(s_mpd_padbank_btn, 0);
+        if (label) lv_label_set_text_fmt(label, "PAD BANK %c",
+                                         'A' + s_mpd_pad_layer);
+    }
+    if (s_mpd_ctrlbank_btn) {
+        lv_obj_t* label = lv_obj_get_child(s_mpd_ctrlbank_btn, 0);
+        if (label) lv_label_set_text_fmt(label, "CTRL BANK %c",
+                                         'A' + s_mpd_knob_layer);
+    }
     if (s_mpd_map_summary_label) {
         lv_label_set_text_fmt(s_mpd_map_summary_label,
-            "DEVICE %u  |  BANK %u %s  |  MIDI CH %u  |  PADS %c N%u-%u  |  KNOBS %c CC%u-%u",
+            "DEV %u  ·  PROG %u %s  ·  MIDI CH %u  ·  PADS %c N%u-%u  ·  "
+            "KNOBS %c CC%u-%u  ·  %u APRENDIDOS",
             (unsigned)s_mpd_device + 1u, (unsigned)s_mpd_bank + 1u,
-            MPD_BANK_NAMES[s_mpd_bank], (unsigned)channel,
+            MPD_BANK_NAMES[s_mpd_bank], (unsigned)channel + 1u,
             'A' + s_mpd_pad_layer, (unsigned)noteBase,
             (unsigned)(noteBase + kPadsPerLayer - 1u),
             'A' + s_mpd_knob_layer, (unsigned)ccBase,
-            (unsigned)(ccBase + kKnobsPerLayer - 1u));
+            (unsigned)(ccBase + kKnobsPerLayer - 1u),
+            (unsigned)control_midi_map_count());
     }
 
     for (uint8_t pad = 0; pad < kPadsPerLayer; ++pad) {
         if (!s_mpd_pad_labels[pad]) continue;
+        const uint8_t note = (uint8_t)(noteBase + pad);
         char action[40] = {};
-        mpd_pad_action_text(kPadMap[s_mpd_bank][s_mpd_pad_layer][pad],
-                            action, sizeof(action));
-        lv_label_set_text_fmt(s_mpd_pad_labels[pad], "P%02u  ·  N%u\n%s",
-                              (unsigned)pad + 1u,
-                              (unsigned)(noteBase + pad), action);
+        MidiMapEntry learned{};
+        const bool hasLearned = control_midi_map_find(
+            channel, MIDI_MAP_KIND_NOTE, note, learned);
+        if (hasLearned)
+            mpd_pad_action_text(learned.action, learned.arg0, learned.arg1,
+                                action, sizeof(action));
+        else {
+            const PadAction& factory = kPadMap[s_mpd_bank][s_mpd_pad_layer][pad];
+            mpd_pad_action_text(factory.type, factory.arg0, factory.arg1,
+                                action, sizeof(action));
+        }
+        lv_label_set_text_fmt(s_mpd_pad_labels[pad], "PAD %u  N%u%s\n%s",
+                              (unsigned)pad + 1u, (unsigned)note,
+                              hasLearned ? "  *" : "", action);
+        lv_obj_set_style_text_color(s_mpd_pad_labels[pad],
+            hasLearned ? MPD_LEARNED_MARK : MPD_TEXT_MAIN, 0);
+        if (s_mpd_pad_cells[pad])
+            lv_obj_set_style_border_color(s_mpd_pad_cells[pad],
+                hasLearned ? MPD_LEARNED_MARK : MPD_PAD_RIM, 0);
     }
 
     for (uint8_t knob = 0; knob < kKnobsPerLayer; ++knob) {
         if (!s_mpd_knob_labels[knob]) continue;
-        const uint8_t action = static_cast<uint8_t>(
-            kKnobMap[s_mpd_bank][s_mpd_knob_layer][knob].type);
-        const char* name = action < sizeof(MPD_KNOB_ACTION_NAMES)
-                                      / sizeof(MPD_KNOB_ACTION_NAMES[0])
-            ? MPD_KNOB_ACTION_NAMES[action] : "NONE";
-        lv_label_set_text_fmt(s_mpd_knob_labels[knob], "K%u  ·  CC%u\n%s",
-                              (unsigned)knob + 1u,
-                              (unsigned)(ccBase + knob), name);
+        const uint8_t cc = (uint8_t)(ccBase + knob);
+        MidiMapEntry learned{};
+        const bool hasLearned = control_midi_map_find(
+            channel, MIDI_MAP_KIND_CC, cc, learned);
+        uint8_t action = hasLearned
+            ? learned.action
+            : (uint8_t)kKnobMap[s_mpd_bank][s_mpd_knob_layer][knob].type;
+        if (action > KNOB_STEREO_WIDTH) action = KNOB_NONE;
+        lv_label_set_text_fmt(s_mpd_knob_labels[knob], "K%u · CC%u%s\n%s",
+                              (unsigned)knob + 1u, (unsigned)cc,
+                              hasLearned ? " *" : "",
+                              MPD_KNOB_ACTION_NAMES[action]);
+        lv_obj_set_style_text_color(s_mpd_knob_labels[knob],
+            hasLearned ? MPD_LEARNED_MARK : MPD_TEXT_FAINT, 0);
     }
 }
 
-static void mpd_map_selector_cb(lv_event_t* e) {
-    const uint16_t packed = static_cast<uint16_t>(
-        reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
-    const uint8_t group = static_cast<uint8_t>(packed >> 8);
-    const uint8_t value = static_cast<uint8_t>(packed & 0xFFu);
+static void mpd_map_cycle_cb(lv_event_t* e) {
+    const uint8_t group = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
     switch (group) {
-        case 0:
-            if (value < red808_mpd218::kDeviceCount) s_mpd_device = value;
-            break;
-        case 1:
-            if (value < red808_mpd218::kBankCount) s_mpd_bank = value;
-            break;
-        case 2:
-            if (value < red808_mpd218::kLayerCount) s_mpd_pad_layer = value;
-            break;
-        case 3:
-            if (value < red808_mpd218::kLayerCount) s_mpd_knob_layer = value;
-            break;
+        case 0: s_mpd_device = (uint8_t)((s_mpd_device + 1u)
+                    % red808_mpd218::kDeviceCount); break;
+        case 1: s_mpd_bank = (uint8_t)((s_mpd_bank + 1u)
+                    % red808_mpd218::kBankCount); break;
+        case 2: s_mpd_pad_layer = (uint8_t)((s_mpd_pad_layer + 1u)
+                    % red808_mpd218::kLayerCount); break;
+        case 3: s_mpd_knob_layer = (uint8_t)((s_mpd_knob_layer + 1u)
+                    % red808_mpd218::kLayerCount); break;
         default: return;
     }
     mpd_map_refresh();
 }
 
-static lv_obj_t* mpd_map_make_selector(lv_obj_t* parent, int x, int y,
-                                       int width, const char* text,
-                                       uint8_t group, uint8_t value) {
-    lv_obj_t* button = lv_btn_create(parent);
-    lv_obj_set_size(button, width, 34);
-    lv_obj_set_pos(button, x, y);
-    apply_control_button_style(button, RED808_ACCENT2, false, 8);
-    lv_obj_set_style_bg_color(button, RED808_SURFACE, 0);
-    lv_obj_t* label = lv_label_create(button);
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
-    lv_obj_center(label);
-    const uint16_t packed = static_cast<uint16_t>(
-        (static_cast<uint16_t>(group) << 8) | value);
-    lv_obj_add_event_cb(button, mpd_map_selector_cb, LV_EVENT_CLICKED,
-                        reinterpret_cast<void*>(static_cast<uintptr_t>(packed)));
-    return button;
+static void mpd_map_pad_cb(lv_event_t* e) {
+    const uint8_t pad = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    if (pad >= 16) return;
+    MidiLearnCapture capture{};
+    capture.channel = mpd_map_channel();
+    capture.kind = MIDI_MAP_KIND_NOTE;
+    capture.number = (uint8_t)(red808_mpd218::kPadNoteBase[s_mpd_pad_layer]
+                               + pad);
+    capture.value = 100;
+    mpd_assign_modal_open(capture);
+}
+
+static void mpd_map_knob_cb(lv_event_t* e) {
+    const uint8_t knob = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    if (knob >= 6) return;
+    MidiLearnCapture capture{};
+    capture.channel = mpd_map_channel();
+    capture.kind = MIDI_MAP_KIND_CC;
+    capture.number = (uint8_t)(red808_mpd218::kKnobCcBase[s_mpd_knob_layer]
+                               + knob);
+    capture.value = 0;
+    mpd_assign_modal_open(capture);
+}
+
+static void mpd_map_learn_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    const bool arm = !control_midi_learn_armed();
+    control_midi_learn_arm(arm);
+    if (arm)
+        mpd_assign_feedback("LEARN ACTIVO — toca un pad o mueve un knob del AKAI",
+                            MPD_LEARN_RED);
+    else
+        mpd_assign_feedback("LEARN cancelado", MPD_TEXT_FAINT);
+}
+
+static void mpd_map_clear_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    control_midi_map_clear_all();
+    mpd_assign_feedback("MAPA APRENDIDO BORRADO — mapa de fabrica activo",
+                        RED808_WARNING);
+    mpd_map_refresh();
 }
 
 static void mpd_map_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    control_midi_learn_arm(false);
+    mpd_assign_modal_close();
     if (s_mpd_map_modal) lv_obj_del(s_mpd_map_modal);
     s_mpd_map_modal = NULL;
     s_mpd_map_summary_label = NULL;
-    memset(s_mpd_device_buttons, 0, sizeof(s_mpd_device_buttons));
-    memset(s_mpd_bank_buttons, 0, sizeof(s_mpd_bank_buttons));
-    memset(s_mpd_pad_layer_buttons, 0, sizeof(s_mpd_pad_layer_buttons));
-    memset(s_mpd_knob_layer_buttons, 0, sizeof(s_mpd_knob_layer_buttons));
+    s_mpd_activity_label = NULL;
+    s_mpd_learn_btn = NULL;
+    s_mpd_learn_label = NULL;
+    s_mpd_dev_btn = NULL;
+    s_mpd_prog_btn = NULL;
+    s_mpd_padbank_btn = NULL;
+    s_mpd_ctrlbank_btn = NULL;
+    memset(s_mpd_pad_cells, 0, sizeof(s_mpd_pad_cells));
     memset(s_mpd_pad_labels, 0, sizeof(s_mpd_pad_labels));
+    memset(s_mpd_knob_cells, 0, sizeof(s_mpd_knob_cells));
+    memset(s_mpd_knob_arcs, 0, sizeof(s_mpd_knob_arcs));
     memset(s_mpd_knob_labels, 0, sizeof(s_mpd_knob_labels));
+}
+
+static lv_obj_t* mpd_map_make_button(lv_obj_t* parent, int x, int y, int w,
+                                     int h, const char* text,
+                                     lv_event_cb_t cb, uint8_t userValue) {
+    lv_obj_t* button = lv_btn_create(parent);
+    lv_obj_set_size(button, w, h);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_set_style_radius(button, 6, 0);
+    lv_obj_set_style_bg_color(button, MPD_PANEL_BG, 0);
+    lv_obj_set_style_bg_grad_color(button, MPD_BODY_BG, 0);
+    lv_obj_set_style_bg_grad_dir(button, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button, lv_color_hex(0x3A3A3A), 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_t* label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, MPD_TEXT_MAIN, 0);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED,
+                        (void*)(uintptr_t)userValue);
+    return button;
 }
 
 static void mpd_map_modal_open_cb(lv_event_t* e) {
     LV_UNUSED(e);
     if (s_mpd_map_modal) { mpd_map_modal_close_cb(NULL); return; }
+
+    // Ignore captures/activity produced before the screen opened.
+    s_mpd_seen_capture_rev = control_midi_capture_revision();
+    s_mpd_seen_activity_rev = control_midi_activity_revision();
+    memset((void*)s_mpd_pad_glow_until, 0, sizeof(s_mpd_pad_glow_until));
+    memset((void*)s_mpd_knob_glow_until, 0, sizeof(s_mpd_knob_glow_until));
 
     s_mpd_map_modal = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_mpd_map_modal, LV_HOR_RES, LV_VER_RES);
@@ -2956,23 +3439,28 @@ static void mpd_map_modal_open_cb(lv_event_t* e) {
                         LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(s_mpd_map_modal);
-    lv_obj_set_size(card, 984, 568);
+    lv_obj_set_size(card, 984, 576);
     lv_obj_center(card);
-    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
-    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
-    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_color(card, MPD_BODY_BG, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(card, 2, 0);
-    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
-    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x2C2C2C), 0);
+    lv_obj_set_style_radius(card, 18, 0);
     lv_obj_set_style_pad_all(card, 0, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
 
+    lv_obj_t* brand = lv_label_create(card);
+    lv_label_set_text(brand, "AKAI  MPD218");
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(brand, MPD_TEXT_MAIN, 0);
+    lv_obj_set_pos(brand, 18, 10);
+
     lv_obj_t* title = lv_label_create(card);
-    lv_label_set_text(title, "MIDI MAP  /  AKAI MPD218 + CME H4MIDI");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
-    lv_obj_set_pos(title, 18, 12);
+    lv_label_set_text(title, "MIDI MAP  +  LEARN");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(title, MPD_PAD_RIM, 0);
+    lv_obj_set_pos(title, 200, 18);
 
     lv_obj_t* close = lv_btn_create(card);
     lv_obj_set_size(close, 78, 34);
@@ -2985,102 +3473,257 @@ static void mpd_map_modal_open_cb(lv_event_t* e) {
     lv_obj_add_event_cb(close, [](lv_event_t*) { mpd_map_modal_close_cb(NULL); },
                         LV_EVENT_CLICKED, NULL);
 
-    auto makeGroupLabel = [&](int x, const char* text) {
-        lv_obj_t* label = lv_label_create(card);
-        lv_label_set_text(label, text);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
-        lv_obj_set_style_text_color(label, RED808_TEXT_DIM, 0);
-        lv_obj_set_pos(label, x, 48);
-    };
-    makeGroupLabel(18, "DEVICE / CHANNEL SET");
-    makeGroupLabel(240, "PROGRAM / BANK");
-    makeGroupLabel(530, "PAD BANK");
-    makeGroupLabel(735, "CTRL BANK");
-
-    for (uint8_t device = 0; device < red808_mpd218::kDeviceCount; ++device) {
-        char text[12] = {};
-        snprintf(text, sizeof(text), "DEV %u", (unsigned)device + 1u);
-        s_mpd_device_buttons[device] = mpd_map_make_selector(
-            card, 18 + device * 100, 62, 94, text, 0, device);
-    }
-    for (uint8_t bank = 0; bank < red808_mpd218::kBankCount; ++bank) {
-        char text[10] = {};
-        snprintf(text, sizeof(text), "BANK %u", (unsigned)bank + 1u);
-        s_mpd_bank_buttons[bank] = mpd_map_make_selector(
-            card, 240 + bank * 91, 62, 85, text, 1, bank);
-    }
-    for (uint8_t layer = 0; layer < red808_mpd218::kLayerCount; ++layer) {
-        char text[2] = {static_cast<char>('A' + layer), '\0'};
-        s_mpd_pad_layer_buttons[layer] = mpd_map_make_selector(
-            card, 530 + layer * 57, 62, 51, text, 2, layer);
-        s_mpd_knob_layer_buttons[layer] = mpd_map_make_selector(
-            card, 735 + layer * 57, 62, 51, text, 3, layer);
-    }
-
     s_mpd_map_summary_label = lv_label_create(card);
     lv_obj_set_width(s_mpd_map_summary_label, 948);
-    lv_obj_set_pos(s_mpd_map_summary_label, 18, 108);
-    lv_obj_set_style_text_font(s_mpd_map_summary_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_mpd_map_summary_label, RED808_ACCENT, 0);
-    lv_obj_set_style_text_align(s_mpd_map_summary_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_mpd_map_summary_label, 18, 40);
+    lv_obj_set_style_text_font(s_mpd_map_summary_label,
+                               &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_mpd_map_summary_label, MPD_TEXT_FAINT, 0);
 
-    for (uint8_t pad = 0; pad < red808_mpd218::kPadsPerLayer; ++pad) {
+    // ── Left panel: knobs + banks + LEARN, like the device front plate ──
+    lv_obj_t* panel = lv_obj_create(card);
+    lv_obj_set_size(panel, 330, 460);
+    lv_obj_set_pos(panel, 18, 58);
+    lv_obj_set_style_bg_color(panel, MPD_PANEL_BG, 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_radius(panel, 12, 0);
+    lv_obj_set_style_pad_all(panel, 0, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+
+    // Knob cells. Physical numbering per row (top→bottom): 5·6, 3·4, 1·2.
+    for (uint8_t row = 0; row < 3; ++row) {
+        for (uint8_t col = 0; col < 2; ++col) {
+            const uint8_t number = (uint8_t)((2 - row) * 2 + col + 1);
+            const uint8_t knob = (uint8_t)(number - 1);
+            lv_obj_t* cell = lv_obj_create(panel);
+            lv_obj_set_size(cell, 150, 100);
+            lv_obj_set_pos(cell, 12 + col * 158, 6 + row * 106);
+            lv_obj_set_style_bg_color(cell, MPD_BODY_BG, 0);
+            lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(cell, 1, 0);
+            lv_obj_set_style_border_color(cell, lv_color_hex(0x2A2A2A), 0);
+            lv_obj_set_style_radius(cell, 10, 0);
+            lv_obj_set_style_pad_all(cell, 2, 0);
+            lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(cell, mpd_map_knob_cb, LV_EVENT_CLICKED,
+                                (void*)(uintptr_t)knob);
+            s_mpd_knob_cells[knob] = cell;
+
+            lv_obj_t* arc = lv_arc_create(cell);
+            lv_obj_set_size(arc, 52, 52);
+            lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 0);
+            lv_arc_set_bg_angles(arc, 135, 45);
+            lv_arc_set_range(arc, 0, 127);
+            lv_arc_set_value(arc, 0);
+            lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+            lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_arc_width(arc, 4, LV_PART_MAIN);
+            lv_obj_set_style_arc_color(arc, lv_color_hex(0x333333),
+                                       LV_PART_MAIN);
+            lv_obj_set_style_arc_width(arc, 4, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(arc, MPD_PAD_GLOW, LV_PART_INDICATOR);
+            s_mpd_knob_arcs[knob] = arc;
+
+            lv_obj_t* num = lv_label_create(arc);
+            lv_label_set_text_fmt(num, "%u", (unsigned)number);
+            lv_obj_set_style_text_font(num, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(num, MPD_TEXT_MAIN, 0);
+            lv_obj_center(num);
+
+            lv_obj_t* label = lv_label_create(cell);
+            lv_obj_set_width(label, 142);
+            lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(label, MPD_TEXT_FAINT, 0);
+            lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -2);
+            s_mpd_knob_labels[knob] = label;
+        }
+    }
+
+    s_mpd_dev_btn = mpd_map_make_button(panel, 12, 326, 150, 34, "DEVICE 1",
+                                        mpd_map_cycle_cb, 0);
+    s_mpd_prog_btn = mpd_map_make_button(panel, 170, 326, 150, 34, "PROG 1",
+                                         mpd_map_cycle_cb, 1);
+    s_mpd_padbank_btn = mpd_map_make_button(panel, 12, 366, 150, 34,
+                                            "PAD BANK A", mpd_map_cycle_cb, 2);
+    s_mpd_ctrlbank_btn = mpd_map_make_button(panel, 170, 366, 150, 34,
+                                             "CTRL BANK A", mpd_map_cycle_cb,
+                                             3);
+
+    s_mpd_learn_btn = lv_btn_create(panel);
+    lv_obj_set_size(s_mpd_learn_btn, 150, 46);
+    lv_obj_set_pos(s_mpd_learn_btn, 12, 408);
+    lv_obj_set_style_radius(s_mpd_learn_btn, 8, 0);
+    lv_obj_set_style_bg_color(s_mpd_learn_btn, MPD_LEARN_RED, 0);
+    lv_obj_set_style_bg_grad_color(s_mpd_learn_btn, lv_color_hex(0x7A130C), 0);
+    lv_obj_set_style_bg_grad_dir(s_mpd_learn_btn, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_width(s_mpd_learn_btn, 2, 0);
+    lv_obj_set_style_border_color(s_mpd_learn_btn, lv_color_hex(0x581008), 0);
+    lv_obj_set_style_shadow_width(s_mpd_learn_btn, 0, 0);
+    s_mpd_learn_label = lv_label_create(s_mpd_learn_btn);
+    lv_label_set_text(s_mpd_learn_label, "LEARN");
+    lv_obj_set_style_text_font(s_mpd_learn_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(s_mpd_learn_label, lv_color_white(), 0);
+    lv_obj_center(s_mpd_learn_label);
+    lv_obj_add_event_cb(s_mpd_learn_btn, mpd_map_learn_cb, LV_EVENT_CLICKED,
+                        NULL);
+
+    lv_obj_t* clearBtn = mpd_map_make_button(panel, 170, 408, 150, 46,
+                                             "CLEAR MAP", mpd_map_clear_cb, 0);
+    LV_UNUSED(clearBtn);
+
+    // ── Right side: 4x4 pad matrix, PAD 13..16 on the top row ──
+    for (uint8_t pad = 0; pad < 16; ++pad) {
         const int column = pad % 4;
-        const int line = pad / 4;
-        lv_obj_t* panel = lv_obj_create(card);
-        lv_obj_set_size(panel, 150, 71);
-        lv_obj_set_pos(panel, 18 + column * 158, 136 + line * 79);
-        lv_obj_set_style_bg_color(panel, RED808_SURFACE, 0);
-        lv_obj_set_style_bg_opa(panel, LV_OPA_90, 0);
-        lv_obj_set_style_border_width(panel, 1, 0);
-        lv_obj_set_style_border_color(panel, RED808_ACCENT2, 0);
-        lv_obj_set_style_radius(panel, 10, 0);
-        lv_obj_set_style_pad_all(panel, 4, 0);
-        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-        s_mpd_pad_labels[pad] = lv_label_create(panel);
-        lv_obj_set_width(s_mpd_pad_labels[pad], 140);
-        lv_label_set_long_mode(s_mpd_pad_labels[pad], LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_align(s_mpd_pad_labels[pad], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_font(s_mpd_pad_labels[pad], &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(s_mpd_pad_labels[pad], RED808_TEXT, 0);
-        lv_obj_center(s_mpd_pad_labels[pad]);
+        const int row = 3 - pad / 4; // hardware order: 13..16 up, 1..4 down
+        lv_obj_t* cell = lv_obj_create(card);
+        lv_obj_set_size(cell, 146, 118);
+        lv_obj_set_pos(cell, 360 + column * 154, 58 + row * 126);
+        lv_obj_set_style_bg_color(cell, MPD_PAD_BG, 0);
+        lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(cell, 2, 0);
+        lv_obj_set_style_border_color(cell, MPD_PAD_RIM, 0);
+        lv_obj_set_style_radius(cell, 8, 0);
+        lv_obj_set_style_pad_all(cell, 4, 0);
+        lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(cell, mpd_map_pad_cb, LV_EVENT_CLICKED,
+                            (void*)(uintptr_t)pad);
+        s_mpd_pad_cells[pad] = cell;
+
+        lv_obj_t* label = lv_label_create(cell);
+        lv_obj_set_width(label, 134);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, MPD_TEXT_MAIN, 0);
+        lv_obj_center(label);
+        s_mpd_pad_labels[pad] = label;
     }
 
-    for (uint8_t knob = 0; knob < red808_mpd218::kKnobsPerLayer; ++knob) {
-        const int column = knob % 2;
-        const int line = knob / 2;
-        lv_obj_t* panel = lv_obj_create(card);
-        lv_obj_set_size(panel, 143, 71);
-        lv_obj_set_pos(panel, 660 + column * 151, 136 + line * 79);
-        lv_obj_set_style_bg_color(panel, RED808_PANEL, 0);
-        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(panel, 2, 0);
-        lv_obj_set_style_border_color(panel, RED808_CYAN, 0);
-        lv_obj_set_style_radius(panel, 10, 0);
-        lv_obj_set_style_pad_all(panel, 4, 0);
-        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-        s_mpd_knob_labels[knob] = lv_label_create(panel);
-        lv_obj_set_width(s_mpd_knob_labels[knob], 133);
-        lv_label_set_long_mode(s_mpd_knob_labels[knob], LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_align(s_mpd_knob_labels[knob], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_font(s_mpd_knob_labels[knob], &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(s_mpd_knob_labels[knob], RED808_CYAN, 0);
-        lv_obj_center(s_mpd_knob_labels[knob]);
-    }
-
-    lv_obj_t* hint = lv_label_create(card);
-    lv_obj_set_width(hint, 948);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(hint,
-        "REFERENCE MAP: DEV 1 uses CH 1/2/3; DEV 2 uses CH 4/5/6. "
-        "PAD BANK and CTRL BANK A/B/C are independent. H4 merge: allow clock/transport from one master only.\n"
-        "The selected bank/layers above are a setup view; the merged MIDI stream cannot report which physical H4 input was used.");
-    lv_obj_set_pos(hint, 18, 462);
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    s_mpd_activity_label = lv_label_create(card);
+    lv_obj_set_width(s_mpd_activity_label, 330);
+    lv_label_set_long_mode(s_mpd_activity_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_pos(s_mpd_activity_label, 18, 524);
+    lv_obj_set_style_text_font(s_mpd_activity_label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_mpd_activity_label, MPD_TEXT_FAINT, 0);
+    lv_label_set_text(s_mpd_activity_label,
+                      "Toca un pad de esta pantalla para asignarlo, o pulsa "
+                      "LEARN y toca el AKAI");
 
     mpd_map_refresh();
+}
+
+// Periodic tick from the LVGL task: LEARN capture handoff, pad/knob glow on
+// incoming MIDI, and LEARN button blink.
+static void mpd_map_modal_update(void) {
+    if (!s_mpd_map_modal) return;
+    const unsigned long now = millis();
+
+    const uint32_t captureRev = control_midi_capture_revision();
+    if (captureRev != s_mpd_seen_capture_rev) {
+        s_mpd_seen_capture_rev = captureRev;
+        mpd_assign_modal_open(control_midi_capture());
+    }
+
+    const uint32_t activityRev = control_midi_activity_revision();
+    if (activityRev != s_mpd_seen_activity_rev) {
+        s_mpd_seen_activity_rev = activityRev;
+        uint8_t status = 0, data0 = 0, data1 = 0;
+        control_midi_last_activity(status, data0, data1);
+        const uint8_t type = status & 0xF0u;
+        const uint8_t channel = status & 0x0Fu;
+        uint8_t device = 0, bank = 0, layer = 0, index = 0;
+        if (type == 0x90u && data1 > 0) {
+            if (s_mpd_activity_label) {
+                char note[6] = {};
+                mpd_note_name(data0, note, sizeof(note));
+                lv_label_set_text_fmt(s_mpd_activity_label,
+                    "IN  CH%u  NOTA %u (%s)  VEL %u",
+                    (unsigned)channel + 1u, (unsigned)data0, note,
+                    (unsigned)data1);
+                lv_obj_set_style_text_color(s_mpd_activity_label,
+                                            MPD_PAD_GLOW, 0);
+            }
+            int glowPad = -1;
+            if (red808_mpd218::DecodePad(channel, data0, device, bank, layer,
+                                         index))
+                glowPad = index;
+            else if (data0 >= red808_mpd218::kPadNoteBase[s_mpd_pad_layer]
+                     && data0 < red808_mpd218::kPadNoteBase[s_mpd_pad_layer]
+                                + 16)
+                glowPad = data0
+                        - red808_mpd218::kPadNoteBase[s_mpd_pad_layer];
+            if (glowPad >= 0 && glowPad < 16)
+                s_mpd_pad_glow_until[glowPad] = now + 160;
+        } else if (type == 0xB0u) {
+            if (s_mpd_activity_label) {
+                lv_label_set_text_fmt(s_mpd_activity_label,
+                    "IN  CH%u  CC %u  VALOR %u",
+                    (unsigned)channel + 1u, (unsigned)data0, (unsigned)data1);
+                lv_obj_set_style_text_color(s_mpd_activity_label,
+                                            MPD_LEARNED_MARK, 0);
+            }
+            int glowKnob = -1;
+            if (red808_mpd218::DecodeKnob(channel, data0, device, bank, layer,
+                                          index))
+                glowKnob = index;
+            else if (data0 >= red808_mpd218::kKnobCcBase[s_mpd_knob_layer]
+                     && data0 < red808_mpd218::kKnobCcBase[s_mpd_knob_layer]
+                                + 6)
+                glowKnob = data0
+                         - red808_mpd218::kKnobCcBase[s_mpd_knob_layer];
+            if (glowKnob >= 0 && glowKnob < 6) {
+                s_mpd_knob_glow_until[glowKnob] = now + 300;
+                if (s_mpd_knob_arcs[glowKnob])
+                    lv_arc_set_value(s_mpd_knob_arcs[glowKnob], data1);
+            }
+        }
+    }
+
+    // Pad/knob glow transitions (only touch styles on edges).
+    static bool padGlowing[16] = {};
+    for (uint8_t pad = 0; pad < 16; ++pad) {
+        if (!s_mpd_pad_cells[pad]) { padGlowing[pad] = false; continue; }
+        const bool glow = now < s_mpd_pad_glow_until[pad];
+        if (glow == padGlowing[pad]) continue;
+        padGlowing[pad] = glow;
+        lv_obj_set_style_bg_color(s_mpd_pad_cells[pad],
+            glow ? MPD_PAD_GLOW : MPD_PAD_BG, 0);
+        lv_obj_set_style_border_width(s_mpd_pad_cells[pad], glow ? 4 : 2, 0);
+    }
+    static bool knobGlowing[6] = {};
+    for (uint8_t knob = 0; knob < 6; ++knob) {
+        if (!s_mpd_knob_cells[knob]) { knobGlowing[knob] = false; continue; }
+        const bool glow = now < s_mpd_knob_glow_until[knob];
+        if (glow == knobGlowing[knob]) continue;
+        knobGlowing[knob] = glow;
+        lv_obj_set_style_border_color(s_mpd_knob_cells[knob],
+            glow ? MPD_PAD_GLOW : lv_color_hex(0x2A2A2A), 0);
+    }
+
+    // LEARN key: solid red normally, blinking bright while armed.
+    if (s_mpd_learn_btn) {
+        static bool lastArmed = false;
+        static bool lastBlink = false;
+        const bool armed = control_midi_learn_armed();
+        const bool blink = armed && ((now / 250u) & 1u);
+        if (armed != lastArmed || blink != lastBlink) {
+            lastArmed = armed;
+            lastBlink = blink;
+            lv_obj_set_style_bg_color(s_mpd_learn_btn,
+                blink ? lv_color_hex(0xFF5040)
+                      : (armed ? lv_color_hex(0xE8281A) : MPD_LEARN_RED), 0);
+            if (s_mpd_learn_label)
+                lv_label_set_text(s_mpd_learn_label,
+                                  armed ? "LEARN..." : "LEARN");
+        }
+    }
 }
 
 static void pod_status_modal_update(void) {
@@ -13660,6 +14303,8 @@ void ui_update_current_screen(void) {
     // STATUS is a global overlay and may be opened from any screen. Keep its
     // hardware values live regardless of the active per-screen updater.
     pod_status_modal_update();
+    // MIDI MAP overlay: LEARN capture handoff + pad/knob glow on MIDI input.
+    mpd_map_modal_update();
 
     // Force fx_screen repaint immediately after a local/USB FX change.
     // Must be BEFORE the period throttle so dirty updates aren't delayed up to 33ms.

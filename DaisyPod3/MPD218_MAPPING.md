@@ -311,6 +311,27 @@ Dos relojes simultáneos producirían cambios de tempo y transporte impredecible
 - `MIDI Reset`: panic global de samples y sintes.
 - El control USB-C del P4 y MIDI TRS funcionan simultáneamente.
 
+## 7b. MIDI LEARN desde la pantalla P4
+
+`STATUS > CONTROL MAP > MIDI MAP` muestra una réplica del MPD218 (16 pads en
+matriz 4×4 con PAD 13-16 arriba, 6 knobs en filas 5·6 / 3·4 / 1·2) con botones
+`PROG`, `PAD BANK`, `CTRL BANK`, `DEVICE` y la tecla roja `LEARN`.
+
+- **LEARN**: pulsa la tecla, toca un pad o mueve un knob del AKAI, y se abre el
+  selector de asignación (samples, TR-808/909/505, patrones, mutes, transporte
+  para notas; las 54 acciones de knob para CC). También puedes tocar cualquier
+  pad o knob de la pantalla para asignar esa posición sin hardware.
+- Las asignaciones aprendidas se guardan en la NVS del P4, se reenvían a Daisy
+  en cada conexión (`0xE9 MIDI_MAP_SET`) y **tienen prioridad sobre el mapa
+  compilado**, en cualquier canal MIDI 1-16. Un MPD218 de fábrica (sin los
+  programas R8) funciona directamente tras aprender sus pads.
+- Daisy reenvía los eventos crudos del bus MIDI al P4 (`0xE8
+  MIDI_GET_EVENTS`, sondeado cada 50 ms): el pad correspondiente se ilumina en
+  la pantalla LIVE y en la vista MPD218, y el LED del Pod parpadea por la
+  actividad de pads como hasta ahora.
+- `CLEAR MAP` borra todas las asignaciones aprendidas y vuelve al mapa de
+  fábrica; `QUITAR ASIGNACION` elimina solo la entrada seleccionada.
+
 ## 8. Prueba rápida del lunes
 
 1. Cargar los tres programas A en canales 1/2/3 y los tres B en 4/5/6.

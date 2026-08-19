@@ -40,6 +40,19 @@ encolar más de una respuesta CDC a la vez:
 - `0xE0 GET_STATUS`: SD, máscara de samples y engines reales de las 16 pistas.
 - `0xE6 POD_GET_STATE`: configuración, posiciones físicas, LED y valores canónicos.
 - `0xE7 POD_SET_CONFIG`: nueva asignación; Daisy valida y devuelve su estado canónico.
+- `0xE8 MIDI_GET_EVENTS`: drena el monitor MIDI del MPD218 (hasta 32 eventos
+  crudos `{status, data0, data1}` por consulta). P4 lo sondea cada 50 ms cuando
+  el PONG anuncia la capacidad `RED808_CAP_MIDI_MONITOR (0x0004)`; alimenta el
+  MIDI LEARN y la iluminación de pads en pantalla.
+
+El mapa MIDI aprendido viaja con `0xE9 MIDI_MAP_SET` (fire-and-forget, sin
+respuesta): `[count(1), {channel, kind, number, action, arg0, arg1}×count]`,
+hasta 64 entradas. `kind` 0 = nota (acciones de pad), 1 = CC (acciones de
+knob); los códigos de acción son los `PadActionType`/`KnobActionType` de
+`mpd218_mapping.h`. Daisy aplica estas entradas con prioridad sobre el mapa
+compilado y en cualquier canal 1-16, de modo que un MPD218 sin reprogramar
+también funciona tras un LEARN. P4 es el dueño del mapa: lo persiste en su
+NVS y lo reenvía en cada reconexión.
 
 `PodConfigPayload` usa la versión 7 e incluye las seis asignaciones físicas de
 DaisyPod, cuatro asignaciones para los SEN0502 y una para el Mini Fader conectado

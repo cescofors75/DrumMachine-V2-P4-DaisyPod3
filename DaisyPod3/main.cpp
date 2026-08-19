@@ -424,12 +424,15 @@ static inline void DspProfBlockDone() {}
 #define CMD_DIAG_PERF_STRESS  0xE5  /* [mode(1): 0=off,1=on,2=reset metrics] */
 #define CMD_POD_GET_STATE     0xE6  /* DaisyPod physical controls/config */
 #define CMD_POD_SET_CONFIG    0xE7  /* [PodConfigPayload] */
+#define CMD_MIDI_GET_EVENTS   0xE8  /* drain MIDI monitor → [count, {status,d0,d1}×n] */
+#define CMD_MIDI_MAP_SET      0xE9  /* [count(1), {ch,kind,num,action,a0,a1}×count] */
 #define CMD_PING              0xEE
 #define CMD_RESET             0xEF
 
 #define RED808_PROTOCOL_VERSION       0x0203u
 #define RED808_CAP_EXTENDED_PONG      0x0001u
 #define RED808_CAP_USB_RX_DIAGNOSTICS 0x0002u
+#define RED808_CAP_MIDI_MONITOR       0x0004u
 
 /* Synth Engine */
 #define CMD_SYNTH_TRIGGER     0xC0  /* [engine(1), instrument(1), velocity(1)] */
@@ -5822,6 +5825,59 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
     audioLoadMeter.OnBlockEnd();
 }
 
+/* ── MIDI monitor + user MIDI map (P4 MIDI LEARN) ──────────────────────
+ * ProcessMpdMidi() and ProcessCommand() both run in the main loop, so the
+ * ring and the map need no ISR protection. The monitor keeps the raw wire
+ * events (note-on/off + CC) so P4 can implement LEARN and pad lighting;
+ * the user map is uploaded by P4 (CMD_MIDI_MAP_SET) and takes precedence
+ * over the compiled MPD218 factory tables, on any MIDI channel. */
+#define MIDI_MON_RING_SIZE  64u /* power of two */
+#define MIDI_MAP_KIND_NOTE  0u
+#define MIDI_MAP_KIND_CC    1u
+#define MIDI_MAP_MAX_ENTRIES 64u
+
+struct __attribute__((packed)) MidiMapEntry
+{
+    uint8_t channel; /* 0-15 zero-based */
+    uint8_t kind;    /* MIDI_MAP_KIND_* */
+    uint8_t number;  /* note or CC 0-127 */
+    uint8_t action;  /* PadActionType (NOTE) / KnobActionType (CC) */
+    uint8_t arg0;
+    uint8_t arg1;
+};
+
+static uint8_t midiMonRing[MIDI_MON_RING_SIZE][3];
+static uint8_t midiMonHead = 0;
+static uint8_t midiMonTail = 0;
+
+static MidiMapEntry midiUserMap[MIDI_MAP_MAX_ENTRIES];
+static uint8_t      midiUserMapCount = 0;
+
+static void MidiMonitorPush(uint8_t status, uint8_t data0, uint8_t data1)
+{
+    const uint8_t next = (midiMonHead + 1u) & (MIDI_MON_RING_SIZE - 1u);
+    if(next == midiMonTail)
+        midiMonTail = (midiMonTail + 1u) & (MIDI_MON_RING_SIZE - 1u);
+    midiMonRing[midiMonHead][0] = status;
+    midiMonRing[midiMonHead][1] = data0;
+    midiMonRing[midiMonHead][2] = data1;
+    midiMonHead = next;
+}
+
+static const MidiMapEntry* MidiUserMapFind(uint8_t channel,
+                                           uint8_t kind,
+                                           uint8_t number)
+{
+    for(uint8_t i = 0; i < midiUserMapCount; ++i)
+    {
+        const MidiMapEntry& entry = midiUserMap[i];
+        if(entry.channel == channel && entry.kind == kind
+           && entry.number == number)
+            return &entry;
+    }
+    return nullptr;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  22. BUILD RESPONSE
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5983,7 +6039,8 @@ static void ProcessCommand()
         pong.uptimeMs = hw.system.GetNow();
         pong.protocolVersion = RED808_PROTOCOL_VERSION;
         pong.capabilityFlags = RED808_CAP_EXTENDED_PONG
-                             | RED808_CAP_USB_RX_DIAGNOSTICS;
+                             | RED808_CAP_USB_RX_DIAGNOSTICS
+                             | RED808_CAP_MIDI_MONITOR;
         pong.rxDrops = usbRxDrops;
         pong.protocolErrors = spiErrCnt;
         BuildResponse(CMD_PING, hdr->sequence,
@@ -7637,6 +7694,56 @@ static void ProcessCommand()
         BuildPodState(state);
         BuildResponse(CMD_POD_SET_CONFIG, hdr->sequence,
                       reinterpret_cast<const uint8_t*>(&state), sizeof(state));
+        return;
+    }
+
+    case CMD_MIDI_GET_EVENTS: {
+        /* Drain the MPD218 monitor ring → up to 32 raw events per poll.
+         * Response: [count(1)] + [status,data0,data1] * count. */
+        uint8_t buf[1 + 32 * 3];
+        uint8_t n = 0;
+        while(midiMonTail != midiMonHead && n < 32u)
+        {
+            buf[1 + n * 3 + 0] = midiMonRing[midiMonTail][0];
+            buf[1 + n * 3 + 1] = midiMonRing[midiMonTail][1];
+            buf[1 + n * 3 + 2] = midiMonRing[midiMonTail][2];
+            midiMonTail = (midiMonTail + 1u) & (MIDI_MON_RING_SIZE - 1u);
+            n++;
+        }
+        buf[0] = n;
+        BuildResponse(CMD_MIDI_GET_EVENTS, hdr->sequence, buf,
+                      static_cast<uint16_t>(1 + n * 3));
+        return;
+    }
+
+    case CMD_MIDI_MAP_SET: {
+        /* Full replacement of the learned map. Fire-and-forget: P4 persists
+         * the map in its NVS and re-uploads it on every reconnection, so no
+         * response slot is consumed (telemetry may be pending). */
+        if(len < 1) return;
+        uint8_t count = p[0];
+        if(count > MIDI_MAP_MAX_ENTRIES) count = MIDI_MAP_MAX_ENTRIES;
+        if(len < 1u + count * sizeof(MidiMapEntry)) return;
+        uint8_t accepted = 0;
+        for(uint8_t i = 0; i < count; ++i)
+        {
+            MidiMapEntry entry;
+            memcpy(&entry, p + 1 + i * sizeof(MidiMapEntry), sizeof(entry));
+            if(entry.channel > 15u || entry.number > 127u) continue;
+            if(entry.kind == MIDI_MAP_KIND_NOTE)
+            {
+                if(entry.action > red808_mpd218::PAD_CLEAR_SELECTED_FX)
+                    continue;
+            }
+            else if(entry.kind == MIDI_MAP_KIND_CC)
+            {
+                if(entry.action > red808_mpd218::KNOB_STEREO_WIDTH) continue;
+            }
+            else
+                continue;
+            midiUserMap[accepted++] = entry;
+        }
+        midiUserMapCount = accepted;
         return;
     }
 
@@ -9468,23 +9575,59 @@ static void ProcessMpdMidi()
         {
             case NoteOn:
             case NoteOff: {
+                const uint8_t channel = static_cast<uint8_t>(event.channel);
                 const bool pressed = event.type == NoteOn && event.data[1] != 0u;
-                if(red808_mpd218::DecodePad(static_cast<uint8_t>(event.channel),
-                                            event.data[0], device, bank,
-                                            layer, index))
+                MidiMonitorPush(static_cast<uint8_t>(
+                                    (event.type == NoteOn ? 0x90u : 0x80u)
+                                    | (channel & 0x0Fu)),
+                                event.data[0], event.data[1]);
+                /* A learned assignment beats the compiled factory map and
+                 * works on any channel/note the controller happens to send. */
+                if(const MidiMapEntry* learned
+                   = MidiUserMapFind(channel, MIDI_MAP_KIND_NOTE,
+                                     event.data[0]))
+                {
+                    uint8_t mapDevice = 0, mapBank = 0;
+                    red808_mpd218::DecodeDeviceAndBank(channel, mapDevice,
+                                                       mapBank);
+                    const red808_mpd218::PadAction action = {
+                        static_cast<red808_mpd218::PadActionType>(
+                            learned->action),
+                        learned->arg0, learned->arg1};
+                    MpdApplyPad(mapDevice, action, event.data[1], pressed,
+                                now);
+                }
+                else if(red808_mpd218::DecodePad(channel, event.data[0],
+                                                 device, bank, layer, index))
                     MpdApplyPad(device,
                                 red808_mpd218::kPadMap[bank][layer][index],
                                 event.data[1], pressed, now);
                 break;
             }
-            case ControlChange:
-                if(red808_mpd218::DecodeKnob(static_cast<uint8_t>(event.channel),
-                                             event.data[0], device, bank,
-                                             layer, index))
+            case ControlChange: {
+                const uint8_t channel = static_cast<uint8_t>(event.channel);
+                MidiMonitorPush(static_cast<uint8_t>(0xB0u
+                                                     | (channel & 0x0Fu)),
+                                event.data[0], event.data[1]);
+                if(const MidiMapEntry* learned
+                   = MidiUserMapFind(channel, MIDI_MAP_KIND_CC,
+                                     event.data[0]))
+                {
+                    uint8_t mapDevice = 0, mapBank = 0;
+                    red808_mpd218::DecodeDeviceAndBank(channel, mapDevice,
+                                                       mapBank);
+                    const red808_mpd218::KnobAction action = {
+                        static_cast<red808_mpd218::KnobActionType>(
+                            learned->action)};
+                    MpdApplyKnob(mapDevice, action, event.data[1]);
+                }
+                else if(red808_mpd218::DecodeKnob(channel, event.data[0],
+                                                  device, bank, layer, index))
                     MpdApplyKnob(device,
                                  red808_mpd218::kKnobMap[bank][layer][index],
                                  event.data[1]);
                 break;
+            }
             case ChannelMode:
                 if(event.cm_type == AllSoundOff || event.cm_type == AllNotesOff)
                 {

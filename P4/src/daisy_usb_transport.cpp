@@ -12,6 +12,7 @@ constexpr uint32_t kEngineTimeoutMs = 3000;
 constexpr uint32_t kPingIntervalMs = 1000;
 constexpr uint32_t kPositionIntervalMs = 40;
 constexpr uint32_t kPodStateIntervalMs = 25;
+constexpr uint32_t kMidiEventsIntervalMs = 50;
 constexpr uint32_t kQueryTimeoutMs = 400;
 constexpr size_t kTelemetryBacklogLimit = 8;
 }
@@ -264,6 +265,26 @@ bool DaisyUsbTransport::controlSong(uint8_t action)
     return sendU8(CMD_SONG_CONTROL, action);
 }
 
+bool DaisyUsbTransport::sendMidiMap(const MidiMapEntry* entries, uint8_t count)
+{
+    if(count > MIDI_MAP_MAX_ENTRIES) count = MIDI_MAP_MAX_ENTRIES;
+    if(count > 0 && entries == nullptr) return false;
+    uint8_t payload[1 + MIDI_MAP_MAX_ENTRIES * sizeof(MidiMapEntry)];
+    payload[0] = count;
+    if(count > 0)
+        memcpy(payload + 1, entries, count * sizeof(MidiMapEntry));
+    return send(CMD_MIDI_MAP_SET, payload,
+                static_cast<uint16_t>(1 + count * sizeof(MidiMapEntry)));
+}
+
+bool DaisyUsbTransport::popMidiEvent(MidiMonitorEvent& event)
+{
+    if(midi_events_tail_ == midi_events_head_) return false;
+    event = midi_events_[midi_events_tail_];
+    midi_events_tail_ = (midi_events_tail_ + 1u) & 63u;
+    return true;
+}
+
 void DaisyUsbTransport::parseByte(uint8_t byte)
 {
     if(rx_length_ == 0)
@@ -330,7 +351,8 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
 
     const bool is_query_response = header->cmd == CMD_PING
         || header->cmd == CMD_DSQ_GET_POS || header->cmd == CMD_GET_STATUS
-        || header->cmd == CMD_POD_GET_STATE;
+        || header->cmd == CMD_POD_GET_STATE
+        || header->cmd == CMD_MIDI_GET_EVENTS;
     if(pending_query_ && is_query_response)
     {
         if(header->cmd == pending_query_command_
@@ -453,6 +475,23 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
         memcpy(&state_.pod, payload, sizeof(PodStatePayload));
         state_.pod_revision++;
     }
+    else if(header->cmd == CMD_MIDI_GET_EVENTS && header->length >= 1)
+    {
+        uint8_t count = payload[0];
+        const uint16_t available = (header->length - 1u) / 3u;
+        if(count > MIDI_MON_EVENTS_PER_POLL) count = MIDI_MON_EVENTS_PER_POLL;
+        if(count > available) count = static_cast<uint8_t>(available);
+        for(uint8_t i = 0; i < count; ++i)
+        {
+            const uint8_t next = (midi_events_head_ + 1u) & 63u;
+            if(next == midi_events_tail_) // full → drop oldest
+                midi_events_tail_ = (midi_events_tail_ + 1u) & 63u;
+            midi_events_[midi_events_head_].status = payload[1 + i * 3 + 0];
+            midi_events_[midi_events_head_].data0 = payload[1 + i * 3 + 1];
+            midi_events_[midi_events_head_].data1 = payload[1 + i * 3 + 2];
+            midi_events_head_ = next;
+        }
+    }
 }
 
 void DaisyUsbTransport::poll()
@@ -487,6 +526,12 @@ void DaisyUsbTransport::poll()
     if(now - last_pod_state_ms_ >= kPodStateIntervalMs)
     {
         if(sendQuery(CMD_POD_GET_STATE)) last_pod_state_ms_ = now;
+        return;
+    }
+    if((state_.capability_flags & RED808_CAP_MIDI_MONITOR)
+       && now - last_midi_events_ms_ >= kMidiEventsIntervalMs)
+    {
+        if(sendQuery(CMD_MIDI_GET_EVENTS)) last_midi_events_ms_ = now;
         return;
     }
 }
