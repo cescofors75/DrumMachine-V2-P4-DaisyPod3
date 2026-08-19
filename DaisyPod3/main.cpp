@@ -4118,6 +4118,192 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
     voices[slot].age    = voiceAge++;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  LOCK-FREE AUDIO COMMAND QUEUE (main loop producer -> AudioCallback consumer)
+ *
+ * Named explicitly in the original race-condition audit as the primary risk:
+ * TriggerPad() and the synth Trigger()/NoteOn()/NoteOff() calls below used to
+ * run directly from main-loop command handlers (USB packets, MPD218 MIDI —
+ * both funnel through ProcessCommand()) while AudioCallback concurrently
+ * reads/advances the SAME voices[]/synth engine state on the audio IRQ.
+ * Main-loop code now only ENQUEUES a command; AudioCmdDrainAndApply(),
+ * called once at the top of every AudioCallback block, performs the actual
+ * state mutation on the audio thread itself — so there is only ever one
+ * writer to voices[]/the synth engines for these paths.
+ *
+ * Single producer (Daisy's bare-metal main() and everything it calls —
+ * ProcessDaisyUsb/ProcessCommand/ProcessMpdMidi are all invoked from the
+ * same main loop, never concurrently with each other), single consumer
+ * (AudioCallback, invoked from the SAI/DMA IRQ). head is written only by
+ * the producer, tail only by the consumer; __DMB() orders each slot's
+ * payload write/read against the index that publishes/consumes it, so the
+ * consumer never observes a partially-written slot.
+ *
+ * SCOPE: this queue covers every main-loop-reachable call site of
+ * TriggerPad and the 808/909/505/303/WTOSC/SH101/FM2OP trigger/note-on
+ * paths explicitly named in the audit — CMD_TRIGGER_LIVE, CMD_TRIGGER_SEQ,
+ * CMD_BULK_TRIGGERS, CMD_SYNTH_TRIGGER, CMD_SYNTH_NOTE_ON(_EX), and
+ * RunPerformanceStressMode (CMD_DIAG_PERF_STRESS can enable it at runtime,
+ * unlike the boot self-test). NOT routed through this queue, and left as
+ * direct main-loop/audio-thread writes exactly as before this change:
+ *   - PHYS/NOISE engine triggers (SetFreq/SetAccent/Trig + *Active flags —
+ *     a different shape than a simple Trigger()/NoteOn() call).
+ *   - NoteOff/"release" helpers (ReleaseAllSynthEngines,
+ *     ReleaseSynthEngineState, ReleaseTrackEngine, DsqReleaseAllHeldNotes,
+ *     DsqReleaseHeldNotes, CMD_SYNTH_ACTIVE) and scalar parameter setters
+ *     (filter type/cutoff, FX mix, track volume, etc.). These are lower
+ *     priority: far less frequent than pad/note triggers, and touch a
+ *     single scalar/gate rather than a multi-field voices[] slot, so a
+ *     torn read is both rarer and far less audible (a note ending a few ms
+ *     early/late, or a one-block-late parameter change, vs. a corrupted
+ *     voice).
+ *   - RunStartup808SelfTest / RunStartupShowcaseDemo: boot-only demos,
+ *     compile-time disabled by default (RED808_STARTUP_808_SELF_TEST=0,
+ *     RED808_STARTUP_SHOWCASE_DEMO=0).
+ *   - DsqTriggerTrackNow/DsqFireStep: already run on the audio thread
+ *     (called from inside AudioCallback), so they call TriggerPad and the
+ *     synth engines directly — no queue needed, there is no second writer.
+ * ═══════════════════════════════════════════════════════════════════ */
+enum AudioCmdType : uint8_t
+{
+    AUDIO_CMD_NONE = 0,
+    AUDIO_CMD_TRIGGER_PAD,
+    AUDIO_CMD_SYNTH_TRIGGER,  /* 808/909/505 drum hit */
+    AUDIO_CMD_SYNTH_NOTE_ON,  /* 303/WTOSC/SH101/FM2OP melodic note-on */
+    AUDIO_CMD_SYNTH_NOTE_OFF, /* matching note-off / panic-all (engine=0xFF) */
+};
+
+struct AudioCmd
+{
+    uint8_t  type;
+    uint8_t  engine;       /* SYNTH_ENGINE_*; 0xFF = legacy "all melodic off" */
+    uint8_t  note;         /* MIDI note (melodic); note-off: 0xFF = unspecified */
+    uint8_t  velocity;     /* 0-127 */
+    uint8_t  accent;       /* bool, 303 note-on */
+    uint8_t  slide;        /* bool, 303 note-on */
+    uint8_t  track;        /* note-off: track index for WTOSC, 0xFF = none */
+    uint8_t  liveSource;   /* bool, pad-trigger */
+    uint8_t  pad;          /* pad-trigger */
+    uint8_t  trkVol;       /* pad-trigger */
+    int8_t   pan;          /* pad-trigger */
+    uint8_t  instrument;   /* drum-trigger native instrument index */
+    uint8_t  pianoGate;    /* bool: apply piano-engine auto-select before NOTE_ON
+                            * (only CMD_SYNTH_NOTE_ON_EX did this originally —
+                            * CMD_SYNTH_TRIGGER/CMD_TRIGGER_LIVE/SEQ/BULK never
+                            * did, so they must NOT set this). */
+    uint32_t maxSamples;   /* pad-trigger */
+    float    sourceVolume; /* pad-trigger */
+    float    sourcePitch;  /* pad-trigger */
+};
+
+#define AUDIO_CMD_RING_SIZE 64u /* power of two; ample headroom for one block */
+static AudioCmd audioCmdRing[AUDIO_CMD_RING_SIZE];
+static volatile uint32_t audioCmdHead = 0; /* producer-owned (main loop) */
+static volatile uint32_t audioCmdTail = 0; /* consumer-owned (AudioCallback) */
+static volatile uint32_t audioCmdDrops = 0;
+
+/* Producer: main loop only (ProcessCommand and friends). Never call from
+ * AudioCallback — this is a single-producer ring. */
+static bool AudioCmdPush(const AudioCmd& cmd)
+{
+    const uint32_t head = audioCmdHead;
+    const uint32_t next = (head + 1u) & (AUDIO_CMD_RING_SIZE - 1u);
+    if(next == audioCmdTail)
+    {
+        audioCmdDrops++;
+        return false; /* full — not expected at depth 64, see comment above */
+    }
+    audioCmdRing[head] = cmd;
+    __DMB(); /* payload write must be visible before the index publishes it */
+    audioCmdHead = next;
+    return true;
+}
+
+static void AudioCmdApplyTriggerPad(const AudioCmd& c)
+{
+    TriggerPad(c.pad, c.velocity, c.trkVol, c.pan, c.maxSamples,
+              c.sourceVolume, c.sourcePitch, c.liveSource != 0);
+}
+
+static void AudioCmdApplySynthTrigger(const AudioCmd& c)
+{
+    const float vel = c.velocity / 127.0f;
+    switch(c.engine)
+    {
+        case SYNTH_ENGINE_808: synth808.Trigger(c.instrument, vel); break;
+        case SYNTH_ENGINE_909: synth909.Trigger(c.instrument, vel); break;
+        case SYNTH_ENGINE_505: synth505.Trigger(c.instrument, vel); break;
+        default: break;
+    }
+}
+
+static void AudioCmdApplyNoteOn(const AudioCmd& c)
+{
+    /* Mirrors the piano-engine auto-select that used to run inline in
+     * CMD_SYNTH_NOTE_ON_EX: keep it glued to the note-on it gates, now both
+     * happening on the audio thread instead of split across two threads.
+     * Gated on pianoGate — CMD_SYNTH_TRIGGER/CMD_TRIGGER_LIVE/SEQ/BULK also
+     * produce AUDIO_CMD_SYNTH_NOTE_ON for 303/WTOSC/SH101/FM2OP, but never
+     * did this auto-select originally and must keep not doing it. */
+    if(c.pianoGate && IsPianoMelodicEngine(c.engine)
+       && c.engine != pianoSelectedEngine)
+    {
+        ReleaseAllSynthEngines();
+        pianoSelectedEngine = c.engine;
+    }
+    const float vel01 = c.velocity / 127.0f;
+    switch(c.engine)
+    {
+        case SYNTH_ENGINE_303:   acid303.NoteOn(c.note, c.accent != 0, c.slide != 0); break;
+        case SYNTH_ENGINE_WTOSC: wtOsc.NoteOn(c.note, vel01); break;
+        case SYNTH_ENGINE_SH101: synthSH101.NoteOn(c.note, vel01); break;
+        case SYNTH_ENGINE_FM2OP: synthFM2Op.NoteOn(c.note, vel01); break;
+        default: break;
+    }
+}
+
+static void AudioCmdApplyNoteOff(const AudioCmd& c)
+{
+    switch(c.engine)
+    {
+        case SYNTH_ENGINE_303: acid303.NoteOff(); break;
+        case SYNTH_ENGINE_WTOSC:
+            if(c.note != 0xFFu)     wtOsc.NoteOff(c.note);
+            else if(c.track < 16)   wtOsc.NoteOff(trackWtNote[c.track]);
+            else                    wtOsc.AllNotesOff();
+            break;
+        case SYNTH_ENGINE_SH101: synthSH101.NoteOff(); break;
+        case SYNTH_ENGINE_FM2OP: synthFM2Op.NoteOff(); break;
+        case 0xFFu: /* legacy panic: every melodic engine off at once */
+            acid303.NoteOff();
+            synthSH101.NoteOff();
+            synthFM2Op.NoteOff();
+            wtOsc.AllNotesOff();
+            break;
+        default: break;
+    }
+}
+
+/* Consumer: AudioCallback only, called once at the top of every block —
+ * never from anywhere else (single-consumer ring). */
+static void AudioCmdDrainAndApply()
+{
+    while(audioCmdTail != audioCmdHead)
+    {
+        __DMB(); /* pairs with the producer's __DMB() before it publishes head */
+        const AudioCmd cmd = audioCmdRing[audioCmdTail];
+        audioCmdTail = (audioCmdTail + 1u) & (AUDIO_CMD_RING_SIZE - 1u);
+        switch(cmd.type)
+        {
+            case AUDIO_CMD_TRIGGER_PAD:    AudioCmdApplyTriggerPad(cmd);   break;
+            case AUDIO_CMD_SYNTH_TRIGGER:  AudioCmdApplySynthTrigger(cmd); break;
+            case AUDIO_CMD_SYNTH_NOTE_ON:  AudioCmdApplyNoteOn(cmd);       break;
+            case AUDIO_CMD_SYNTH_NOTE_OFF: AudioCmdApplyNoteOff(cmd);      break;
+            default: break;
+        }
+    }
+}
+
 static uint8_t ActiveVoices(){
     uint8_t c = 0;
     for(int i = 0; i < MAX_VOICES; i++) if(voices[i].active) c++;
@@ -4175,26 +4361,82 @@ static void RunPerformanceStressMode(uint32_t nowMs)
     perfStressNextMs = nowMs + (kStartupStressReport ? 500u : 70u);
     uint8_t step = perfStressStep++;
 
+    /* CMD_DIAG_PERF_STRESS can enable this at runtime (unlike the boot
+     * self-test, which is compile-time disabled) — queue every trigger the
+     * same way the live/USB/MIDI paths do, so a stress-test session doesn't
+     * reopen the exact race this queue exists to close. */
     if(perfStressProfile >= 2){
         for(uint8_t i = 0; i < 4; i++){
             uint8_t pad = (uint8_t)((step + i * 5u) % MAX_PADS);
-            if(sampleLoaded[pad] && !padLoading[pad])
-                TriggerPad(pad, (uint8_t)(96 + (i * 7)), 100, 0, 0, 0.72f);
+            if(sampleLoaded[pad] && !padLoading[pad]){
+                AudioCmd cmd{};
+                cmd.type = AUDIO_CMD_TRIGGER_PAD;
+                cmd.pad = pad;
+                cmd.velocity = (uint8_t)(96 + (i * 7));
+                cmd.trkVol = 100;
+                cmd.sourceVolume = 0.72f;
+                cmd.sourcePitch = 1.0f;
+                AudioCmdPush(cmd);
+            }
         }
     }
 
-    synth808.Trigger(padTo808[step & 15u], 0.75f);
-    synth909.Trigger(padTo909[(step + 3u) & 15u], 0.68f);
-    synth505.Trigger(padTo505[(step + 7u) & 15u], 0.60f);
+    {
+        AudioCmd cmd{};
+        cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+        cmd.engine = SYNTH_ENGINE_808;
+        cmd.instrument = padTo808[step & 15u];
+        cmd.velocity = (uint8_t)(0.75f * 127.0f + 0.5f);
+        AudioCmdPush(cmd);
+    }
+    {
+        AudioCmd cmd{};
+        cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+        cmd.engine = SYNTH_ENGINE_909;
+        cmd.instrument = padTo909[(step + 3u) & 15u];
+        cmd.velocity = (uint8_t)(0.68f * 127.0f + 0.5f);
+        AudioCmdPush(cmd);
+    }
+    {
+        AudioCmd cmd{};
+        cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+        cmd.engine = SYNTH_ENGINE_505;
+        cmd.instrument = padTo505[(step + 7u) & 15u];
+        cmd.velocity = (uint8_t)(0.60f * 127.0f + 0.5f);
+        AudioCmdPush(cmd);
+    }
 
     if(!kStartupStressReport){
-        acid303.NoteOn((uint8_t)(36 + (step % 24u)), (step & 3u) == 0, (step & 7u) == 0);
-        wtOsc.NoteOn((uint8_t)(48 + (step % 12u)), 0.45f);
+        AudioCmd cmd303{};
+        cmd303.type = AUDIO_CMD_SYNTH_NOTE_ON;
+        cmd303.engine = SYNTH_ENGINE_303;
+        cmd303.note = (uint8_t)(36 + (step % 24u));
+        cmd303.accent = ((step & 3u) == 0) ? 1 : 0;
+        cmd303.slide  = ((step & 7u) == 0) ? 1 : 0;
+        AudioCmdPush(cmd303);
+
+        AudioCmd cmdWt{};
+        cmdWt.type = AUDIO_CMD_SYNTH_NOTE_ON;
+        cmdWt.engine = SYNTH_ENGINE_WTOSC;
+        cmdWt.note = (uint8_t)(48 + (step % 12u));
+        cmdWt.velocity = (uint8_t)(0.45f * 127.0f + 0.5f);
+        AudioCmdPush(cmdWt);
     }
 
     if(!kStartupStressReport && perfStressProfile >= 2){
-        synthSH101.NoteOn((uint8_t)(52 + (step % 12u)), 0.42f);
-        synthFM2Op.NoteOn((uint8_t)(60 + (step % 12u)), 0.35f);
+        AudioCmd cmdSh{};
+        cmdSh.type = AUDIO_CMD_SYNTH_NOTE_ON;
+        cmdSh.engine = SYNTH_ENGINE_SH101;
+        cmdSh.note = (uint8_t)(52 + (step % 12u));
+        cmdSh.velocity = (uint8_t)(0.42f * 127.0f + 0.5f);
+        AudioCmdPush(cmdSh);
+
+        AudioCmd cmdFm{};
+        cmdFm.type = AUDIO_CMD_SYNTH_NOTE_ON;
+        cmdFm.engine = SYNTH_ENGINE_FM2OP;
+        cmdFm.note = (uint8_t)(60 + (step % 12u));
+        cmdFm.velocity = (uint8_t)(0.35f * 127.0f + 0.5f);
+        AudioCmdPush(cmdFm);
     }
 }
 
@@ -4961,6 +5203,13 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
     __asm volatile("VMRS r0, FPSCR\n"
                    "ORR  r0, r0, #(1<<24)|(1<<25)\n"
                    "VMSR FPSCR, r0" ::: "r0");
+
+    /* Apply every pad/synth trigger queued by the main loop since the last
+     * block, on THIS thread, before anything else touches voices[] or the
+     * synth engines this callback. Must run even on the early-exit paths
+     * below (tone test / safe mode / kit mute) so queued commands are
+     * never starved while one of those states is active. */
+    AudioCmdDrainAndApply();
 
     /* ── STARTUP TONE TEST: tono 1kHz directo, bypasea toda la cadena ── */
     if(kStartupToneTest){
@@ -6058,39 +6307,58 @@ static void ProcessCommand()
             if(kAcceptOneBasedPadIndex && pad > 0) pad -= 1;
             int8_t livEng = (pad < DSQ_TRACKS) ? dsqTrackEngine[pad] : -1;
             if(livEng >= 0 && livEng < SYNTH_ENGINE_COUNT){
-                /* Synth engine activo: disparar synth, NO sampler */
+                /* Synth engine activo: disparar synth, NO sampler.
+                 * Queued (except PHYS/NOISE — see the AudioCmd scope note
+                 * above TriggerPad's definition) so the actual Trigger()/
+                 * NoteOn() call happens on the audio thread, not here. */
                 float fvel = clampF(vel / 127.0f, 0.0f, 1.0f);
+                const uint8_t qvel = (uint8_t)(fvel * 127.0f + 0.5f);
+                AudioCmd cmd{};
+                cmd.engine = (uint8_t)livEng;
+                cmd.velocity = qvel;
                 switch(livEng){
                     case SYNTH_ENGINE_808:
-                        if(pad < 16) synth808.Trigger(padTo808[pad], fvel);
+                        if(pad < 16){
+                            cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                            cmd.instrument = padTo808[pad];
+                            AudioCmdPush(cmd);
+                        }
                         break;
                     case SYNTH_ENGINE_909:
-                        if(pad < 16) synth909.Trigger(padTo909[pad], fvel);
+                        if(pad < 16){
+                            cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                            cmd.instrument = padTo909[pad];
+                            AudioCmdPush(cmd);
+                        }
                         break;
                     case SYNTH_ENGINE_505:
-                        if(pad < 16) synth505.Trigger(padTo505[pad], fvel);
+                        if(pad < 16){
+                            cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                            cmd.instrument = padTo505[pad];
+                            AudioCmdPush(cmd);
+                        }
                         break;
-                    case SYNTH_ENGINE_303: {
-                        uint8_t note = (pad < 16) ? padTo303Midi[pad] : 48;
-                        bool    acc  = (fvel > 0.85f);
-                        acid303.NoteOn(note, acc, false);
+                    case SYNTH_ENGINE_303:
+                        cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                        cmd.note = (pad < 16) ? padTo303Midi[pad] : 48;
+                        cmd.accent = (fvel > 0.85f) ? 1 : 0;
+                        AudioCmdPush(cmd);
                         break;
-                    }
-                    case SYNTH_ENGINE_WTOSC: {
-                        uint8_t note = (pad < 16) ? trackWtNote[pad] : 60;
-                        wtOsc.NoteOn(note, fvel);
+                    case SYNTH_ENGINE_WTOSC:
+                        cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                        cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
-                    case SYNTH_ENGINE_SH101: {           /* I1 */
-                        uint8_t note = (pad < 16) ? trackSH101Note[pad] : 60;
-                        synthSH101.NoteOn(note, fvel);
+                    case SYNTH_ENGINE_SH101:             /* I1 */
+                        cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                        cmd.note = (pad < 16) ? trackSH101Note[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
-                    case SYNTH_ENGINE_FM2OP: {           /* I2 */
-                        uint8_t note = (pad < 16) ? trackFM2OpNote[pad] : 60;
-                        synthFM2Op.NoteOn(note, fvel);
+                    case SYNTH_ENGINE_FM2OP:             /* I2 */
+                        cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                        cmd.note = (pad < 16) ? trackFM2OpNote[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
                     case SYNTH_ENGINE_PHYS: {
                         float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
                         physModal.SetFreq(freq);
@@ -6111,11 +6379,25 @@ static void ProcessCommand()
                 }
             } else {
                 /* Modo sampler (por defecto) */
-                TriggerPad(pad, vel, 100, 0, 0, liveVolume, livePitch, true);
+                AudioCmd cmd{};
+                cmd.type = AUDIO_CMD_TRIGGER_PAD;
+                cmd.pad = pad;
+                cmd.velocity = vel;
+                cmd.trkVol = 100;
+                cmd.sourceVolume = liveVolume;
+                cmd.sourcePitch = livePitch;
+                cmd.liveSource = 1;
+                AudioCmdPush(cmd);
                 /* DIAG: si no hay sample cargado, fallback a snare 808 (audible y distinto del kick)
                  * Confirma que el problema es sampleLoaded=false, no el SPI. */
                 if(pad < MAX_PADS && !sampleLoaded[pad]){
-                    synth808.Trigger(TR808::INST_SNARE, clampF(vel / 127.0f, 0.1f, 1.0f));
+                    AudioCmd fallback{};
+                    fallback.type = AUDIO_CMD_SYNTH_TRIGGER;
+                    fallback.engine = SYNTH_ENGINE_808;
+                    fallback.instrument = TR808::INST_SNARE;
+                    fallback.velocity = (uint8_t)(clampF(vel / 127.0f, 0.1f, 1.0f)
+                                                  * 127.0f + 0.5f);
+                    AudioCmdPush(fallback);
                 }
             }
             spiLastTriggerMs = hw.system.GetNow();
@@ -6133,38 +6415,55 @@ static void ProcessCommand()
              * sequencer del Master. */
             int8_t seqEng = (pad < DSQ_TRACKS) ? dsqTrackEngine[pad] : -1;
             if(seqEng >= 0 && seqEng < SYNTH_ENGINE_COUNT){
+                /* Same queueing as CMD_TRIGGER_LIVE — see the note there. */
                 float fvel = clampF(p[1] / 127.0f, 0.0f, 1.0f);
+                const uint8_t qvel = (uint8_t)(fvel * 127.0f + 0.5f);
+                AudioCmd cmd{};
+                cmd.engine = (uint8_t)seqEng;
+                cmd.velocity = qvel;
                 switch(seqEng){
                     case SYNTH_ENGINE_808:
-                        if(pad < 16) synth808.Trigger(padTo808[pad], fvel);
+                        if(pad < 16){
+                            cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                            cmd.instrument = padTo808[pad];
+                            AudioCmdPush(cmd);
+                        }
                         break;
                     case SYNTH_ENGINE_909:
-                        if(pad < 16) synth909.Trigger(padTo909[pad], fvel);
+                        if(pad < 16){
+                            cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                            cmd.instrument = padTo909[pad];
+                            AudioCmdPush(cmd);
+                        }
                         break;
                     case SYNTH_ENGINE_505:
-                        if(pad < 16) synth505.Trigger(padTo505[pad], fvel);
+                        if(pad < 16){
+                            cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                            cmd.instrument = padTo505[pad];
+                            AudioCmdPush(cmd);
+                        }
                         break;
-                    case SYNTH_ENGINE_303: {
-                        uint8_t note = (pad < 16) ? padTo303Midi[pad] : 48;
-                        bool    acc  = (fvel > 0.85f);
-                        acid303.NoteOn(note, acc, false);
+                    case SYNTH_ENGINE_303:
+                        cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                        cmd.note = (pad < 16) ? padTo303Midi[pad] : 48;
+                        cmd.accent = (fvel > 0.85f) ? 1 : 0;
+                        AudioCmdPush(cmd);
                         break;
-                    }
-                    case SYNTH_ENGINE_WTOSC: {
-                        uint8_t note = (pad < 16) ? trackWtNote[pad] : 60;
-                        wtOsc.NoteOn(note, fvel);
+                    case SYNTH_ENGINE_WTOSC:
+                        cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                        cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
-                    case SYNTH_ENGINE_SH101: {
-                        uint8_t note = (pad < 16) ? trackSH101Note[pad] : 60;
-                        synthSH101.NoteOn(note, fvel);
+                    case SYNTH_ENGINE_SH101:
+                        cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                        cmd.note = (pad < 16) ? trackSH101Note[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
-                    case SYNTH_ENGINE_FM2OP: {
-                        uint8_t note = (pad < 16) ? trackFM2OpNote[pad] : 60;
-                        synthFM2Op.NoteOn(note, fvel);
+                    case SYNTH_ENGINE_FM2OP:
+                        cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                        cmd.note = (pad < 16) ? trackFM2OpNote[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
                     case SYNTH_ENGINE_PHYS: {
                         float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
                         physModal.SetFreq(freq);
@@ -6184,7 +6483,16 @@ static void ProcessCommand()
                     }
                 }
             } else {
-                TriggerPad(pad, p[1], p[2], (int8_t)p[3], maxS, seqVolume);
+                AudioCmd cmd{};
+                cmd.type = AUDIO_CMD_TRIGGER_PAD;
+                cmd.pad = pad;
+                cmd.velocity = p[1];
+                cmd.trkVol = p[2];
+                cmd.pan = (int8_t)p[3];
+                cmd.maxSamples = maxS;
+                cmd.sourceVolume = seqVolume;
+                cmd.sourcePitch = 1.0f;
+                AudioCmdPush(cmd);
                 if(kTriggerSynthOnLiveCmd)
                     Synth808TriggerByPad(pad, clampF(p[1] / 127.0f, 0.0f, 1.0f));
             }
@@ -7900,47 +8208,57 @@ static void ProcessCommand()
         if(len >= 3){
             uint8_t engine = p[0];
             uint8_t instrument = p[1];
-            float velocity = p[2] / 127.0f;
+            /* Queued (except PHYS/NOISE, see the AudioCmd scope note above
+             * TriggerPad's definition). cmd.velocity carries the raw byte —
+             * AudioCmdApplySynthTrigger/ApplyNoteOn recompute /127.0f, which
+             * is bit-for-bit the same as this handler's original
+             * `velocity = p[2]/127.0f`, including the lack of clamping. */
+            AudioCmd cmd{};
+            cmd.engine = engine;
+            cmd.velocity = p[2];
             switch(engine){
-                case SYNTH_ENGINE_808: {
-                    uint8_t inst = (instrument < 16) ? padTo808[instrument] : (uint8_t)(instrument % TR808::INST_COUNT);
-                    synth808.Trigger(inst, velocity);
+                case SYNTH_ENGINE_808:
+                    cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                    cmd.instrument = (instrument < 16) ? padTo808[instrument] : (uint8_t)(instrument % TR808::INST_COUNT);
+                    AudioCmdPush(cmd);
                     break;
-                }
-                case SYNTH_ENGINE_909: {
-                    uint8_t inst = (instrument < 16) ? padTo909[instrument] : (uint8_t)(instrument % TR909::INST_COUNT);
-                    synth909.Trigger(inst, velocity);
+                case SYNTH_ENGINE_909:
+                    cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                    cmd.instrument = (instrument < 16) ? padTo909[instrument] : (uint8_t)(instrument % TR909::INST_COUNT);
+                    AudioCmdPush(cmd);
                     break;
-                }
-                case SYNTH_ENGINE_505: {
-                    uint8_t inst = (instrument < 16) ? padTo505[instrument] : (uint8_t)(instrument % TR505::INST_COUNT);
-                    synth505.Trigger(inst, velocity);
+                case SYNTH_ENGINE_505:
+                    cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                    cmd.instrument = (instrument < 16) ? padTo505[instrument] : (uint8_t)(instrument % TR505::INST_COUNT);
+                    AudioCmdPush(cmd);
                     break;
-                }
                 case SYNTH_ENGINE_303: {
                     uint8_t slot = (uint8_t)(instrument & 0x0F);
-                    uint8_t note = padTo303Midi[slot];
-                    bool accent = (slot % 4 == 0) || (velocity > 0.85f);
-                    bool slide = (slot % 4 == 3);
-                    acid303.NoteOn(note, accent, slide);
+                    float velocity = p[2] / 127.0f;
+                    cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                    cmd.note = padTo303Midi[slot];
+                    cmd.accent = ((slot % 4 == 0) || (velocity > 0.85f)) ? 1 : 0;
+                    cmd.slide = (slot % 4 == 3) ? 1 : 0;
+                    AudioCmdPush(cmd);
                     break;
                 }
-                case SYNTH_ENGINE_WTOSC: {
-                    uint8_t note = (instrument < 16) ? trackWtNote[instrument] : 60;
-                    wtOsc.NoteOn(note, velocity);
+                case SYNTH_ENGINE_WTOSC:
+                    cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                    cmd.note = (instrument < 16) ? trackWtNote[instrument] : 60;
+                    AudioCmdPush(cmd);
                     break;
-                }
-                case SYNTH_ENGINE_SH101: {               /* I1 */
-                    uint8_t note = (instrument < 16) ? trackSH101Note[instrument] : 60;
-                    synthSH101.NoteOn(note, velocity);
+                case SYNTH_ENGINE_SH101:                 /* I1 */
+                    cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                    cmd.note = (instrument < 16) ? trackSH101Note[instrument] : 60;
+                    AudioCmdPush(cmd);
                     break;
-                }
-                case SYNTH_ENGINE_FM2OP: {               /* I2 */
-                    uint8_t note = (instrument < 16) ? trackFM2OpNote[instrument] : 60;
-                    synthFM2Op.NoteOn(note, velocity);
+                case SYNTH_ENGINE_FM2OP:                 /* I2 */
+                    cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                    cmd.note = (instrument < 16) ? trackFM2OpNote[instrument] : 60;
+                    AudioCmdPush(cmd);
                     break;
-                }
                 case SYNTH_ENGINE_PHYS: {
+                    float velocity = p[2] / 127.0f;
                     uint8_t note = (instrument < 16) ? trackWtNote[instrument] : 60;
                     float freq = 440.f * powf(2.f, (note - 69) / 12.f);
                     physModal.SetFreq(freq);
@@ -7952,6 +8270,7 @@ static void ProcessCommand()
                     break;
                 }
                 case SYNTH_ENGINE_NOISE: {
+                    float velocity = p[2] / 127.0f;
                     uint8_t note = (instrument < 16) ? trackWtNote[instrument] : 60;
                     float freq = 440.f * powf(2.f, (note - 69) / 12.f);
                     noisePart.SetFreq(freq);
@@ -8074,16 +8393,21 @@ static void ProcessCommand()
 
     case CMD_SYNTH_NOTE_ON:
         if(len >= 3){
-            uint8_t note = p[0];
-            bool accent = (p[1] != 0);
-            bool slide  = (p[2] != 0);
-            acid303.NoteOn(note, accent, slide);
+            AudioCmd cmd{};
+            cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+            cmd.engine = SYNTH_ENGINE_303;
+            cmd.note = p[0];
+            cmd.accent = (p[1] != 0) ? 1 : 0;
+            cmd.slide = (p[2] != 0) ? 1 : 0;
+            AudioCmdPush(cmd);
         }
         break;
 
     case CMD_SYNTH_NOTE_OFF:
         /* v2.5: payload extendido [engine, track] para apagar el synth correcto.
-         * Sin payload: apaga TODOS los synths melódicos (panic legacy 303). */
+         * Sin payload: apaga TODOS los synths melódicos (panic legacy 303).
+         * Queued for 303/WTOSC/SH101/FM2OP (PHYS stays a direct write — see
+         * the AudioCmd scope note above TriggerPad's definition). */
         if(len >= 2){
             uint8_t engine = p[0];
             uint8_t track  = p[1];
@@ -8091,14 +8415,18 @@ static void ProcessCommand()
             if(kEnableSynthCmdLog && track == 0xFF)
                 hw.PrintLine("SYNTH_NOTE_OFF_ALL engine=%u", engine);
             switch(engine){
-                case SYNTH_ENGINE_303:   acid303.NoteOff(); break;
+                case SYNTH_ENGINE_303:
                 case SYNTH_ENGINE_WTOSC:
-                    if(note != 0xFF)     wtOsc.NoteOff(note);
-                    else if(track < 16)  wtOsc.NoteOff(trackWtNote[track]);
-                    else           wtOsc.AllNotesOff();
+                case SYNTH_ENGINE_SH101:
+                case SYNTH_ENGINE_FM2OP: {
+                    AudioCmd cmd{};
+                    cmd.type = AUDIO_CMD_SYNTH_NOTE_OFF;
+                    cmd.engine = engine;
+                    cmd.note = note;
+                    cmd.track = track;
+                    AudioCmdPush(cmd);
                     break;
-                case SYNTH_ENGINE_SH101: synthSH101.NoteOff(); break;
-                case SYNTH_ENGINE_FM2OP: synthFM2Op.NoteOff(); break;
+                }
                 case SYNTH_ENGINE_PHYS:
                     physModalActive = false;
                     physStringActive = false;
@@ -8107,10 +8435,10 @@ static void ProcessCommand()
             }
         } else {
             /* Legacy: NoteOff genérico (compat firmware antiguo) */
-            acid303.NoteOff();
-            synthSH101.NoteOff();
-            synthFM2Op.NoteOff();
-            wtOsc.AllNotesOff();
+            AudioCmd cmd{};
+            cmd.type = AUDIO_CMD_SYNTH_NOTE_OFF;
+            cmd.engine = 0xFFu; /* panic-all: 303 + SH101 + FM2OP + WTOSC */
+            AudioCmdPush(cmd);
             physModalActive = false;
             physStringActive = false;
         }
@@ -8205,27 +8533,47 @@ static void ProcessCommand()
             bool    accent   = (p[3] != 0);
             bool    slide    = (p[4] != 0);
             float   vel01    = velocity / 127.0f;
-            if(IsPianoMelodicEngine(engine) && engine != pianoSelectedEngine)
-            {
-                ReleaseAllSynthEngines();
-                pianoSelectedEngine = engine;
-                if(kEnableSynthCmdLog)
-                    hw.PrintLine("PIANO_SELECT via=note_on engine=%u", engine);
-            }
+            /* The piano-engine auto-select (ReleaseAllSynthEngines +
+             * pianoSelectedEngine write) moved INTO AudioCmdApplyNoteOn for
+             * 303/WTOSC/SH101/FM2OP (cmd.pianoGate below) so it lands on the
+             * audio thread glued to the note-on it gates, instead of racing
+             * ahead of it from the main loop. PHYS isn't queued yet (see the
+             * AudioCmd scope note above TriggerPad's definition), so its
+             * gate stays direct, exactly as before, inside that case. This
+             * is only a would-it-fire check for the diagnostic log. */
+            if(kEnableSynthCmdLog && IsPianoMelodicEngine(engine)
+               && engine != pianoSelectedEngine)
+                hw.PrintLine("PIANO_SELECT via=note_on engine=%u", engine);
             switch(engine){
-                case SYNTH_ENGINE_303:
-                    acid303.NoteOn(midiNote, accent, slide);
+                case SYNTH_ENGINE_303: {
+                    AudioCmd cmd{};
+                    cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                    cmd.engine = engine;
+                    cmd.note = midiNote;
+                    cmd.accent = accent ? 1 : 0;
+                    cmd.slide = slide ? 1 : 0;
+                    cmd.pianoGate = 1;
+                    AudioCmdPush(cmd);
                     break;
+                }
                 case SYNTH_ENGINE_WTOSC:
-                    wtOsc.NoteOn(midiNote, vel01);
-                    break;
                 case SYNTH_ENGINE_SH101:
-                    synthSH101.NoteOn(midiNote, vel01);
+                case SYNTH_ENGINE_FM2OP: {
+                    AudioCmd cmd{};
+                    cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                    cmd.engine = engine;
+                    cmd.note = midiNote;
+                    cmd.velocity = velocity;
+                    cmd.pianoGate = 1;
+                    AudioCmdPush(cmd);
                     break;
-                case SYNTH_ENGINE_FM2OP:
-                    synthFM2Op.NoteOn(midiNote, vel01);
-                    break;
+                }
                 case SYNTH_ENGINE_PHYS: {
+                    if(engine != pianoSelectedEngine)
+                    {
+                        ReleaseAllSynthEngines();
+                        pianoSelectedEngine = engine;
+                    }
                     float freq = 440.f * powf(2.f, (midiNote - 69) / 12.f);
                     physModal.SetFreq(freq);
                     physString.SetFreq(freq);
@@ -8269,37 +8617,55 @@ static void ProcessCommand()
                  * el synth correspondiente (igual que CMD_TRIGGER_LIVE/SEQ). */
                 int8_t bEng = (pad < DSQ_TRACKS) ? dsqTrackEngine[pad] : -1;
                 if(bEng >= 0 && bEng < SYNTH_ENGINE_COUNT){
+                    /* Same queueing as CMD_TRIGGER_LIVE — see the note there. */
                     float fvel = clampF(vel / 127.0f, 0.0f, 1.0f);
+                    const uint8_t qvel = (uint8_t)(fvel * 127.0f + 0.5f);
+                    AudioCmd cmd{};
+                    cmd.engine = (uint8_t)bEng;
+                    cmd.velocity = qvel;
                     switch(bEng){
                         case SYNTH_ENGINE_808:
-                            if(pad < 16) synth808.Trigger(padTo808[pad], fvel);
+                            if(pad < 16){
+                                cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                                cmd.instrument = padTo808[pad];
+                                AudioCmdPush(cmd);
+                            }
                             break;
                         case SYNTH_ENGINE_909:
-                            if(pad < 16) synth909.Trigger(padTo909[pad], fvel);
+                            if(pad < 16){
+                                cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                                cmd.instrument = padTo909[pad];
+                                AudioCmdPush(cmd);
+                            }
                             break;
                         case SYNTH_ENGINE_505:
-                            if(pad < 16) synth505.Trigger(padTo505[pad], fvel);
+                            if(pad < 16){
+                                cmd.type = AUDIO_CMD_SYNTH_TRIGGER;
+                                cmd.instrument = padTo505[pad];
+                                AudioCmdPush(cmd);
+                            }
                             break;
-                        case SYNTH_ENGINE_303: {
-                            uint8_t note = (pad < 16) ? padTo303Midi[pad] : 48;
-                            acid303.NoteOn(note, fvel > 0.85f, false);
+                        case SYNTH_ENGINE_303:
+                            cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                            cmd.note = (pad < 16) ? padTo303Midi[pad] : 48;
+                            cmd.accent = (fvel > 0.85f) ? 1 : 0;
+                            AudioCmdPush(cmd);
                             break;
-                        }
-                        case SYNTH_ENGINE_WTOSC: {
-                            uint8_t note = (pad < 16) ? trackWtNote[pad] : 60;
-                            wtOsc.NoteOn(note, fvel);
+                        case SYNTH_ENGINE_WTOSC:
+                            cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                            cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                            AudioCmdPush(cmd);
                             break;
-                        }
-                        case SYNTH_ENGINE_SH101: {
-                            uint8_t note = (pad < 16) ? trackSH101Note[pad] : 60;
-                            synthSH101.NoteOn(note, fvel);
+                        case SYNTH_ENGINE_SH101:
+                            cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                            cmd.note = (pad < 16) ? trackSH101Note[pad] : 60;
+                            AudioCmdPush(cmd);
                             break;
-                        }
-                        case SYNTH_ENGINE_FM2OP: {
-                            uint8_t note = (pad < 16) ? trackFM2OpNote[pad] : 60;
-                            synthFM2Op.NoteOn(note, fvel);
+                        case SYNTH_ENGINE_FM2OP:
+                            cmd.type = AUDIO_CMD_SYNTH_NOTE_ON;
+                            cmd.note = (pad < 16) ? trackFM2OpNote[pad] : 60;
+                            AudioCmdPush(cmd);
                             break;
-                        }
                         case SYNTH_ENGINE_PHYS: {
                             float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
                             physModal.SetFreq(freq);
@@ -8319,7 +8685,16 @@ static void ProcessCommand()
                         }
                     }
                 } else {
-                    TriggerPad(pad, vel, tvol, pan, maxS, seqVolume);
+                    AudioCmd cmd{};
+                    cmd.type = AUDIO_CMD_TRIGGER_PAD;
+                    cmd.pad = pad;
+                    cmd.velocity = vel;
+                    cmd.trkVol = tvol;
+                    cmd.pan = pan;
+                    cmd.maxSamples = maxS;
+                    cmd.sourceVolume = seqVolume;
+                    cmd.sourcePitch = 1.0f;
+                    AudioCmdPush(cmd);
                 }
             }
             spiLastTriggerMs = hw.system.GetNow();
