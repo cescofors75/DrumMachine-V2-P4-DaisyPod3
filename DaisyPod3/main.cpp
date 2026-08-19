@@ -4140,23 +4140,27 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
  * consumer never observes a partially-written slot.
  *
  * SCOPE: this queue covers every main-loop-reachable call site of
- * TriggerPad and the 808/909/505/303/WTOSC/SH101/FM2OP trigger/note-on
- * paths explicitly named in the audit — CMD_TRIGGER_LIVE, CMD_TRIGGER_SEQ,
- * CMD_BULK_TRIGGERS, CMD_SYNTH_TRIGGER, CMD_SYNTH_NOTE_ON(_EX), and
- * RunPerformanceStressMode (CMD_DIAG_PERF_STRESS can enable it at runtime,
- * unlike the boot self-test). NOT routed through this queue, and left as
- * direct main-loop/audio-thread writes exactly as before this change:
- *   - PHYS/NOISE engine triggers (SetFreq/SetAccent/Trig + *Active flags —
- *     a different shape than a simple Trigger()/NoteOn() call).
+ * TriggerPad, the 808/909/505/303/WTOSC/SH101/FM2OP trigger/note-on paths
+ * explicitly named in the audit, and PHYS/NOISE (SetFreq, then SetAccent
+ * or SetDensity, then an optional Trig, then the Active flag — a different
+ * shape than a plain Trigger()/NoteOn() call, but the same "several writes
+ * an ISR can read mid-update" risk) — across CMD_TRIGGER_LIVE,
+ * CMD_TRIGGER_SEQ, CMD_BULK_TRIGGERS,
+ * CMD_SYNTH_TRIGGER, CMD_SYNTH_NOTE_ON(_EX), and RunPerformanceStressMode
+ * (CMD_DIAG_PERF_STRESS can enable it at runtime, unlike the boot
+ * self-test). NOT routed through this queue, and left as direct main-loop/
+ * audio-thread writes exactly as before this change:
  *   - NoteOff/"release" helpers (ReleaseAllSynthEngines,
  *     ReleaseSynthEngineState, ReleaseTrackEngine, DsqReleaseAllHeldNotes,
- *     DsqReleaseHeldNotes, CMD_SYNTH_ACTIVE) and scalar parameter setters
+ *     DsqReleaseHeldNotes, CMD_SYNTH_ACTIVE), voice-stop helpers
+ *     (StopPadVoices, SilenceVoicesInPadRange, the several "voices[v].active
+ *     = false" loops in ProcessCommand), and scalar parameter setters
  *     (filter type/cutoff, FX mix, track volume, etc.). These are lower
- *     priority: far less frequent than pad/note triggers, and touch a
- *     single scalar/gate rather than a multi-field voices[] slot, so a
- *     torn read is both rarer and far less audible (a note ending a few ms
- *     early/late, or a one-block-late parameter change, vs. a corrupted
- *     voice).
+ *     priority: far less frequent than pad/note triggers, and each is a
+ *     single scalar/bool write (or several independent ones) rather than a
+ *     multi-field voice/engine being brought up in one specific order, so a
+ *     torn read is both rarer and far less audible — worst case a note
+ *     stops or a parameter updates one block late, not a corrupted voice.
  *   - RunStartup808SelfTest / RunStartupShowcaseDemo: boot-only demos,
  *     compile-time disabled by default (RED808_STARTUP_808_SELF_TEST=0,
  *     RED808_STARTUP_SHOWCASE_DEMO=0).
@@ -4171,6 +4175,7 @@ enum AudioCmdType : uint8_t
     AUDIO_CMD_SYNTH_TRIGGER,  /* 808/909/505 drum hit */
     AUDIO_CMD_SYNTH_NOTE_ON,  /* 303/WTOSC/SH101/FM2OP melodic note-on */
     AUDIO_CMD_SYNTH_NOTE_OFF, /* matching note-off / panic-all (engine=0xFF) */
+    AUDIO_CMD_PHYS_NOISE,     /* PHYS/NOISE: SetFreq+SetAccent/SetDensity+[Trig]+Active */
 };
 
 struct AudioCmd
@@ -4191,6 +4196,7 @@ struct AudioCmd
                             * (only CMD_SYNTH_NOTE_ON_EX did this originally —
                             * CMD_SYNTH_TRIGGER/CMD_TRIGGER_LIVE/SEQ/BULK never
                             * did, so they must NOT set this). */
+    uint8_t  trig;         /* bool: also call .Trig() (PHYS via NOTE_ON_EX only) */
     uint32_t maxSamples;   /* pad-trigger */
     float    sourceVolume; /* pad-trigger */
     float    sourcePitch;  /* pad-trigger */
@@ -4284,6 +4290,44 @@ static void AudioCmdApplyNoteOff(const AudioCmd& c)
     }
 }
 
+static void AudioCmdApplyPhysNoise(const AudioCmd& c)
+{
+    /* PHYS/NOISE never had a single Trigger()/NoteOn() call — main-loop code
+     * did SetFreq + SetAccent/SetDensity + [Trig] + *Active=true as several
+     * separate writes. AudioCallback's Process() reads physModal/physString/
+     * noisePart state every sample once *Active is true, so doing those
+     * writes from the main loop while a voice is already active carries the
+     * same "reader observes an inconsistent mid-update state" risk as
+     * TriggerPad — just spread across a few calls instead of one struct. */
+    const float freq = 440.f * powf(2.f, (c.note - 69) / 12.f);
+    const float vel01 = c.velocity / 127.0f;
+    if(c.engine == SYNTH_ENGINE_PHYS)
+    {
+        if(c.pianoGate && c.engine != pianoSelectedEngine)
+        {
+            ReleaseAllSynthEngines();
+            pianoSelectedEngine = c.engine;
+        }
+        physModal.SetFreq(freq);
+        physString.SetFreq(freq);
+        physModal.SetAccent(vel01);
+        physString.SetAccent(vel01);
+        if(c.trig)
+        {
+            physModal.Trig();
+            physString.Trig();
+        }
+        physModalActive = true;
+        physStringActive = true;
+    }
+    else if(c.engine == SYNTH_ENGINE_NOISE)
+    {
+        noisePart.SetFreq(freq);
+        noisePart.SetDensity(0.5f + vel01 * 0.5f);
+        noisePartActive = true;
+    }
+}
+
 /* Consumer: AudioCallback only, called once at the top of every block —
  * never from anywhere else (single-consumer ring). */
 static void AudioCmdDrainAndApply()
@@ -4299,6 +4343,7 @@ static void AudioCmdDrainAndApply()
             case AUDIO_CMD_SYNTH_TRIGGER:  AudioCmdApplySynthTrigger(cmd); break;
             case AUDIO_CMD_SYNTH_NOTE_ON:  AudioCmdApplyNoteOn(cmd);       break;
             case AUDIO_CMD_SYNTH_NOTE_OFF: AudioCmdApplyNoteOff(cmd);      break;
+            case AUDIO_CMD_PHYS_NOISE:     AudioCmdApplyPhysNoise(cmd);    break;
             default: break;
         }
     }
@@ -6359,23 +6404,16 @@ static void ProcessCommand()
                         cmd.note = (pad < 16) ? trackFM2OpNote[pad] : 60;
                         AudioCmdPush(cmd);
                         break;
-                    case SYNTH_ENGINE_PHYS: {
-                        float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
-                        physModal.SetFreq(freq);
-                        physString.SetFreq(freq);
-                        physModal.SetAccent(fvel);
-                        physString.SetAccent(fvel);
-                        physModalActive = true;
-                        physStringActive = true;
+                    case SYNTH_ENGINE_PHYS:
+                        cmd.type = AUDIO_CMD_PHYS_NOISE;
+                        cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
-                    case SYNTH_ENGINE_NOISE: {
-                        float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
-                        noisePart.SetFreq(freq);
-                        noisePart.SetDensity(0.5f + fvel * 0.5f);
-                        noisePartActive = true;
+                    case SYNTH_ENGINE_NOISE:
+                        cmd.type = AUDIO_CMD_PHYS_NOISE;
+                        cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
                 }
             } else {
                 /* Modo sampler (por defecto) */
@@ -6464,23 +6502,16 @@ static void ProcessCommand()
                         cmd.note = (pad < 16) ? trackFM2OpNote[pad] : 60;
                         AudioCmdPush(cmd);
                         break;
-                    case SYNTH_ENGINE_PHYS: {
-                        float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
-                        physModal.SetFreq(freq);
-                        physString.SetFreq(freq);
-                        physModal.SetAccent(fvel);
-                        physString.SetAccent(fvel);
-                        physModalActive = true;
-                        physStringActive = true;
+                    case SYNTH_ENGINE_PHYS:
+                        cmd.type = AUDIO_CMD_PHYS_NOISE;
+                        cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
-                    case SYNTH_ENGINE_NOISE: {
-                        float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
-                        noisePart.SetFreq(freq);
-                        noisePart.SetDensity(0.5f + fvel * 0.5f);
-                        noisePartActive = true;
+                    case SYNTH_ENGINE_NOISE:
+                        cmd.type = AUDIO_CMD_PHYS_NOISE;
+                        cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                        AudioCmdPush(cmd);
                         break;
-                    }
                 }
             } else {
                 AudioCmd cmd{};
@@ -8257,27 +8288,16 @@ static void ProcessCommand()
                     cmd.note = (instrument < 16) ? trackFM2OpNote[instrument] : 60;
                     AudioCmdPush(cmd);
                     break;
-                case SYNTH_ENGINE_PHYS: {
-                    float velocity = p[2] / 127.0f;
-                    uint8_t note = (instrument < 16) ? trackWtNote[instrument] : 60;
-                    float freq = 440.f * powf(2.f, (note - 69) / 12.f);
-                    physModal.SetFreq(freq);
-                    physString.SetFreq(freq);
-                    physModal.SetAccent(velocity);
-                    physString.SetAccent(velocity);
-                    physModalActive = true;
-                    physStringActive = true;
+                case SYNTH_ENGINE_PHYS:
+                    cmd.type = AUDIO_CMD_PHYS_NOISE;
+                    cmd.note = (instrument < 16) ? trackWtNote[instrument] : 60;
+                    AudioCmdPush(cmd);
                     break;
-                }
-                case SYNTH_ENGINE_NOISE: {
-                    float velocity = p[2] / 127.0f;
-                    uint8_t note = (instrument < 16) ? trackWtNote[instrument] : 60;
-                    float freq = 440.f * powf(2.f, (note - 69) / 12.f);
-                    noisePart.SetFreq(freq);
-                    noisePart.SetDensity(0.5f + velocity * 0.5f);
-                    noisePartActive = true;
+                case SYNTH_ENGINE_NOISE:
+                    cmd.type = AUDIO_CMD_PHYS_NOISE;
+                    cmd.note = (instrument < 16) ? trackWtNote[instrument] : 60;
+                    AudioCmdPush(cmd);
                     break;
-                }
             }
         }
         break;
@@ -8532,15 +8552,13 @@ static void ProcessCommand()
             uint8_t velocity = p[2];
             bool    accent   = (p[3] != 0);
             bool    slide    = (p[4] != 0);
-            float   vel01    = velocity / 127.0f;
             /* The piano-engine auto-select (ReleaseAllSynthEngines +
-             * pianoSelectedEngine write) moved INTO AudioCmdApplyNoteOn for
-             * 303/WTOSC/SH101/FM2OP (cmd.pianoGate below) so it lands on the
-             * audio thread glued to the note-on it gates, instead of racing
-             * ahead of it from the main loop. PHYS isn't queued yet (see the
-             * AudioCmd scope note above TriggerPad's definition), so its
-             * gate stays direct, exactly as before, inside that case. This
-             * is only a would-it-fire check for the diagnostic log. */
+             * pianoSelectedEngine write) moved INTO AudioCmdApplyNoteOn /
+             * AudioCmdApplyPhysNoise (cmd.pianoGate below, for 303/WTOSC/
+             * SH101/FM2OP/PHYS) so it lands on the audio thread glued to
+             * the note-on it gates, instead of racing ahead of it from the
+             * main loop. This check is only a would-it-fire read for the
+             * diagnostic log — the actual gate runs once, at apply time. */
             if(kEnableSynthCmdLog && IsPianoMelodicEngine(engine)
                && engine != pianoSelectedEngine)
                 hw.PrintLine("PIANO_SELECT via=note_on engine=%u", engine);
@@ -8569,27 +8587,23 @@ static void ProcessCommand()
                     break;
                 }
                 case SYNTH_ENGINE_PHYS: {
-                    if(engine != pianoSelectedEngine)
-                    {
-                        ReleaseAllSynthEngines();
-                        pianoSelectedEngine = engine;
-                    }
-                    float freq = 440.f * powf(2.f, (midiNote - 69) / 12.f);
-                    physModal.SetFreq(freq);
-                    physString.SetFreq(freq);
-                    physModal.SetAccent(vel01);
-                    physString.SetAccent(vel01);
-                    physModal.Trig();
-                    physString.Trig();
-                    physModalActive = true;
-                    physStringActive = true;
+                    AudioCmd cmd{};
+                    cmd.type = AUDIO_CMD_PHYS_NOISE;
+                    cmd.engine = engine;
+                    cmd.note = midiNote;
+                    cmd.velocity = velocity;
+                    cmd.pianoGate = 1;
+                    cmd.trig = 1;
+                    AudioCmdPush(cmd);
                     break;
                 }
                 case SYNTH_ENGINE_NOISE: {
-                    float freq = 440.f * powf(2.f, (midiNote - 69) / 12.f);
-                    noisePart.SetFreq(freq);
-                    noisePart.SetDensity(0.5f + vel01 * 0.5f);
-                    noisePartActive = true;
+                    AudioCmd cmd{};
+                    cmd.type = AUDIO_CMD_PHYS_NOISE;
+                    cmd.engine = engine;
+                    cmd.note = midiNote;
+                    cmd.velocity = velocity;
+                    AudioCmdPush(cmd);
                     break;
                 }
                 default:
@@ -8666,23 +8680,16 @@ static void ProcessCommand()
                             cmd.note = (pad < 16) ? trackFM2OpNote[pad] : 60;
                             AudioCmdPush(cmd);
                             break;
-                        case SYNTH_ENGINE_PHYS: {
-                            float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
-                            physModal.SetFreq(freq);
-                            physString.SetFreq(freq);
-                            physModal.SetAccent(fvel);
-                            physString.SetAccent(fvel);
-                            physModalActive = true;
-                            physStringActive = true;
+                        case SYNTH_ENGINE_PHYS:
+                            cmd.type = AUDIO_CMD_PHYS_NOISE;
+                            cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                            AudioCmdPush(cmd);
                             break;
-                        }
-                        case SYNTH_ENGINE_NOISE: {
-                            float freq = 440.f * powf(2.f, ((pad < 16 ? trackWtNote[pad] : 60) - 69) / 12.f);
-                            noisePart.SetFreq(freq);
-                            noisePart.SetDensity(0.5f + fvel * 0.5f);
-                            noisePartActive = true;
+                        case SYNTH_ENGINE_NOISE:
+                            cmd.type = AUDIO_CMD_PHYS_NOISE;
+                            cmd.note = (pad < 16) ? trackWtNote[pad] : 60;
+                            AudioCmdPush(cmd);
                             break;
-                        }
                     }
                 } else {
                     AudioCmd cmd{};

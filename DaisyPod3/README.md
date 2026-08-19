@@ -33,21 +33,38 @@ mismo instante es una condición de carrera real: una escritura a medias en
 `voices[slot]` puede audible como click, silencio o, en el peor caso,
 `HardFault`.
 
-Para las rutas de mayor tráfico — disparo de pad (`TriggerPad`) y disparo/
-note-on de los sintetizadores 808/909/505/303/WTOSC/SH101/FM2OP — el bucle
-principal ya no llama a esas funciones directamente. En su lugar encola un
-`AudioCmd` en un ring SPSC (`AudioCmdPush`, ver `main.cpp` justo después de
-`TriggerPad`) y `AudioCmdDrainAndApply()`, invocado al inicio de cada bloque de
-`AudioCallback`, ejecuta la llamada real ya en el hilo de audio. Solo hay un
-escritor de `voices[]`/los motores para esas rutas.
+Para las rutas de mayor tráfico — disparo de pad (`TriggerPad`), disparo/
+note-on de los sintetizadores 808/909/505/303/WTOSC/SH101/FM2OP, y el disparo
+de PHYS/NOISE (SetFreq + SetAccent/SetDensity + `Trig()` opcional + flag
+`*Active`) — el bucle principal ya no llama a esas funciones directamente. En
+su lugar encola un `AudioCmd` en un ring SPSC (`AudioCmdPush`, ver `main.cpp`
+justo después de `TriggerPad`) y `AudioCmdDrainAndApply()`, invocado al
+inicio de cada bloque de `AudioCallback`, ejecuta la llamada real ya en el
+hilo de audio. Solo hay un escritor de `voices[]`/los motores para esas
+rutas.
 
-Quedan fuera de esta cola (documentado en el comentario junto a la
-definición): los motores PHYS/NOISE, los helpers de "release"/NoteOff
-(`ReleaseAllSynthEngines`, `CMD_SYNTH_ACTIVE`, etc.) y los setters de
-parámetros escalares (tipo de filtro, mezcla de FX, volumen de pista...).
-Son de menor prioridad: mucho menos frecuentes que un trigger y tocan un
-único campo escalar en vez de una voz completa de varios campos, así que una
-lectura a medias es tanto más rara como mucho menos audible.
+Quedan fuera de esta cola, deliberadamente:
+
+- **Helpers de "release"/NoteOff** (`ReleaseAllSynthEngines`,
+  `ReleaseSynthEngineState`, `ReleaseTrackEngine`, `CMD_SYNTH_ACTIVE`,
+  `DsqReleaseAllHeldNotes`...) y los bucles que paran voces
+  (`StopPadVoices`, `SilenceVoicesInPadRange`,
+  `voices[v].active = false` sueltos). Investigado y descartado a
+  propósito: en `CMD_SYNTH_PRESET`, por ejemplo, el release va seguido
+  *síncronamente* de `ApplySynthPreset(engine, preset)` en el mismo
+  handler. Encolar solo el release dejaría una ventana de ~2 ms donde
+  `ApplySynthPreset` corre en el main loop ANTES de que el release llegue
+  al hilo de audio — el preset nuevo podría aplicarse y luego el release
+  cortar una nota que acababa de empezar con él. Arreglarlo bien exigiría
+  encolar el preset-load *junto con* el release como una única operación
+  atómica (el mismo patrón que ya se usa para el piano-gate), lo cual es
+  más cambio y más riesgo del que justifica cerrar una race de un solo
+  booleano (una voz que se corta unos ms tarde, no una voz corrupta).
+- **Setters de parámetros escalares** (tipo de filtro, mezcla de FX,
+  volumen de pista...). Mucho menos frecuentes que un trigger y tocan un
+  único campo escalar en vez de una voz/motor completo con varios campos
+  en un orden concreto, así que una lectura a medias es tanto más rara
+  como mucho menos audible.
 
 Esta migración se verificó con una compilación limpia (`make`, sin
 warnings) y una revisión manual campo a campo contra el código original,
