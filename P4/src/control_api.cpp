@@ -597,6 +597,15 @@ void control_process()
 // ── User MIDI map / LEARN API ────────────────────────────────────────
 void control_midi_learn_arm(bool armed)
 {
+    if(armed)
+    {
+        // Discard whatever is already queued so LEARN captures the next
+        // FRESH press. Without this, a note/CC left over from normal play
+        // just before arming (backlog from the 50 ms poll cadence) could be
+        // captured instead of the pad/knob the user actually touches.
+        MidiMonitorEvent stale;
+        while(daisyUsb.popMidiEvent(stale)) {}
+    }
     midiLearnArmed.store(armed, std::memory_order_release);
 }
 

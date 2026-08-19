@@ -2844,9 +2844,33 @@ static void mpd_pad_action_text(uint8_t type, uint8_t arg0, uint8_t arg1,
                                 char* out, size_t outSize) {
     using namespace red808_mpd218;
     switch (type) {
-        case PAD_TRIGGER_SAMPLE:
-            snprintf(out, outSize, "SAMPLE %02u", (unsigned)arg0 + 1u);
+        case PAD_TRIGGER_SAMPLE: {
+            // This action triggers whatever sound the P4 pad currently
+            // holds — show that live, not a static "SAMPLE NN": if PAD
+            // SOUND on HOME reassigns the pad, the MIDI MAP view (and any
+            // AKAI key mapped to it) should read that change immediately.
+            // arg0 also covers the 8 XTRA pads (16..23), which only ever
+            // hold a sample — s_pad_inst_sel[]/MPD_DRUM_PAD_NAMES[] cover
+            // just the 16 main pads, so only consult them below that.
+            const uint8_t pad = arg0 < 24 ? arg0 : 0;
+            const uint8_t inst = pad < 16 ? s_pad_inst_sel[pad] : 0;
+            if (inst == 0) { // Sampler (or an XTRA pad)
+                if (p4.sample_name[pad][0] != '\0')
+                    snprintf(out, outSize, "S%02u %s", pad + 1u,
+                             p4.sample_name[pad]);
+                else
+                    snprintf(out, outSize, "SAMPLE %02u", pad + 1u);
+            } else if (inst >= 1 && inst <= 3) { // 808/909/505
+                static const char* const engines[3] = {"808", "909", "505"};
+                snprintf(out, outSize, "%s %s", engines[inst - 1],
+                         MPD_DRUM_PAD_NAMES[inst - 1][pad]);
+            } else if (inst < 8) { // melodic: 303/WT/FM2/SH101
+                snprintf(out, outSize, "%s MELODIC", PAD_INST_SHORT[inst]);
+            } else {
+                snprintf(out, outSize, "SAMPLE %02u", pad + 1u);
+            }
             break;
+        }
         case PAD_TRIGGER_MELODIC: {
             char note[6] = {};
             mpd_note_name(arg0, note, sizeof(note));
@@ -3652,9 +3676,23 @@ static void mpd_map_modal_update(void) {
             }
             int glowPad = -1;
             if (red808_mpd218::DecodePad(channel, data0, device, bank, layer,
-                                         index))
+                                         index)) {
+                // DecodePad resolves index relative to the event's OWN
+                // device/bank/layer, not necessarily the one on screen. If
+                // the AKAI is sitting on a different program than what is
+                // shown, glowing `index` directly lit the wrong on-screen
+                // cell (whatever pad happens to share that position in the
+                // CURRENT layer). Snap the view to match instead, so the
+                // grid the user sees is always the one actually playing.
+                if (device != s_mpd_device || bank != s_mpd_bank
+                    || layer != s_mpd_pad_layer) {
+                    s_mpd_device = device;
+                    s_mpd_bank = bank;
+                    s_mpd_pad_layer = layer;
+                    mpd_map_refresh();
+                }
                 glowPad = index;
-            else if (data0 >= red808_mpd218::kPadNoteBase[s_mpd_pad_layer]
+            } else if (data0 >= red808_mpd218::kPadNoteBase[s_mpd_pad_layer]
                      && data0 < red808_mpd218::kPadNoteBase[s_mpd_pad_layer]
                                 + 16)
                 glowPad = data0
@@ -3671,8 +3709,18 @@ static void mpd_map_modal_update(void) {
             }
             int glowKnob = -1;
             if (red808_mpd218::DecodeKnob(channel, data0, device, bank, layer,
-                                          index))
+                                          index)) {
+                // Same fix as the pad case: follow the incoming CC's real
+                // program/layer instead of assuming it matches the screen.
+                if (device != s_mpd_device || bank != s_mpd_bank
+                    || layer != s_mpd_knob_layer) {
+                    s_mpd_device = device;
+                    s_mpd_bank = bank;
+                    s_mpd_knob_layer = layer;
+                    mpd_map_refresh();
+                }
                 glowKnob = index;
+            }
             else if (data0 >= red808_mpd218::kKnobCcBase[s_mpd_knob_layer]
                      && data0 < red808_mpd218::kKnobCcBase[s_mpd_knob_layer]
                                 + 6)
