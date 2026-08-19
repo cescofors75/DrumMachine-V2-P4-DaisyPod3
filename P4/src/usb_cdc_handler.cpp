@@ -107,20 +107,34 @@ static void on_cdc_event(const cdc_acm_host_dev_event_data_t *event, void *user_
 }
 
 // Called when ANY new USB device is detected by the host
+//
+// FASE 0 — prueba de transparencia de hub USB (ver plan de arquitectura
+// AKAI -> H4MIDI USB -> P4 -> Daisy): este callback ya se disparaba para
+// cada dispositivo nuevo que el host enumera, Daisy incluida, así que sirve
+// tal cual para comprobar si, al conectar un hub USB al puerto OTG del P4,
+// el stack ve el hub Y los dispositivos que cuelgan de él (transparencia de
+// hub) o si se queda solo con uno. Lo único que añadimos aquí es dejar la
+// clasificación explícita en el log (DAISY / HUB / OTRO) en vez de obligar
+// a comparar VID/PID a mano mientras se mira el monitor serie en directo.
+// No toca nada del enlace CDC con la Daisy.
 static void on_new_dev(usb_device_handle_t usb_dev) {
-    s_dev_detect_count.fetch_add(1, std::memory_order_relaxed);
+    int detect_num = s_dev_detect_count.fetch_add(1, std::memory_order_relaxed) + 1;
     // Use snprintf to build one message at a time (avoids race conditions on Serial)
     char buf[256];
 
     const usb_device_desc_t *desc;
     if (usb_host_get_device_descriptor(usb_dev, &desc) == ESP_OK) {
+        const bool is_daisy = (desc->idVendor == DAISY_USB_VID && desc->idProduct == DAISY_USB_PID);
+        const bool is_hub = (desc->bDeviceClass == 0x09); // USB_CLASS_HUB
+        const char* kind = is_daisy ? "DAISY" : (is_hub ? "HUB" : "OTHER");
         snprintf(buf, sizeof(buf),
-            "[USB-CDC] NEW DEV VID=0x%04X PID=0x%04X class=%d sub=%d configs=%d bcdUSB=0x%04X\n",
-            desc->idVendor, desc->idProduct, desc->bDeviceClass, desc->bDeviceSubClass,
-            desc->bNumConfigurations, desc->bcdUSB);
+            "[USB-CDC] FASE0 NEW DEV #%d [%s] VID=0x%04X PID=0x%04X class=%d sub=%d configs=%d bcdUSB=0x%04X\n",
+            detect_num, kind, desc->idVendor, desc->idProduct, desc->bDeviceClass,
+            desc->bDeviceSubClass, desc->bNumConfigurations, desc->bcdUSB);
         P4_LOG_PRINT(buf);
     } else {
-        P4_LOG_PRINTLN("[USB-CDC] NEW DEVICE: (no descriptor)");
+        snprintf(buf, sizeof(buf), "[USB-CDC] FASE0 NEW DEV #%d: (no descriptor)\n", detect_num);
+        P4_LOG_PRINT(buf);
     }
 
     // Dump config descriptor to find the CDC interface index
