@@ -72,3 +72,38 @@ pero **no se ha probado en hardware real**. Antes de darla por buena en
 producción: cargar samples por USB mientras suena el secuenciador, un
 stress test con `CMD_DIAG_PERF_STRESS`, e inyección de MIDI rápido (redobles)
 mientras se reasignan pads desde P4.
+
+## Ring USB (tercer contexto de ejecución)
+
+`DaisyUsbRxCallback` corre en la IRQ del periférico USB (`FS_INTERNAL`) —
+un tercer contexto además del bucle principal y la IRQ de audio. El ring
+`usbRxRing`/`usbRxHead`/`usbRxTail` que lo conecta con `ProcessDaisyUsb`
+(bucle principal) ya usaba variables `volatile`, pero le faltaba `__DMB()`
+entre escribir el byte y publicar el índice — igual que la cola de audio,
+sin la barrera el consumidor podía en teoría ver el índice actualizado
+antes de que el byte fuera visible. Añadido en productor y consumidor.
+
+## Bandera `sampleLoaded[]` y coherencia de caché D en SDRAM
+
+Verificado a fondo (el audit original pedía `SCB_CleanDCache_by_Addr` tras
+cargar samples en SDRAM):
+
+- **`sampleLoaded[]` no era `volatile`** (a diferencia de `padLoading[]`, que
+  sí lo es) y se publicaba sin barrera tras escribir los datos del sample —
+  esto sí era una carencia real. Corregido: ahora es `volatile`, y
+  `CMD_SAMPLE_END`, `LoadWavToPad` y el cargador QSPI de arranque hacen
+  `__DMB()` justo antes de publicar la bandera, después de escribir todos
+  los campos relacionados (incluido `sampleRateHz`, que antes se escribía
+  *después* de publicar `sampleLoaded`, dejando una ventana donde el ISR
+  podía leer el sample con el pitch equivocado).
+- **La coherencia de caché D en SDRAM ya estaba resuelta**, pero no en
+  `main.cpp`: `third_party/libDaisy/src/util/sd_diskio.c` (`SD_read`/
+  `SD_write`) ya hace `SCB_CleanDCache_by_Addr` +
+  `SCB_InvalidateDCache_by_Addr` alrededor de toda lectura/escritura DMA a
+  SD (`ENABLE_SD_DMA_CACHE_MAINTENANCE` está fijo a `1`) — es el único sitio
+  donde DMA escribe samples directo en SDRAM (el *fast path* de WAV mono
+  16-bit en `LoadWavToPad`, vía `f_read`). La carga desde QSPI (lectura
+  *memory-mapped* por CPU) y `CMD_SAMPLE_DATA` por USB (`memcpy` por CPU
+  desde `rxBuf`) nunca usan DMA hacia SDRAM: mismo núcleo escribe, mismo
+  núcleo lee más tarde en `AudioCallback` — coherente por construcción, sin
+  necesitar mantenimiento de caché.

@@ -598,6 +598,14 @@ static uint8_t  usbParseBuf[RX_BUF_SIZE];
 static uint16_t usbParseIdx = 0;
 static uint32_t usbLastPacketMs = 0;
 
+/* Producer: runs from the USB peripheral IRQ (FS_INTERNAL RX callback),
+ * a THIRD execution context alongside the main loop and the audio IRQ.
+ * usbRxRing/Head/Tail are `volatile`, which stops the compiler reordering
+ * these accesses relative to each other, but on Cortex-M7 that alone does
+ * not guarantee the CPU's own memory system publishes the byte write
+ * before the index write becomes visible to the main-loop consumer (same
+ * reasoning as the AudioCmd queue's __DMB() — see the comment above
+ * TriggerPad's definition). Add the same barrier here. */
 static void DaisyUsbRxCallback(uint8_t* data, uint32_t* length)
 {
     if(data == nullptr || length == nullptr)
@@ -611,6 +619,7 @@ static void DaisyUsbRxCallback(uint8_t* data, uint32_t* length)
             break;
         }
         usbRxRing[usbRxHead] = data[i];
+        __DMB(); /* byte write must be visible before the index publishes it */
         usbRxHead = next;
     }
 }
@@ -707,7 +716,12 @@ static uint32_t sampleTotalSamples[MAX_PADS];
 static uint32_t sampleRateHz[MAX_PADS];
 static uint32_t sampleOffsetSamples[MAX_PADS];
 static uint32_t sampleCapacitySamples[MAX_PADS];
-static bool     sampleLoaded[MAX_PADS];
+/* volatile: the ISR (AudioCallback/TriggerPad) gates every read of
+ * sampleStorage/sampleLength/sampleOffsetSamples on this flag. Main-loop
+ * loaders (CMD_SAMPLE_END, LoadWavToPad, the QSPI boot loader) __DMB()
+ * right before publishing it, so the ISR never observes it true while the
+ * sample data it guards is still being written — see those call sites. */
+static volatile bool sampleLoaded[MAX_PADS];
 static volatile bool padLoading[MAX_PADS];  /* true while LoadWavToPad is writing */
 static uint32_t cleanTrackLength[CLEAN_TRACK_COUNT];
 static uint32_t cleanTrackTotalSamples[CLEAN_TRACK_COUNT];
@@ -7530,6 +7544,14 @@ static void ProcessCommand()
                     if(sampleTotalSamples[pad] > MAX_SAMPLE_BYTES / 2)
                         sampleTotalSamples[pad] = MAX_SAMPLE_BYTES / 2;
                     sampleLength[pad] = sampleTotalSamples[pad];
+                    /* Every CMD_SAMPLE_DATA memcpy into sampleData[] and the
+                     * sampleLength write above must be visible to the audio
+                     * ISR before it sees sampleLoaded[pad]==true and starts
+                     * reading this pad's samples (TriggerPad gates on this
+                     * flag). Without the barrier a stale/partial read is
+                     * possible even though both run on the same core, since
+                     * neither sampleData[] nor sampleLength[] is volatile. */
+                    __DMB();
                     sampleLoaded[pad] = true;
                     /* A WAV loaded into a LIVE pad always becomes its audible
                      * source. Otherwise the boot fallback 909/505 engine keeps
@@ -10104,6 +10126,7 @@ static void ProcessDaisyUsb()
     uint16_t budget = USB_RX_RING_SIZE;
     while(usbRxTail != usbRxHead && budget-- > 0)
     {
+        __DMB(); /* pairs with the producer's __DMB() before it publishes head */
         const uint8_t byte = usbRxRing[usbRxTail];
         usbRxTail = (usbRxTail + 1u) & USB_RX_RING_MASK;
 
@@ -10484,15 +10507,29 @@ static bool LoadWavToPad(const char* filepath, uint8_t padIdx)
     }
 
     sampleTotalSamples[padIdx] = sampleLength[padIdx];
-    sampleLoaded[padIdx] = (sampleLength[padIdx] > 0);
-    if(sampleLoaded[padIdx])
-        sampleRateHz[padIdx] = sr;
-    if(sampleLoaded[padIdx] && synth505PcmMode && padIdx < 16)
-        synth505.SetPcmSample(padTo505[padIdx], SamplePtr(padIdx),
-                              sampleLength[padIdx], (float)sampleRateHz[padIdx]);
-    if(sampleLoaded[padIdx] && synth909PcmMode && Is909PcmPad(padIdx))
-        synth909.SetPcmSample(padTo909[padIdx], SamplePtr(padIdx),
-                              sampleLength[padIdx], (float)sampleRateHz[padIdx]);
+    {
+        /* Braced so `loaded` goes out of scope before the `done:` label
+         * below — the goto's above it would otherwise jump into (skip)
+         * this initialization, which C++ rejects. */
+        const bool loaded = sampleLength[padIdx] > 0;
+        if(loaded)
+            sampleRateHz[padIdx] = sr;
+        if(loaded && synth505PcmMode && padIdx < 16)
+            synth505.SetPcmSample(padTo505[padIdx], SamplePtr(padIdx),
+                                  sampleLength[padIdx], (float)sampleRateHz[padIdx]);
+        if(loaded && synth909PcmMode && Is909PcmPad(padIdx))
+            synth909.SetPcmSample(padTo909[padIdx], SamplePtr(padIdx),
+                                  sampleLength[padIdx], (float)sampleRateHz[padIdx]);
+
+        /* Publish last: every write above (the sample data filled earlier
+         * in this function, sampleLength/sampleTotalSamples/sampleRateHz,
+         * and the PCM pointers just handed to synth505/909) must be
+         * visible before the audio ISR can see sampleLoaded[padIdx]==true
+         * and start using this pad — TriggerPad and the PCM playback path
+         * both gate on this flag. */
+        __DMB();
+        sampleLoaded[padIdx] = loaded;
+    }
 
     ok = sampleLoaded[padIdx];
     if(ok && padIdx < DSQ_TRACKS)
@@ -11241,9 +11278,14 @@ int main()
                     sampleLength[padIdx] = frames;
                 }
                 sampleTotalSamples[padIdx] = sampleLength[padIdx];
-                sampleLoaded[padIdx] = (sampleLength[padIdx] > 0);
-                sampleRateHz[padIdx] = sampleLoaded[padIdx] ? sr : SAMPLE_RATE;
-                if(sampleLoaded[padIdx])
+                const bool loaded = sampleLength[padIdx] > 0;
+                sampleRateHz[padIdx] = loaded ? sr : SAMPLE_RATE;
+                /* Audio is already running at this point in boot (StartAudio
+                 * happened earlier in main()) — publish last, after a
+                 * barrier, same reasoning as LoadWavToPad/CMD_SAMPLE_END. */
+                __DMB();
+                sampleLoaded[padIdx] = loaded;
+                if(loaded)
                     Log("  Pad %2d: %lu frames OK", padIdx, sampleLength[padIdx]);
             }
         } else {
