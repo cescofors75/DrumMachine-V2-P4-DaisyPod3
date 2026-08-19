@@ -9577,10 +9577,15 @@ static void ProcessMpdMidi()
             case NoteOff: {
                 const uint8_t channel = static_cast<uint8_t>(event.channel);
                 const bool pressed = event.type == NoteOn && event.data[1] != 0u;
-                MidiMonitorPush(static_cast<uint8_t>(
-                                    (event.type == NoteOn ? 0x90u : 0x80u)
-                                    | (channel & 0x0Fu)),
-                                event.data[0], event.data[1]);
+                /* Only mirror actual presses into the monitor ring — LEARN
+                 * and the on-screen pad glow only care about note-on, and
+                 * note-off/vel=0 events (roughly half of all pad traffic)
+                 * would otherwise fill the ring and delay/skew what a
+                 * freshly armed LEARN captures. */
+                if(pressed)
+                    MidiMonitorPush(static_cast<uint8_t>(0x90u
+                                                         | (channel & 0x0Fu)),
+                                    event.data[0], event.data[1]);
                 /* A learned assignment beats the compiled factory map and
                  * works on any channel/note the controller happens to send. */
                 if(const MidiMapEntry* learned

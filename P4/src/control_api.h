@@ -118,6 +118,9 @@ void control_request_sync();
 // ── User MIDI map / LEARN (AKAI MPD218) ─────────────────────────────
 void control_midi_learn_arm(bool armed);
 bool control_midi_learn_armed();
+// Bumps whenever an armed LEARN gets auto-disarmed after ~8s with no
+// note/CC captured. UI polls this the same way it polls capture_revision.
+uint32_t control_midi_learn_timeout_revision();
 uint32_t control_midi_capture_revision();
 MidiLearnCapture control_midi_capture();
 uint32_t control_midi_activity_revision();
@@ -130,6 +133,16 @@ bool control_midi_map_find(uint8_t channel, uint8_t kind, uint8_t number,
 bool control_midi_map_assign(const MidiMapEntry& entry);
 bool control_midi_map_clear(uint8_t channel, uint8_t kind, uint8_t number);
 bool control_midi_map_clear_all();
+// Another learned entry already pointing at the same action/target,
+// excluding the (channel,kind,number) about to be overwritten.
+bool control_midi_map_find_duplicate(uint8_t kind, uint8_t action,
+                                     uint8_t arg0, uint8_t arg1,
+                                     uint8_t excludeChannel,
+                                     uint8_t excludeNumber, MidiMapEntry& out);
+// Backup/restore the whole learned map to/from the P4 SD card. Caller
+// should confirm the SD card is mounted before calling either.
+bool control_midi_map_export_sd();
+bool control_midi_map_import_sd();
 
 void local_apply_message(uint8_t type, uint8_t id, uint8_t value);
 void local_push_pattern(int pattern, const bool steps[16][16]);

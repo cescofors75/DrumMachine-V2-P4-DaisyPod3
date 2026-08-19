@@ -1,11 +1,14 @@
 #include "midi_map_store.h"
 
+#include <FS.h>
 #include <Preferences.h>
+#include <SD_MMC.h>
 #include <cstring>
 
 namespace {
 constexpr uint32_t MIDI_STORE_MAGIC = 0x3149444Du; // "MDI1"
 constexpr uint16_t MIDI_STORE_VERSION = 1;
+constexpr const char* MIDI_SD_BACKUP_PATH = "/midi_map_backup.mmap";
 
 struct MidiStoreBlob {
     uint32_t magic;
@@ -73,4 +76,45 @@ bool midi_map_store_save(const MidiMapEntry* entries, uint8_t count)
     const bool ok = prefs.putBytes("map", &blob, sizeof(blob)) == sizeof(blob);
     prefs.end();
     return ok;
+}
+
+bool midi_map_store_export_sd(const MidiMapEntry* entries, uint8_t count)
+{
+    if(count > MIDI_MAP_MAX_ENTRIES) count = MIDI_MAP_MAX_ENTRIES;
+    MidiStoreBlob blob{};
+    blob.magic = MIDI_STORE_MAGIC;
+    blob.version = MIDI_STORE_VERSION;
+    blob.count = count;
+    if(count > 0)
+        memcpy(blob.entries, entries, count * sizeof(MidiMapEntry));
+    blob.checksum = checksum(blob.entries, blob.count);
+
+    if(SD_MMC.exists(MIDI_SD_BACKUP_PATH)) SD_MMC.remove(MIDI_SD_BACKUP_PATH);
+    File file = SD_MMC.open(MIDI_SD_BACKUP_PATH, FILE_WRITE);
+    if(!file) return false;
+    const bool ok = file.write(reinterpret_cast<const uint8_t*>(&blob),
+                               sizeof(blob)) == sizeof(blob);
+    file.flush();
+    file.close();
+    return ok;
+}
+
+bool midi_map_store_import_sd(MidiMapEntry* entries, uint8_t& count)
+{
+    count = 0;
+    File file = SD_MMC.open(MIDI_SD_BACKUP_PATH, FILE_READ);
+    if(!file) return false;
+    MidiStoreBlob blob{};
+    const bool readOk = file.read(reinterpret_cast<uint8_t*>(&blob),
+                                  sizeof(blob)) == sizeof(blob);
+    file.close();
+    if(!readOk || blob.magic != MIDI_STORE_MAGIC
+       || blob.version != MIDI_STORE_VERSION
+       || blob.count > MIDI_MAP_MAX_ENTRIES
+       || blob.checksum != checksum(blob.entries, blob.count))
+        return false;
+    for(uint8_t i = 0; i < blob.count; ++i)
+        if(entryValid(blob.entries[i]))
+            entries[count++] = blob.entries[i];
+    return true;
 }

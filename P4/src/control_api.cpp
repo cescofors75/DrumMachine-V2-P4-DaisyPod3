@@ -72,6 +72,9 @@ uint8_t factoryPatternsFound = 0;
 MidiMapEntry midiMap[MIDI_MAP_MAX_ENTRIES] = {};
 uint8_t midiMapCount = 0;
 std::atomic<bool> midiLearnArmed{false};
+uint32_t midiLearnArmedSinceMs = 0; // loop-task only; guards the timeout below
+std::atomic<uint32_t> midiLearnTimeoutRevision{0};
+constexpr uint32_t kMidiLearnTimeoutMs = 8000;
 std::atomic<uint32_t> midiCaptureRevision{0};
 MidiLearnCapture midiCapture = {};
 std::atomic<uint32_t> midiActivityRevision{0};
@@ -88,6 +91,29 @@ int MidiMapIndexOf(uint8_t channel, uint8_t kind, uint8_t number)
         if(midiMap[i].channel == channel && midiMap[i].kind == kind
            && midiMap[i].number == number)
             return i;
+    return -1;
+}
+
+// Finds another learned entry that already points at the same target
+// (kind+action, and arg0/arg1 too for pad actions that carry a slot
+// number), excluding the (channel,kind,number) about to be overwritten.
+// Two different physical pads/knobs firing the exact same thing is
+// sometimes intentional, sometimes a stray double-assignment — worth a
+// heads-up either way.
+int MidiMapIndexOfDuplicateAction(uint8_t kind, uint8_t action, uint8_t arg0,
+                                  uint8_t arg1, uint8_t excludeChannel,
+                                  uint8_t excludeNumber)
+{
+    for(uint8_t i = 0; i < midiMapCount; ++i)
+    {
+        const MidiMapEntry& e = midiMap[i];
+        if(e.channel == excludeChannel && e.kind == kind
+           && e.number == excludeNumber)
+            continue; // the slot being overwritten, not a collision
+        if(e.kind != kind || e.action != action) continue;
+        if(kind == MIDI_MAP_KIND_CC || (e.arg0 == arg0 && e.arg1 == arg1))
+            return i;
+    }
     return -1;
 }
 
@@ -591,6 +617,12 @@ void control_process()
     }
     engineWasConnected = transport.engine_responding;
     ProcessMidiMonitor();
+    if(midiLearnArmed.load(std::memory_order_acquire)
+       && millis() - midiLearnArmedSinceMs > kMidiLearnTimeoutMs)
+    {
+        midiLearnArmed.store(false, std::memory_order_release);
+        midiLearnTimeoutRevision.fetch_add(1, std::memory_order_release);
+    }
     SequencerInstance().update();
 }
 
@@ -605,8 +637,14 @@ void control_midi_learn_arm(bool armed)
         // captured instead of the pad/knob the user actually touches.
         MidiMonitorEvent stale;
         while(daisyUsb.popMidiEvent(stale)) {}
+        midiLearnArmedSinceMs = millis();
     }
     midiLearnArmed.store(armed, std::memory_order_release);
+}
+
+uint32_t control_midi_learn_timeout_revision()
+{
+    return midiLearnTimeoutRevision.load(std::memory_order_acquire);
 }
 
 bool control_midi_learn_armed()
@@ -684,6 +722,35 @@ bool control_midi_map_clear(uint8_t channel, uint8_t kind, uint8_t number)
 bool control_midi_map_clear_all()
 {
     midiMapCount = 0;
+    midi_map_store_save(midiMap, midiMapCount);
+    SendMidiMapToDaisy();
+    return true;
+}
+
+bool control_midi_map_find_duplicate(uint8_t kind, uint8_t action,
+                                     uint8_t arg0, uint8_t arg1,
+                                     uint8_t excludeChannel,
+                                     uint8_t excludeNumber, MidiMapEntry& out)
+{
+    const int index = MidiMapIndexOfDuplicateAction(
+        kind, action, arg0, arg1, excludeChannel, excludeNumber);
+    if(index < 0) return false;
+    out = midiMap[index];
+    return true;
+}
+
+bool control_midi_map_export_sd()
+{
+    return midi_map_store_export_sd(midiMap, midiMapCount);
+}
+
+bool control_midi_map_import_sd()
+{
+    MidiMapEntry imported[MIDI_MAP_MAX_ENTRIES] = {};
+    uint8_t count = 0;
+    if(!midi_map_store_import_sd(imported, count)) return false;
+    memcpy(midiMap, imported, count * sizeof(MidiMapEntry));
+    midiMapCount = count;
     midi_map_store_save(midiMap, midiMapCount);
     SendMidiMapToDaisy();
     return true;

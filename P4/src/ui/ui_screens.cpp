@@ -750,12 +750,15 @@ static lv_obj_t* s_mpd_dev_btn = NULL;
 static lv_obj_t* s_mpd_prog_btn = NULL;
 static lv_obj_t* s_mpd_padbank_btn = NULL;
 static lv_obj_t* s_mpd_ctrlbank_btn = NULL;
+static lv_obj_t* s_mpd_batch_btn = NULL;
+static bool s_mpd_batch_learn = false;
 static uint8_t s_mpd_device = 0;
 static uint8_t s_mpd_bank = 0;
 static uint8_t s_mpd_pad_layer = 0;
 static uint8_t s_mpd_knob_layer = 0;
 static uint32_t s_mpd_seen_capture_rev = 0;
 static uint32_t s_mpd_seen_activity_rev = 0;
+static uint32_t s_mpd_seen_timeout_rev = 0;
 static unsigned long s_mpd_pad_glow_until[16] = {};
 static unsigned long s_mpd_knob_glow_until[6] = {};
 // Assignment picker (opened by LEARN capture or by tapping a pad/knob cell)
@@ -2916,6 +2919,7 @@ static uint8_t mpd_map_channel(void) {
 static void mpd_map_refresh(void);
 static void mpd_assign_modal_open(const MidiLearnCapture& capture);
 static void mpd_assign_modal_close(void);
+static void mpd_assign_rearm_if_batch(void);
 
 // ── Assignment picker ────────────────────────────────────────────────────────
 
@@ -2962,6 +2966,26 @@ static bool mpd_assign_current_action(uint8_t& type, uint8_t& arg0,
 }
 
 static void mpd_assign_apply(uint8_t action, uint8_t arg0, uint8_t arg1) {
+    // Capture what this slot pointed at BEFORE overwriting it, so the
+    // confirmation toast can show "OLD -> NEW" instead of just the new
+    // sound — makes it obvious a reassignment actually landed on the
+    // intended pad/knob and not somewhere else.
+    uint8_t prevType = 0, prevA0 = 0, prevA1 = 0;
+    const bool hadPrevious =
+        mpd_assign_current_action(prevType, prevA0, prevA1);
+    char before[40] = {};
+    if (hadPrevious) {
+        if (s_mpd_assign_capture.kind == MIDI_MAP_KIND_NOTE)
+            mpd_pad_action_text(prevType, prevA0, prevA1, before,
+                                sizeof(before));
+        else
+            snprintf(before, sizeof(before), "%s",
+                     prevType <= red808_mpd218::KNOB_STEREO_WIDTH
+                         ? MPD_KNOB_ACTION_NAMES[prevType] : "NONE");
+    } else {
+        snprintf(before, sizeof(before), "NONE");
+    }
+
     MidiMapEntry entry{};
     entry.channel = s_mpd_assign_capture.channel;
     entry.kind = s_mpd_assign_capture.kind;
@@ -2976,18 +3000,33 @@ static void mpd_assign_apply(uint8_t action, uint8_t arg0, uint8_t arg1) {
         snprintf(what, sizeof(what), "%s",
                  action <= red808_mpd218::KNOB_STEREO_WIDTH
                      ? MPD_KNOB_ACTION_NAMES[action] : "NONE");
-    char message[72] = {};
-    if (control_midi_map_assign(entry))
-        snprintf(message, sizeof(message), "MAPEADO  CH%u %s%u  >  %s",
-                 (unsigned)entry.channel + 1u,
-                 entry.kind == MIDI_MAP_KIND_NOTE ? "N" : "CC",
-                 (unsigned)entry.number, what);
-    else
+    char message[160] = {};
+    if (control_midi_map_assign(entry)) {
+        int n = snprintf(message, sizeof(message),
+                         "MAPEADO  CH%u %s%u   %s  >  %s",
+                         (unsigned)entry.channel + 1u,
+                         entry.kind == MIDI_MAP_KIND_NOTE ? "N" : "CC",
+                         (unsigned)entry.number, before, what);
+        // Heads-up if another learned pad/knob already fires the exact same
+        // thing — not necessarily wrong (some setups do want two physical
+        // controls sharing one action), but worth flagging so it isn't an
+        // accidental double-assignment.
+        MidiMapEntry dup{};
+        if (n > 0 && n < (int)sizeof(message)
+            && control_midi_map_find_duplicate(
+                   entry.kind, entry.action, entry.arg0, entry.arg1,
+                   entry.channel, entry.number, dup))
+            snprintf(message + n, sizeof(message) - n,
+                     "  (tambien CH%u %s%u)", (unsigned)dup.channel + 1u,
+                     dup.kind == MIDI_MAP_KIND_NOTE ? "N" : "CC",
+                     (unsigned)dup.number);
+    } else
         snprintf(message, sizeof(message), "MAPA LLENO (%u ENTRADAS)",
                  (unsigned)MIDI_MAP_MAX_ENTRIES);
     mpd_assign_feedback(message, MPD_LEARNED_MARK);
     mpd_assign_modal_close();
     mpd_map_refresh();
+    mpd_assign_rearm_if_batch();
 }
 
 static void mpd_assign_option_cb(lv_event_t* e) {
@@ -3118,6 +3157,14 @@ static void mpd_assign_category_cb(lv_event_t* e) {
     mpd_assign_build_options();
 }
 
+// LEARN CONTINUO: re-arms LEARN right after the picker closes, so the user
+// can tap several AKAI pads/knobs in a row without reopening LEARN each
+// time. Called from the apply/remove/cancel paths alike, so backing out of
+// a wrong pick doesn't break the streak.
+static void mpd_assign_rearm_if_batch(void) {
+    if (s_mpd_batch_learn) control_midi_learn_arm(true);
+}
+
 static void mpd_assign_remove_cb(lv_event_t* e) {
     LV_UNUSED(e);
     if (control_midi_map_clear(s_mpd_assign_capture.channel,
@@ -3130,11 +3177,13 @@ static void mpd_assign_remove_cb(lv_event_t* e) {
                             MPD_TEXT_FAINT);
     mpd_assign_modal_close();
     mpd_map_refresh();
+    mpd_assign_rearm_if_batch();
 }
 
 static void mpd_assign_cancel_cb(lv_event_t* e) {
     LV_UNUSED(e);
     mpd_assign_modal_close();
+    mpd_assign_rearm_if_batch();
 }
 
 static void mpd_assign_modal_open(const MidiLearnCapture& capture) {
@@ -3378,6 +3427,17 @@ static void mpd_map_knob_cb(lv_event_t* e) {
     mpd_assign_modal_open(capture);
 }
 
+static void mpd_map_batch_button_refresh(void) {
+    if (!s_mpd_batch_btn) return;
+    lv_obj_set_style_bg_color(s_mpd_batch_btn,
+        s_mpd_batch_learn ? MPD_LEARN_RED : MPD_PANEL_BG, 0);
+    lv_obj_set_style_bg_grad_color(s_mpd_batch_btn,
+        s_mpd_batch_learn ? MPD_LEARN_RED : MPD_BODY_BG, 0);
+    lv_obj_t* label = lv_obj_get_child(s_mpd_batch_btn, 0);
+    if (label) lv_obj_set_style_text_color(label,
+        s_mpd_batch_learn ? lv_color_white() : MPD_TEXT_MAIN, 0);
+}
+
 static void mpd_map_learn_cb(lv_event_t* e) {
     LV_UNUSED(e);
     const bool arm = !control_midi_learn_armed();
@@ -3385,8 +3445,55 @@ static void mpd_map_learn_cb(lv_event_t* e) {
     if (arm)
         mpd_assign_feedback("LEARN ACTIVO — toca un pad o mueve un knob del AKAI",
                             MPD_LEARN_RED);
-    else
+    else {
+        // Manually cancelling LEARN also stops any batch streak in
+        // progress — pressing the red key again is the universal "stop".
+        s_mpd_batch_learn = false;
+        mpd_map_batch_button_refresh();
         mpd_assign_feedback("LEARN cancelado", MPD_TEXT_FAINT);
+    }
+}
+
+static void mpd_map_batch_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    s_mpd_batch_learn = !s_mpd_batch_learn;
+    mpd_map_batch_button_refresh();
+    if (s_mpd_batch_learn) {
+        control_midi_learn_arm(true);
+        mpd_assign_feedback(
+            "LEARN CONTINUO — cada asignacion rearma LEARN sola",
+            MPD_LEARN_RED);
+    } else {
+        mpd_assign_feedback("Learn continuo desactivado", MPD_TEXT_FAINT);
+    }
+}
+
+static void mpd_map_export_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (!p4sd.mounted) {
+        mpd_assign_feedback("EXPORT SD: tarjeta no montada", RED808_WARNING);
+        return;
+    }
+    if (control_midi_map_export_sd())
+        mpd_assign_feedback("Mapa exportado a /midi_map_backup.mmap",
+                            MPD_LEARNED_MARK);
+    else
+        mpd_assign_feedback("EXPORT SD: fallo de escritura", RED808_WARNING);
+}
+
+static void mpd_map_import_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (!p4sd.mounted) {
+        mpd_assign_feedback("IMPORT SD: tarjeta no montada", RED808_WARNING);
+        return;
+    }
+    if (control_midi_map_import_sd()) {
+        mpd_assign_feedback("Mapa importado desde /midi_map_backup.mmap",
+                            MPD_LEARNED_MARK);
+        mpd_map_refresh();
+    } else
+        mpd_assign_feedback("IMPORT SD: sin backup valido en la tarjeta",
+                            RED808_WARNING);
 }
 
 static void mpd_map_clear_cb(lv_event_t* e) {
@@ -3400,6 +3507,7 @@ static void mpd_map_clear_cb(lv_event_t* e) {
 static void mpd_map_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     control_midi_learn_arm(false);
+    s_mpd_batch_learn = false;
     mpd_assign_modal_close();
     if (s_mpd_map_modal) lv_obj_del(s_mpd_map_modal);
     s_mpd_map_modal = NULL;
@@ -3411,6 +3519,7 @@ static void mpd_map_modal_close_cb(lv_event_t* e) {
     s_mpd_prog_btn = NULL;
     s_mpd_padbank_btn = NULL;
     s_mpd_ctrlbank_btn = NULL;
+    s_mpd_batch_btn = NULL;
     memset(s_mpd_pad_cells, 0, sizeof(s_mpd_pad_cells));
     memset(s_mpd_pad_labels, 0, sizeof(s_mpd_pad_labels));
     memset(s_mpd_knob_cells, 0, sizeof(s_mpd_knob_cells));
@@ -3449,6 +3558,7 @@ static void mpd_map_modal_open_cb(lv_event_t* e) {
     // Ignore captures/activity produced before the screen opened.
     s_mpd_seen_capture_rev = control_midi_capture_revision();
     s_mpd_seen_activity_rev = control_midi_activity_revision();
+    s_mpd_seen_timeout_rev = control_midi_learn_timeout_revision();
     memset((void*)s_mpd_pad_glow_until, 0, sizeof(s_mpd_pad_glow_until));
     memset((void*)s_mpd_knob_glow_until, 0, sizeof(s_mpd_knob_glow_until));
 
@@ -3496,6 +3606,14 @@ static void mpd_map_modal_open_cb(lv_event_t* e) {
     lv_obj_center(closeLabel);
     lv_obj_add_event_cb(close, [](lv_event_t*) { mpd_map_modal_close_cb(NULL); },
                         LV_EVENT_CLICKED, NULL);
+
+    s_mpd_batch_btn = mpd_map_make_button(card, 440, 8, 108, 34,
+                                          "BATCH", mpd_map_batch_cb, 0);
+    mpd_map_make_button(card, 556, 8, 108, 34, "EXPORT SD",
+                        mpd_map_export_cb, 0);
+    mpd_map_make_button(card, 672, 8, 108, 34, "IMPORT SD",
+                        mpd_map_import_cb, 0);
+    mpd_map_batch_button_refresh();
 
     s_mpd_map_summary_label = lv_label_create(card);
     lv_obj_set_width(s_mpd_map_summary_label, 948);
@@ -3653,6 +3771,18 @@ static void mpd_map_modal_update(void) {
     if (captureRev != s_mpd_seen_capture_rev) {
         s_mpd_seen_capture_rev = captureRev;
         mpd_assign_modal_open(control_midi_capture());
+    }
+
+    const uint32_t timeoutRev = control_midi_learn_timeout_revision();
+    if (timeoutRev != s_mpd_seen_timeout_rev) {
+        s_mpd_seen_timeout_rev = timeoutRev;
+        // A timeout mid-batch means the user stopped touching the AKAI —
+        // end the streak instead of leaving BATCH lit with nothing armed.
+        s_mpd_batch_learn = false;
+        mpd_map_batch_button_refresh();
+        mpd_assign_feedback(
+            "LEARN CANCELADO — sin pad/knob del AKAI en 8 s",
+            RED808_WARNING);
     }
 
     const uint32_t activityRev = control_midi_activity_revision();
