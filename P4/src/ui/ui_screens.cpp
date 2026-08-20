@@ -4308,10 +4308,14 @@ static void apply_pad_layout(int mode) {
         else            lv_obj_clear_flag(live_home_panels[i], LV_OBJ_FLAG_HIDDEN);
     }
 
+    // Bottom-up row order (row 0 = bottom), matching the physical MPD218's
+    // MPC-style pad numbering: BD/track 0 sits bottom-left in every mode,
+    // not top-left. See create_live_screen()'s pad loop for the same flip.
+    const int rows = count / cols;
     for (int i = 0; i < 16; i++) {
         if (!live_pad_btns[i]) continue;
         if (i < count) {
-            int c = i % cols, r = i / cols;
+            int c = i % cols, r = (rows - 1) - i / cols;
             lv_obj_set_size(live_pad_btns[i], pw, ph);
             lv_obj_set_pos(live_pad_btns[i], M + c*(pw+G), M + r*(ph+G));
             lv_obj_clear_flag(live_pad_btns[i], LV_OBJ_FLAG_HIDDEN);
@@ -4613,8 +4617,12 @@ static void create_live_screen(void) {
     live_home_panels[live_home_panel_count++] = sep;
 
     // === LEFT 4×4: Drum Pads (Neon Ring Style) ===
+    // Bottom-up row order (row 0 = bottom): BD/track 0 sits bottom-left,
+    // matching the physical MPD218's MPC-style pad numbering instead of a
+    // top-left reading order. Keep in sync with apply_pad_layout()'s same
+    // flip and ui_pad_from_xy()'s legacy-fallback row math below.
     for (int i = 0; i < 16; i++) {
-        int c = i % 4, r = i / 4;
+        int c = i % 4, r = 3 - i / 4;
         lv_color_t tc = ui_track_color(i);
 
         live_pad_btns[i] = lv_btn_create(scr_live);
@@ -14474,7 +14482,9 @@ int ui_pad_from_xy(uint16_t x, uint16_t y, uint8_t* cell_x, uint8_t* cell_y) {
     if (col >= 4 || row >= 4) return -1;
     if (cell_x) *cell_x = (uint8_t)constrain((x_in * 127) / (LIVE_CW - 1), 0, 127);
     if (cell_y) *cell_y = (uint8_t)constrain((y_in * 127) / (LIVE_CH - 1), 0, 127);
-    return row * 4 + col;
+    // Bottom-up row order, same flip as create_live_screen()'s pad loop —
+    // row 0 on screen (top) is pad row 3 (BD sits bottom-left, row 3).
+    return (3 - row) * 4 + col;
 }
 
 static inline uint8_t ui_live_pad_velocity(void) {
