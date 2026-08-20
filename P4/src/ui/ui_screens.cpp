@@ -10153,6 +10153,21 @@ static bool sd_factory_autoload_tick(void) {
     return false;
 }
 
+// Re-arms the factory-kit loader so every Coach entry guarantees the 16 pads
+// sound like RED 808 KARZ (kick on 0, snare on 1, ...), regardless of
+// whatever kit the player had loaded for free play. Deliberately does NOT
+// restore the previous kit on exit — that would need a per-pad "what's
+// currently loaded" record that nothing in the app tracks today (see
+// p4.sample_name[], which is declared but never written). Cheap no-op if
+// the loader is still mid-flight from the initial USB connect.
+static void coach_ensure_kit_loaded(void) {
+    const uint8_t state = s_factory_kit_state.load(std::memory_order_acquire);
+    if (state == FACTORY_KIT_COMPLETE || state == FACTORY_KIT_ERROR) {
+        s_factory_result_announced = false;
+        s_factory_kit_state.store(FACTORY_KIT_WAIT_LINK, std::memory_order_release);
+    }
+}
+
 // LVGL task: validate, snapshot the request and launch the worker.
 static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUpload) {
     if (p4sd.selected_file[0] == '\0' || p4sd.selected_is_midi) return false;
@@ -14060,6 +14075,12 @@ void ui_navigate_to(int screen_id) {
     // in the background since coach::tick() runs every loop() regardless
     // of which screen is on-screen.
     if (screen_id != 14 && active_screen == 14) coach::open_home();
+
+    // Entering the coach from anywhere else: guarantee the 16 pads sound
+    // like RED 808 KARZ (kick=0, snare=1, ...) no matter what the player
+    // had loaded for free play, so the lesson patterns are never silent or
+    // mismatched. Left loaded on the way back out — see coach_ensure_kit_loaded().
+    if (screen_id == 14 && active_screen != 14) coach_ensure_kit_loaded();
 
     // Lazy screen creation: create only what the user actually opens.
     switch (screen_id) {
