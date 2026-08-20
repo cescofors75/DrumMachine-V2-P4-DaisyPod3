@@ -754,6 +754,21 @@ static lv_obj_t* s_mpd_padbank_btn = NULL;
 static lv_obj_t* s_mpd_ctrlbank_btn = NULL;
 static lv_obj_t* s_mpd_batch_btn = NULL;
 static bool s_mpd_batch_learn = false;
+// Guided calibration wizard: walks LEARN through all 16 pads + 6 knobs in a
+// fixed order, auto-assigning each capture without the usual picker so a
+// first-time setup is "touch what I say, in order" instead of 22 manual
+// LEARN + pick-from-a-list round trips.
+static lv_obj_t* s_mpd_calib_btn = NULL;
+static bool s_calib_active = false;
+static uint8_t s_calib_index = 0;
+static constexpr uint8_t kCalibPadCount = 16;
+static constexpr uint8_t kCalibKnobCount = 6;
+static constexpr uint8_t kCalibTotal = kCalibPadCount + kCalibKnobCount;
+static const uint8_t kCalibKnobActions[kCalibKnobCount] = {
+    red808_mpd218::KNOB_MASTER_VOLUME, red808_mpd218::KNOB_LIVE_VOLUME,
+    red808_mpd218::KNOB_SEQ_VOLUME,    red808_mpd218::KNOB_TEMPO,
+    red808_mpd218::KNOB_DELAY_MIX,     red808_mpd218::KNOB_REVERB_MIX,
+};
 static uint8_t s_mpd_device = 0;
 static uint8_t s_mpd_bank = 0;
 static uint8_t s_mpd_pad_layer = 0;
@@ -3507,6 +3522,81 @@ static void mpd_map_batch_cb(lv_event_t* e) {
     }
 }
 
+// Defined later in this file, next to the rest of the P4-SD factory-kit
+// loader (coach_ensure_kit_loaded() re-arms sd_factory_autoload_tick() to
+// re-stream RED 808 KARZ onto all 16 pads).
+static void coach_ensure_kit_loaded(void);
+
+static void mpd_map_karz_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    coach_ensure_kit_loaded();
+    mpd_assign_feedback("Cargando RED 808 KARZ en los 16 pads...", MPD_LEARNED_MARK);
+}
+
+static void mpd_calib_button_refresh(void) {
+    if (!s_mpd_calib_btn) return;
+    lv_obj_set_style_bg_color(s_mpd_calib_btn,
+        s_calib_active ? MPD_LEARN_RED : MPD_PANEL_BG, 0);
+    lv_obj_set_style_bg_grad_color(s_mpd_calib_btn,
+        s_calib_active ? MPD_LEARN_RED : MPD_BODY_BG, 0);
+    lv_obj_t* label = lv_obj_get_child(s_mpd_calib_btn, 0);
+    if (label) lv_obj_set_style_text_color(label,
+        s_calib_active ? lv_color_white() : MPD_TEXT_MAIN, 0);
+}
+
+static void mpd_calib_arm_current(void) {
+    if (s_calib_index >= kCalibTotal) {
+        s_calib_active = false;
+        control_midi_learn_arm(false);
+        mpd_calib_button_refresh();
+        mpd_assign_feedback("CALIBRACION COMPLETA — 16 pads + 6 knobs asignados",
+                            MPD_LEARNED_MARK);
+        return;
+    }
+    char msg[72];
+    if (s_calib_index < kCalibPadCount) {
+        snprintf(msg, sizeof(msg), "CALIBRA PAD %u/%u: %s — toca ese pad del AKAI",
+                 (unsigned)s_calib_index + 1u, (unsigned)kCalibPadCount,
+                 MPD_DRUM_PAD_NAMES[0][s_calib_index]);
+    } else {
+        const uint8_t k = s_calib_index - kCalibPadCount;
+        snprintf(msg, sizeof(msg), "CALIBRA KNOB %u/%u: %s — mueve ese knob",
+                 (unsigned)k + 1u, (unsigned)kCalibKnobCount,
+                 MPD_KNOB_ACTION_NAMES[kCalibKnobActions[k]]);
+    }
+    mpd_assign_feedback(msg, MPD_LEARN_RED);
+    control_midi_learn_arm(true);
+}
+
+// Give the "MAPEADO ..." confirmation from mpd_assign_apply() a moment on
+// screen before the prompt for the next pad/knob replaces it.
+static void mpd_calib_advance_timer_cb(lv_timer_t* t) {
+    lv_timer_del(t);
+    if (!s_calib_active) return;  // cancelled while the toast was showing
+    mpd_calib_arm_current();
+}
+
+static void mpd_calib_stop(const char* reason, lv_color_t color) {
+    s_calib_active = false;
+    control_midi_learn_arm(false);
+    mpd_calib_button_refresh();
+    if (reason) mpd_assign_feedback(reason, color);
+}
+
+static void mpd_map_calib_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_calib_active) {
+        mpd_calib_stop("Calibracion cancelada", MPD_TEXT_FAINT);
+        return;
+    }
+    s_calib_active = true;
+    s_calib_index = 0;
+    s_mpd_batch_learn = false;  // calibration owns LEARN — don't fight BATCH
+    mpd_map_batch_button_refresh();
+    mpd_calib_button_refresh();
+    mpd_calib_arm_current();
+}
+
 static void mpd_map_export_cb(lv_event_t* e) {
     LV_UNUSED(e);
     if (!p4sd.mounted) {
@@ -3547,6 +3637,7 @@ static void mpd_map_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     control_midi_learn_arm(false);
     s_mpd_batch_learn = false;
+    s_calib_active = false;
     mpd_assign_modal_close();
     if (s_mpd_map_modal) lv_obj_del(s_mpd_map_modal);
     s_mpd_map_modal = NULL;
@@ -3559,6 +3650,7 @@ static void mpd_map_modal_close_cb(lv_event_t* e) {
     s_mpd_padbank_btn = NULL;
     s_mpd_ctrlbank_btn = NULL;
     s_mpd_batch_btn = NULL;
+    s_mpd_calib_btn = NULL;
     memset(s_mpd_pad_cells, 0, sizeof(s_mpd_pad_cells));
     memset(s_mpd_pad_labels, 0, sizeof(s_mpd_pad_labels));
     memset(s_mpd_knob_cells, 0, sizeof(s_mpd_knob_cells));
@@ -3646,13 +3738,17 @@ static void mpd_map_modal_open_cb(lv_event_t* e) {
     lv_obj_add_event_cb(close, [](lv_event_t*) { mpd_map_modal_close_cb(NULL); },
                         LV_EVENT_CLICKED, NULL);
 
-    s_mpd_batch_btn = mpd_map_make_button(card, 440, 8, 108, 34,
+    mpd_map_make_button(card, 370, 8, 90, 34, "KARZ", mpd_map_karz_cb, 0);
+    s_mpd_calib_btn = mpd_map_make_button(card, 472, 8, 90, 34, "CALIB",
+                                          mpd_map_calib_cb, 0);
+    s_mpd_batch_btn = mpd_map_make_button(card, 574, 8, 90, 34,
                                           "BATCH", mpd_map_batch_cb, 0);
-    mpd_map_make_button(card, 556, 8, 108, 34, "EXPORT SD",
+    mpd_map_make_button(card, 676, 8, 90, 34, "EXPORT",
                         mpd_map_export_cb, 0);
-    mpd_map_make_button(card, 672, 8, 108, 34, "IMPORT SD",
+    mpd_map_make_button(card, 778, 8, 90, 34, "IMPORT",
                         mpd_map_import_cb, 0);
     mpd_map_batch_button_refresh();
+    mpd_calib_button_refresh();
 
     s_mpd_map_summary_label = lv_label_create(card);
     lv_obj_set_width(s_mpd_map_summary_label, 948);
@@ -3809,19 +3905,51 @@ static void mpd_map_modal_update(void) {
     const uint32_t captureRev = control_midi_capture_revision();
     if (captureRev != s_mpd_seen_capture_rev) {
         s_mpd_seen_capture_rev = captureRev;
-        mpd_assign_modal_open(control_midi_capture());
+        const MidiLearnCapture capture = control_midi_capture();
+        if (s_calib_active) {
+            // The wizard applies each capture directly — no picker, no
+            // "which sound is this" question. Wrong kind of input for the
+            // current step (e.g. a stray CC while calibrating pads) just
+            // re-arms and keeps waiting for the right one.
+            const bool wantNote = s_calib_index < kCalibPadCount;
+            const bool kindMatches =
+                (wantNote && capture.kind == MIDI_MAP_KIND_NOTE) ||
+                (!wantNote && capture.kind == MIDI_MAP_KIND_CC);
+            if (kindMatches) {
+                s_mpd_assign_capture = capture;
+                if (wantNote)
+                    mpd_assign_apply(red808_mpd218::PAD_TRIGGER_SAMPLE,
+                                     s_calib_index, 0);
+                else
+                    mpd_assign_apply(
+                        kCalibKnobActions[s_calib_index - kCalibPadCount], 0, 0);
+                ++s_calib_index;
+                lv_timer_t* advance =
+                    lv_timer_create(mpd_calib_advance_timer_cb, 550, NULL);
+                lv_timer_set_repeat_count(advance, 1);
+            } else {
+                control_midi_learn_arm(true);
+            }
+        } else {
+            mpd_assign_modal_open(capture);
+        }
     }
 
     const uint32_t timeoutRev = control_midi_learn_timeout_revision();
     if (timeoutRev != s_mpd_seen_timeout_rev) {
         s_mpd_seen_timeout_rev = timeoutRev;
-        // A timeout mid-batch means the user stopped touching the AKAI —
-        // end the streak instead of leaving BATCH lit with nothing armed.
-        s_mpd_batch_learn = false;
-        mpd_map_batch_button_refresh();
-        mpd_assign_feedback(
-            "LEARN CANCELADO — sin pad/knob del AKAI en 8 s",
-            RED808_WARNING);
+        if (s_calib_active) {
+            mpd_calib_stop("CALIBRACION CANCELADA — sin actividad del AKAI en 8 s",
+                          RED808_WARNING);
+        } else {
+            // A timeout mid-batch means the user stopped touching the AKAI —
+            // end the streak instead of leaving BATCH lit with nothing armed.
+            s_mpd_batch_learn = false;
+            mpd_map_batch_button_refresh();
+            mpd_assign_feedback(
+                "LEARN CANCELADO — sin pad/knob del AKAI en 8 s",
+                RED808_WARNING);
+        }
     }
 
     const uint32_t activityRev = control_midi_activity_revision();
