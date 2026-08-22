@@ -13,7 +13,6 @@
 #include "../../include/ui_events.h"
 #include "../dsp_task.h"
 #include "../mem_midi_loader.h"
-#include "../coach/coach_engine.h"
 #include "config.h"
 #include "../../../shared/synth_params.h"
 #include "../../../DaisyPod3/mpd218_mapping.h"
@@ -240,7 +239,6 @@ lv_obj_t* scr_performance = NULL;
 lv_obj_t* scr_piano = NULL;       /* v2.6 — PIANO live keyboard */
 lv_obj_t* scr_piano_params = NULL; /* v2.7 — synth engine parameter editor */
 lv_obj_t* scr_fx_xy = NULL;       /* v3.2 — FX XY performance pad */
-lv_obj_t* scr_coach = NULL;       /* v3.3 — Drum Finger Coach (RED808 teacher) */
 static lv_obj_t* scr_screensaver = NULL; /* local status screensaver */
 
 // Header widgets
@@ -737,6 +735,7 @@ static lv_obj_t* s_pad_inst_modal_kit_btns[3][5] = {};   // [engine 0=808/1=909/
 static lv_obj_t* s_pad_inst_modal_kit_lbl_eng[3] = {};   // labels "808"/"909"/"505"
 static lv_obj_t* s_pod_status_modal = NULL;
 static lv_obj_t* s_pod_status_label = NULL;
+static lv_obj_t* s_pod_rotate_label = NULL;
 // ── AKAI MPD218 MIDI MAP + LEARN ─────────────────────────────────────
 static lv_obj_t* s_mpd_map_modal = NULL;
 static lv_obj_t* s_mpd_map_summary_label = NULL;
@@ -3523,13 +3522,13 @@ static void mpd_map_batch_cb(lv_event_t* e) {
 }
 
 // Defined later in this file, next to the rest of the P4-SD factory-kit
-// loader (coach_ensure_kit_loaded() re-arms sd_factory_autoload_tick() to
+// loader (karz_kit_ensure_loaded() re-arms sd_factory_autoload_tick() to
 // re-stream RED 808 KARZ onto all 16 pads).
-static void coach_ensure_kit_loaded(void);
+static void karz_kit_ensure_loaded(void);
 
 static void mpd_map_karz_cb(lv_event_t* e) {
     LV_UNUSED(e);
-    coach_ensure_kit_loaded();
+    karz_kit_ensure_loaded();
     mpd_assign_feedback("Cargando RED 808 KARZ en los 16 pads...", MPD_LEARNED_MARK);
 }
 
@@ -4142,6 +4141,7 @@ static void pod_status_modal_close_cb(lv_event_t* e) {
     if (s_pod_status_modal) lv_obj_del(s_pod_status_modal);
     s_pod_status_modal = NULL;
     s_pod_status_label = NULL;
+    s_pod_rotate_label = NULL;
     memset(s_pod_control_value_labels, 0, sizeof(s_pod_control_value_labels));
     memset(s_pod_led_function_labels, 0, sizeof(s_pod_led_function_labels));
     memset(s_pod_led_color_labels, 0, sizeof(s_pod_led_color_labels));
@@ -4279,6 +4279,26 @@ static void pod_status_popup_cb(lv_event_t* e) {
     lv_obj_center(closeLabel);
     lv_obj_add_event_cb(close, [](lv_event_t*) { pod_status_modal_close_cb(NULL); },
                         LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* rotate = lv_btn_create(card);
+    lv_obj_set_size(rotate, 100, 42);
+    lv_obj_set_pos(rotate, 816, 496);
+    apply_control_button_style(rotate, RED808_ACCENT2, false, 10);
+    s_pod_rotate_label = lv_label_create(rotate);
+    lv_obj_set_width(s_pod_rotate_label, 88);
+    lv_obj_set_style_text_align(s_pod_rotate_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(s_pod_rotate_label, &lv_font_montserrat_12, 0);
+    lv_label_set_text(s_pod_rotate_label, p4.screen_rotated ? "ROTATE\n180 ON" : "ROTATE\n180 OFF");
+    lv_obj_center(s_pod_rotate_label);
+    lv_obj_add_event_cb(rotate, [](lv_event_t*) {
+        p4.screen_rotated = !p4.screen_rotated;
+        if (s_pod_rotate_label)
+            lv_label_set_text(s_pod_rotate_label, p4.screen_rotated ? "ROTATE\n180 ON" : "ROTATE\n180 OFF");
+        // direct_mode only flushes dirty areas — force one now so the flip
+        // (applied in disp_flush_cb) is visible immediately, not just after
+        // the next unrelated screen update.
+        lv_obj_invalidate(lv_scr_act());
+    }, LV_EVENT_CLICKED, NULL);
 
     pod_status_modal_refresh();
     pod_status_modal_update();
@@ -4735,19 +4755,6 @@ static void create_live_screen(void) {
                                            "STATUS", "P01", RED808_WARNING, &grid_bpm_lbl);
     lv_obj_add_flag(home_cell, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(home_cell, pod_status_popup_cb, LV_EVENT_CLICKED, NULL);
-    // Hold this cell to open the Drum Finger Coach — the 4x4 control grid is
-    // fully packed, so the coach entry point rides the existing long-press
-    // convention ("hold MODE"/"hold PRESET" on XTRA PADS) instead of taking
-    // a cell away from an existing function.
-    lv_obj_add_event_cb(home_cell, [](lv_event_t* e) {
-        LV_UNUSED(e);
-        ui_navigate_to(14);
-    }, LV_EVENT_LONG_PRESSED, NULL);
-    lv_obj_t* coach_badge = lv_label_create(home_cell);
-    lv_label_set_text(coach_badge, "COACH");
-    lv_obj_set_style_text_font(coach_badge, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(coach_badge, theme_accent(), 0);
-    lv_obj_align(coach_badge, LV_ALIGN_TOP_RIGHT, -4, 4);
     pod_register_owner_badge(home_cell, POD_FUNC_CONTROL_CONFIG);
     grid_home_vol_lbl = lv_label_create(home_cell);
     lv_label_set_text(grid_home_vol_lbl, "MASTER --");
@@ -10289,14 +10296,11 @@ static bool sd_factory_autoload_tick(void) {
     return false;
 }
 
-// Re-arms the factory-kit loader so every Coach entry guarantees the 16 pads
-// sound like RED 808 KARZ (kick on 0, snare on 1, ...), regardless of
-// whatever kit the player had loaded for free play. Deliberately does NOT
-// restore the previous kit on exit — that would need a per-pad "what's
-// currently loaded" record that nothing in the app tracks today (see
-// p4.sample_name[], which is declared but never written). Cheap no-op if
+// Re-arms the factory-kit loader so the MIDI MAP "KARZ" button guarantees
+// the 16 pads sound like RED 808 KARZ (kick on 0, snare on 1, ...),
+// regardless of whatever kit the player had loaded before. Cheap no-op if
 // the loader is still mid-flight from the initial USB connect.
-static void coach_ensure_kit_loaded(void) {
+static void karz_kit_ensure_loaded(void) {
     const uint8_t state = s_factory_kit_state.load(std::memory_order_acquire);
     if (state == FACTORY_KIT_COMPLETE || state == FACTORY_KIT_ERROR) {
         s_factory_result_announced = false;
@@ -13519,376 +13523,6 @@ static void create_performance_screen(void) {
 }
 
 // =============================================================================
-// DRUM FINGER COACH — v0.1 demo (APRENDER only; PRACTICAR/LIBRE are stubs)
-// One screen, three internal views (Home / Level select / Lesson) toggled by
-// coach::screen(). Playback/click/hit-capture live in coach_engine.cpp; this
-// file only renders whatever state that engine reports, every ~16ms via
-// update_coach_screen() from ui_update_current_screen().
-// =============================================================================
-static lv_obj_t* coach_home_view = NULL;
-static lv_obj_t* coach_level_view = NULL;
-static lv_obj_t* coach_lesson_view = NULL;
-
-static lv_obj_t* coach_level_btns[coach::kLevelCount] = {};
-static lv_obj_t* coach_level_star_lbls[coach::kLevelCount] = {};
-static lv_obj_t* coach_level_focus_lbls[coach::kLevelCount] = {};
-
-static lv_obj_t* coach_lesson_title_lbl = NULL;
-static lv_obj_t* coach_lesson_bpm_lbl = NULL;
-static lv_obj_t* coach_lesson_phase_lbl = NULL;
-static lv_obj_t* coach_lesson_step_dots[coach::kMaxPatternSteps] = {};
-static lv_obj_t* coach_lesson_step_lbls[coach::kMaxPatternSteps] = {};
-static lv_obj_t* coach_lesson_feedback1_lbl = NULL;
-static lv_obj_t* coach_lesson_feedback2_lbl = NULL;
-static lv_obj_t* coach_lesson_action_btn = NULL;
-static lv_obj_t* coach_lesson_action_lbl = NULL;
-static lv_obj_t* coach_lesson_combo_lbl = NULL;
-
-static const char* coach_track_short(uint8_t track) {
-    static const char* names[] = {
-        "BD", "SD", "CH", "OH", "CY", "CP", "RS", "CB",
-        "LT", "MT", "HT", "MA", "CL", "HC", "MC", "LC"
-    };
-    return track < 16 ? names[track] : "--";
-}
-
-static void coach_show_view(lv_obj_t* view) {
-    if (coach_home_view) {
-        if (coach_home_view == view) lv_obj_clear_flag(coach_home_view, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(coach_home_view, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (coach_level_view) {
-        if (coach_level_view == view) lv_obj_clear_flag(coach_level_view, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(coach_level_view, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (coach_lesson_view) {
-        if (coach_lesson_view == view) lv_obj_clear_flag(coach_lesson_view, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(coach_lesson_view, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-static void coach_back_cb(lv_event_t* e) {
-    LV_UNUSED(e);
-    switch (coach::screen()) {
-        case coach::Screen::Lesson:      coach::open_level_select(); break;
-        case coach::Screen::LevelSelect: coach::open_home(); break;
-        default:                         ui_navigate_to(2); break;
-    }
-}
-
-static void coach_aprender_cb(lv_event_t* e) { LV_UNUSED(e); coach::open_level_select(); }
-
-static void coach_soon_cb(lv_event_t* e) {
-    LV_UNUSED(e);
-    ui_show_toast("PROXIMAMENTE", theme_warning());
-}
-
-static void coach_level_cb(lv_event_t* e) {
-    int level = (int)(intptr_t)lv_event_get_user_data(e);
-    if (!coach::level_unlocked(level)) return;
-    coach::start_level(level);
-}
-
-static void coach_action_cb(lv_event_t* e) {
-    LV_UNUSED(e);
-    if (coach::phase() != coach::Phase::Result) return;
-    if (coach::result_is_success()) coach::advance();
-    else coach::repeat();
-}
-
-static void create_coach_screen(void) {
-    scr_coach = lv_obj_create(NULL);
-    apply_screen_theme_bg(scr_coach);
-    lv_obj_clear_flag(scr_coach, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t* back_btn = lv_btn_create(scr_coach);
-    lv_obj_set_size(back_btn, 48, 42);
-    lv_obj_set_pos(back_btn, 8, 8);
-    apply_control_button_style(back_btn, RED808_BORDER, false, 8);
-    lv_obj_add_event_cb(back_btn, coach_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t* back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(back_lbl, RED808_TEXT, 0);
-    lv_obj_center(back_lbl);
-
-    lv_obj_t* header = lv_label_create(scr_coach);
-    lv_label_set_text(header, "DRUM FINGER COACH");
-    lv_obj_set_style_text_font(header, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(header, theme_text_dim(), 0);
-    lv_obj_set_style_text_letter_space(header, 2, 0);
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 18);
-
-    // ── HOME: APRENDER / PRACTICAR / LIBRE ──────────────────────────────
-    coach_home_view = lv_obj_create(scr_coach);
-    lv_obj_set_size(coach_home_view, LCD_H_RES, LCD_V_RES);
-    lv_obj_set_pos(coach_home_view, 0, 0);
-    lv_obj_set_style_bg_opa(coach_home_view, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(coach_home_view, 0, 0);
-    lv_obj_clear_flag(coach_home_view, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(coach_home_view, LV_OBJ_FLAG_CLICKABLE);
-    {
-        const char* labels[3] = {"APRENDER", "PRACTICAR", "LIBRE"};
-        const char* subs[3] = {"Lecciones guiadas", "Proximamente", "Proximamente"};
-        lv_color_t colors[3] = {RED808_ACCENT, RED808_ACCENT2, RED808_CYAN};
-        int card_w = 280, card_h = 360, gap = 32;
-        int total_w = card_w * 3 + gap * 2;
-        int start_x = (LCD_H_RES - total_w) / 2;
-        int y = (LCD_V_RES - card_h) / 2 + 10;
-        for (int i = 0; i < 3; i++) {
-            lv_obj_t* card = lv_btn_create(coach_home_view);
-            lv_obj_set_size(card, card_w, card_h);
-            lv_obj_set_pos(card, start_x + i * (card_w + gap), y);
-            apply_control_button_style(card, colors[i], i == 0, 16);
-            lv_obj_add_event_cb(card, i == 0 ? coach_aprender_cb : coach_soon_cb, LV_EVENT_CLICKED, NULL);
-            lv_obj_t* t = lv_label_create(card);
-            lv_label_set_text(t, labels[i]);
-            lv_obj_set_style_text_font(t, &lv_font_montserrat_28, 0);
-            lv_obj_set_style_text_color(t, i == 0 ? RED808_BG : RED808_TEXT, 0);
-            lv_obj_align(t, LV_ALIGN_CENTER, 0, -10);
-            lv_obj_t* s = lv_label_create(card);
-            lv_label_set_text(s, subs[i]);
-            lv_obj_set_style_text_font(s, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(s, i == 0 ? lv_color_mix(RED808_BG, colors[i], 200) : theme_text_dim(), 0);
-            lv_obj_align(s, LV_ALIGN_CENTER, 0, 30);
-        }
-    }
-
-    // ── LEVEL SELECT: 5 lesson cards ─────────────────────────────────────
-    coach_level_view = lv_obj_create(scr_coach);
-    lv_obj_set_size(coach_level_view, LCD_H_RES, LCD_V_RES);
-    lv_obj_set_pos(coach_level_view, 0, 0);
-    lv_obj_set_style_bg_opa(coach_level_view, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(coach_level_view, 0, 0);
-    lv_obj_clear_flag(coach_level_view, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(coach_level_view, LV_OBJ_FLAG_CLICKABLE);
-    {
-        lv_obj_t* title = lv_label_create(coach_level_view);
-        lv_label_set_text(title, "APRENDER");
-        lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
-        lv_obj_set_style_text_color(title, theme_accent2(), 0);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 70);
-
-        int card_w = 176, card_h = 300, gap = 16;
-        int total_w = card_w * coach::kLevelCount + gap * (coach::kLevelCount - 1);
-        int start_x = (LCD_H_RES - total_w) / 2;
-        int y = 190;
-        for (int i = 0; i < coach::kLevelCount; i++) {
-            lv_obj_t* card = lv_btn_create(coach_level_view);
-            lv_obj_set_size(card, card_w, card_h);
-            lv_obj_set_pos(card, start_x + i * (card_w + gap), y);
-            apply_control_button_style(card, theme_accent(), false, 14);
-            lv_obj_add_event_cb(card, coach_level_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-            coach_level_btns[i] = card;
-
-            lv_obj_t* n = lv_label_create(card);
-            lv_label_set_text_fmt(n, "NIVEL %d", i + 1);
-            lv_obj_set_style_text_font(n, &lv_font_montserrat_20, 0);
-            lv_obj_set_style_text_color(n, RED808_TEXT, 0);
-            lv_obj_align(n, LV_ALIGN_TOP_MID, 0, 16);
-
-            lv_obj_t* f = lv_label_create(card);
-            lv_obj_set_width(f, card_w - 20);
-            lv_label_set_long_mode(f, LV_LABEL_LONG_WRAP);
-            lv_obj_set_style_text_font(f, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(f, theme_text_dim(), 0);
-            lv_obj_set_style_text_align(f, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_align(f, LV_ALIGN_TOP_MID, 0, 54);
-            coach_level_focus_lbls[i] = f;
-
-            lv_obj_t* stars = lv_label_create(card);
-            lv_obj_set_style_text_font(stars, &lv_font_montserrat_20, 0);
-            lv_obj_set_style_text_color(stars, RED808_WARNING, 0);
-            lv_obj_align(stars, LV_ALIGN_BOTTOM_MID, 0, -18);
-            coach_level_star_lbls[i] = stars;
-        }
-    }
-
-    // ── LESSON: listen / count-in / perform / feedback ──────────────────
-    coach_lesson_view = lv_obj_create(scr_coach);
-    lv_obj_set_size(coach_lesson_view, LCD_H_RES, LCD_V_RES);
-    lv_obj_set_pos(coach_lesson_view, 0, 0);
-    lv_obj_set_style_bg_opa(coach_lesson_view, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(coach_lesson_view, 0, 0);
-    lv_obj_clear_flag(coach_lesson_view, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(coach_lesson_view, LV_OBJ_FLAG_CLICKABLE);
-    {
-        coach_lesson_title_lbl = lv_label_create(coach_lesson_view);
-        lv_obj_set_style_text_font(coach_lesson_title_lbl, &lv_font_montserrat_20, 0);
-        lv_obj_set_style_text_color(coach_lesson_title_lbl, theme_accent2(), 0);
-        lv_obj_align(coach_lesson_title_lbl, LV_ALIGN_TOP_MID, 0, 68);
-
-        coach_lesson_bpm_lbl = lv_label_create(coach_lesson_view);
-        lv_obj_set_style_text_font(coach_lesson_bpm_lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(coach_lesson_bpm_lbl, theme_text_dim(), 0);
-        lv_obj_align(coach_lesson_bpm_lbl, LV_ALIGN_TOP_MID, 0, 98);
-
-        // Pattern step dots — up to 8, spaced evenly, playhead highlighted live.
-        const int dot = 46, dot_gap = 26;
-        const int grid_w = dot * coach::kMaxPatternSteps + dot_gap * (coach::kMaxPatternSteps - 1);
-        const int gx = (LCD_H_RES - grid_w) / 2;
-        const int gy = 200;
-        for (int i = 0; i < coach::kMaxPatternSteps; i++) {
-            lv_obj_t* d = lv_obj_create(coach_lesson_view);
-            lv_obj_set_size(d, dot, dot);
-            lv_obj_set_pos(d, gx + i * (dot + dot_gap), gy);
-            lv_obj_set_style_radius(d, dot / 2, 0);
-            lv_obj_set_style_border_width(d, 2, 0);
-            lv_obj_set_style_border_color(d, RED808_BORDER, 0);
-            lv_obj_set_style_bg_color(d, RED808_SURFACE, 0);
-            lv_obj_set_style_bg_opa(d, LV_OPA_60, 0);
-            lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_clear_flag(d, LV_OBJ_FLAG_CLICKABLE);
-            coach_lesson_step_dots[i] = d;
-
-            lv_obj_t* lbl = lv_label_create(d);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(lbl, RED808_TEXT, 0);
-            lv_obj_center(lbl);
-            coach_lesson_step_lbls[i] = lbl;
-        }
-
-        coach_lesson_phase_lbl = lv_label_create(coach_lesson_view);
-        lv_obj_set_style_text_font(coach_lesson_phase_lbl, &lv_font_montserrat_40, 0);
-        lv_obj_set_style_text_color(coach_lesson_phase_lbl, RED808_TEXT, 0);
-        lv_obj_align(coach_lesson_phase_lbl, LV_ALIGN_CENTER, 0, 40);
-
-        coach_lesson_feedback1_lbl = lv_label_create(coach_lesson_view);
-        lv_obj_set_style_text_font(coach_lesson_feedback1_lbl, &lv_font_montserrat_32, 0);
-        lv_obj_set_style_text_align(coach_lesson_feedback1_lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(coach_lesson_feedback1_lbl, LV_ALIGN_CENTER, 0, 20);
-
-        coach_lesson_feedback2_lbl = lv_label_create(coach_lesson_view);
-        lv_obj_set_style_text_font(coach_lesson_feedback2_lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(coach_lesson_feedback2_lbl, theme_text_dim(), 0);
-        lv_obj_set_style_text_align(coach_lesson_feedback2_lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(coach_lesson_feedback2_lbl, LV_ALIGN_CENTER, 0, 58);
-
-        coach_lesson_action_btn = lv_btn_create(coach_lesson_view);
-        lv_obj_set_size(coach_lesson_action_btn, 260, 64);
-        lv_obj_align(coach_lesson_action_btn, LV_ALIGN_CENTER, 0, 110);
-        apply_control_button_style(coach_lesson_action_btn, RED808_SUCCESS, true, 14);
-        lv_obj_add_event_cb(coach_lesson_action_btn, coach_action_cb, LV_EVENT_CLICKED, NULL);
-        coach_lesson_action_lbl = lv_label_create(coach_lesson_action_btn);
-        lv_obj_set_style_text_font(coach_lesson_action_lbl, &lv_font_montserrat_20, 0);
-        lv_obj_set_style_text_color(coach_lesson_action_lbl, RED808_BG, 0);
-        lv_obj_center(coach_lesson_action_lbl);
-
-        coach_lesson_combo_lbl = lv_label_create(coach_lesson_view);
-        lv_obj_set_style_text_font(coach_lesson_combo_lbl, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(coach_lesson_combo_lbl, theme_text_dim(), 0);
-        lv_obj_align(coach_lesson_combo_lbl, LV_ALIGN_BOTTOM_MID, 0, -24);
-    }
-
-    coach_show_view(coach_home_view);
-}
-
-// Repaints whichever coach view is active from coach_engine's state. Called
-// every ~16ms from ui_update_current_screen() while scr_coach is on screen.
-static void update_coach_screen(void) {
-    switch (coach::screen()) {
-        case coach::Screen::Home:         coach_show_view(coach_home_view); return;
-        case coach::Screen::LevelSelect: {
-            coach_show_view(coach_level_view);
-            for (int i = 0; i < coach::kLevelCount; i++) {
-                bool unlocked = coach::level_unlocked(i);
-                lv_obj_t* card = coach_level_btns[i];
-                if (!card) continue;
-                lv_obj_set_style_border_opa(card, unlocked ? LV_OPA_COVER : LV_OPA_30, 0);
-                lv_obj_set_style_bg_opa(card, unlocked ? LV_OPA_COVER : LV_OPA_40, 0);
-                if (coach_level_focus_lbls[i])
-                    lv_label_set_text(coach_level_focus_lbls[i], coach::level_focus(i));
-                if (coach_level_star_lbls[i]) {
-                    int stars = coach::level_best_stars(i);
-                    if (!unlocked) {
-                        lv_label_set_text(coach_level_star_lbls[i], LV_SYMBOL_CLOSE);
-                    } else {
-                        char buf[8] = "";
-                        for (int s = 0; s < 3; s++) strcat(buf, s < stars ? "*" : "-");
-                        lv_label_set_text(coach_level_star_lbls[i], buf);
-                    }
-                }
-            }
-            return;
-        }
-        case coach::Screen::Lesson: {
-            coach_show_view(coach_lesson_view);
-            const int level = coach::current_level();
-            lv_label_set_text_fmt(coach_lesson_title_lbl, "%s%s",
-                                  coach::level_focus(level), coach::is_drill() ? " (REPASO)" : "");
-            lv_label_set_text_fmt(coach_lesson_bpm_lbl, "%d BPM", (int)(coach::pattern_bpm() + 0.5f));
-
-            const int steps = coach::pattern_step_count();
-            const int playhead = coach::playhead_step();
-            for (int i = 0; i < coach::kMaxPatternSteps; i++) {
-                lv_obj_t* d = coach_lesson_step_dots[i];
-                if (!d) continue;
-                if (i >= steps) { lv_obj_add_flag(d, LV_OBJ_FLAG_HIDDEN); continue; }
-                lv_obj_clear_flag(d, LV_OBJ_FLAG_HIDDEN);
-                uint8_t track = 0;
-                bool hit = coach::pattern_step_hit(i, &track);
-                lv_label_set_text(coach_lesson_step_lbls[i], hit ? coach_track_short(track) : "");
-                lv_color_t base = hit ? ui_track_color(track) : RED808_SURFACE;
-                bool active = (i == playhead);
-                lv_obj_set_style_bg_color(d, base, 0);
-                lv_obj_set_style_bg_opa(d, hit ? LV_OPA_COVER : LV_OPA_30, 0);
-                lv_obj_set_style_border_color(d, active ? RED808_TEXT : RED808_BORDER, 0);
-                lv_obj_set_style_border_width(d, active ? 4 : 2, 0);
-            }
-
-            const coach::Phase phase = coach::phase();
-            const bool show_result = (phase == coach::Phase::Result);
-            lv_obj_set_style_opa(coach_lesson_phase_lbl, show_result ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
-            lv_obj_set_style_opa(coach_lesson_feedback1_lbl, show_result ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-            lv_obj_set_style_opa(coach_lesson_feedback2_lbl, show_result ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-            if (show_result) lv_obj_clear_flag(coach_lesson_action_btn, LV_OBJ_FLAG_HIDDEN);
-            else lv_obj_add_flag(coach_lesson_action_btn, LV_OBJ_FLAG_HIDDEN);
-
-            switch (phase) {
-                case coach::Phase::Listen:
-                    lv_label_set_text(coach_lesson_phase_lbl, LV_SYMBOL_PLAY " ESCUCHA");
-                    lv_obj_set_style_text_color(coach_lesson_phase_lbl, theme_info(), 0);
-                    break;
-                case coach::Phase::CountIn: {
-                    int beat = coach::count_in_beat();
-                    lv_label_set_text_fmt(coach_lesson_phase_lbl, "%d", beat > 0 ? beat : 1);
-                    lv_obj_set_style_text_color(coach_lesson_phase_lbl, theme_warning(), 0);
-                    break;
-                }
-                case coach::Phase::Perform:
-                    lv_label_set_text(coach_lesson_phase_lbl, "AHORA TU");
-                    lv_obj_set_style_text_color(coach_lesson_phase_lbl, RED808_SUCCESS, 0);
-                    break;
-                case coach::Phase::Result: {
-                    bool ok = coach::result_is_success();
-                    lv_label_set_text_fmt(coach_lesson_feedback1_lbl, "%s%s",
-                                          ok ? LV_SYMBOL_OK " " : "", coach::result_line1());
-                    lv_obj_set_style_text_color(coach_lesson_feedback1_lbl, ok ? RED808_SUCCESS : RED808_ERROR, 0);
-                    lv_label_set_text(coach_lesson_feedback2_lbl, coach::result_line2());
-                    if (ok) {
-                        bool last_level = (level == coach::kLevelCount - 1);
-                        lv_label_set_text(coach_lesson_action_lbl,
-                                          coach::is_drill() ? "SIGUIENTE PARTE " LV_SYMBOL_RIGHT
-                                          : last_level     ? "SIGUIENTE " LV_SYMBOL_RIGHT
-                                                            : "SIGUIENTE NIVEL " LV_SYMBOL_RIGHT);
-                        apply_control_button_style(coach_lesson_action_btn, RED808_SUCCESS, true, 14);
-                    } else {
-                        lv_label_set_text(coach_lesson_action_lbl, "OTRA VEZ " LV_SYMBOL_RIGHT);
-                        apply_control_button_style(coach_lesson_action_btn, RED808_WARNING, true, 14);
-                    }
-                    lv_obj_set_style_text_color(coach_lesson_action_lbl, RED808_BG, 0);
-                    break;
-                }
-            }
-
-            lv_label_set_text_fmt(coach_lesson_combo_lbl, "ACCURACY %d%%   COMBO %d",
-                                  coach::accuracy_percent(), coach::combo());
-            return;
-        }
-    }
-}
-
-// =============================================================================
 // PUBLIC API
 // =============================================================================
 void ui_create_all_screens(void) {
@@ -13997,19 +13631,6 @@ static void ui_reload_themed_screens(void) {
     if (scr_piano)       { lv_obj_del(scr_piano);       scr_piano       = NULL; }
     if (scr_piano_params){ lv_obj_del(scr_piano_params);scr_piano_params= NULL; }
     if (scr_fx_xy)       { lv_obj_del(scr_fx_xy);       scr_fx_xy       = NULL; }
-    if (scr_coach)       { lv_obj_del(scr_coach);       scr_coach       = NULL; }
-
-    // Clear coach widget pointers (the coach screen itself was just deleted above)
-    coach_home_view = NULL; coach_level_view = NULL; coach_lesson_view = NULL;
-    for (int i = 0; i < coach::kLevelCount; i++) {
-        coach_level_btns[i] = NULL; coach_level_star_lbls[i] = NULL; coach_level_focus_lbls[i] = NULL;
-    }
-    coach_lesson_title_lbl = NULL; coach_lesson_bpm_lbl = NULL; coach_lesson_phase_lbl = NULL;
-    for (int i = 0; i < coach::kMaxPatternSteps; i++) {
-        coach_lesson_step_dots[i] = NULL; coach_lesson_step_lbls[i] = NULL;
-    }
-    coach_lesson_feedback1_lbl = NULL; coach_lesson_feedback2_lbl = NULL;
-    coach_lesson_action_btn = NULL; coach_lesson_action_lbl = NULL; coach_lesson_combo_lbl = NULL;
 
     // Clear widget pointers (prevent stale access in update functions)
     header_bar = NULL; hdr_bpm_label = NULL; hdr_pattern_label = NULL;
@@ -14181,7 +13802,6 @@ static void ui_reload_themed_screens(void) {
     if (saved_screen == 10) nav_to = 10;   /* PIANO */
     if (saved_screen == 11) nav_to = 11;   /* PIANO PARAMS (synth editor) */
     if (saved_screen == 13) nav_to = 13;   /* FX XY PAD */
-    if (saved_screen == 14) nav_to = 14;   /* DRUM FINGER COACH */
     ui_navigate_to(nav_to);
 
     /* A visual theme must never select a different musical pattern. Preserve
@@ -14205,19 +13825,6 @@ static void ui_reload_themed_screens(void) {
 }
 
 void ui_navigate_to(int screen_id) {
-    // Leaving the coach screen any other way than its own back button (e.g. a
-    // physical Pod button jumping straight to LIVE) must stop its lesson
-    // clock — otherwise Listen/CountIn keep ticking and triggering sounds
-    // in the background since coach::tick() runs every loop() regardless
-    // of which screen is on-screen.
-    if (screen_id != 14 && active_screen == 14) coach::open_home();
-
-    // Entering the coach from anywhere else: guarantee the 16 pads sound
-    // like RED 808 KARZ (kick=0, snare=1, ...) no matter what the player
-    // had loaded for free play, so the lesson patterns are never silent or
-    // mismatched. Left loaded on the way back out — see coach_ensure_kit_loaded().
-    if (screen_id == 14 && active_screen != 14) coach_ensure_kit_loaded();
-
     // Lazy screen creation: create only what the user actually opens.
     switch (screen_id) {
         case 2:  if (!scr_live)         create_live_screen(); break;
@@ -14229,7 +13836,6 @@ void ui_navigate_to(int screen_id) {
         case 10: if (!scr_piano)        create_piano_screen(); break;
         case 11: if (!scr_piano_params) create_piano_params_screen(); break;
         case 13: if (!scr_fx_xy)        create_fx_xy_screen(); break;
-        case 14: if (!scr_coach)        create_coach_screen(); break;
         default: break;
     }
     lv_obj_t* targets[] = {
@@ -14239,7 +13845,6 @@ void ui_navigate_to(int screen_id) {
         scr_piano_params, /* 11 = PIANO PARAMS (synth editor) */
         NULL,             /* 12 = reserved (guitar screen removed) */
         scr_fx_xy,        /* 13 = FX XY PAD */
-        scr_coach         /* 14 = DRUM FINGER COACH */
     };
     int count = sizeof(targets) / sizeof(targets[0]);
     if (screen_id >= 0 && screen_id < count && targets[screen_id]) {
@@ -14359,9 +13964,6 @@ void ui_process_pad_queue(void) {
         if (!velocity) velocity = 100;   // defensive floor
         // Feed DSP spectrum with real velocity
         dsp_notify_pad(pad, velocity);
-        // Let the coach capture on-screen taps too, in case someone practices
-        // without the MPD218 plugged in. No-op unless a lesson is listening.
-        coach::on_pad_hit(pad, velocity, now_ms);
         // Notify the local controller first. The internal tap event ignores
         // velocity; we still send it for forward compatibility.
         local_apply_message(MSG_TOUCH_CMD, TCMD_PAD_TAP, pad);
@@ -15196,5 +14798,4 @@ void ui_update_current_screen(void) {
              p4sd.needs_refresh.exchange(false, std::memory_order_acq_rel)) {
         sd_refresh_ui();
     }
-    else if (active == scr_coach) update_coach_screen();
 }

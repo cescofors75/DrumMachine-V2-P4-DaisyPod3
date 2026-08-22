@@ -12,6 +12,7 @@ enum VisualTheme : uint8_t {
     THEME_SUNSET,
     THEME_RAINBOW,
     THEME_GREYSCALE,
+    THEME_MPD218,   // v3.4 — Akai MPD218 hardware look: black/white body, red pad LEDs
     THEME_COUNT
 };
 

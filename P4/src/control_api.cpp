@@ -10,7 +10,6 @@
 #include "pod_config_store.h"
 #include "midi_map_store.h"
 #include "../../DaisyPod3/mpd218_mapping.h"
-#include "coach/coach_engine.h"
 #include "ui/ui_screens.h"
 #include "../include/ui_events.h"
 #include <Arduino.h>
@@ -183,11 +182,6 @@ void ProcessMidiMonitor()
             if(pad >= 0)
             {
                 ui_external_pad_flash(static_cast<uint8_t>(pad), event.data1);
-                // Coach ignores this unless a lesson is actively listening
-                // for input (Phase::Perform) — cheap no-op otherwise. The
-                // wire protocol carries no per-event timestamp, so millis()
-                // at pop-time is the best latency estimate available.
-                coach::on_pad_hit(static_cast<uint8_t>(pad), event.data1, millis());
             }
         }
     }
@@ -495,7 +489,6 @@ void control_init()
     midiMapCount = 0;
     midi_map_store_load(midiMap, midiMapCount);
     daisyUsb.begin();
-    coach::init();
 }
 
 void control_process()
@@ -633,7 +626,6 @@ void control_process()
         midiLearnTimeoutRevision.fetch_add(1, std::memory_order_release);
     }
     SequencerInstance().update();
-    coach::tick(millis());
 }
 
 // ── User MIDI map / LEARN API ────────────────────────────────────────

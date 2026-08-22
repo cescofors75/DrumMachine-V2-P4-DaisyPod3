@@ -9,6 +9,7 @@
 #include "i2c_rotaries.h"
 #include "../include/config.h"
 #include "../ui/ui_screens.h"
+#include "../app_state.h"
 #include <Arduino.h>
 #include <Wire.h>
 #include <lvgl.h>
@@ -84,6 +85,27 @@ static bool IRAM_ATTR dpi_on_refresh_done(esp_lcd_panel_handle_t panel,
 // In direct_mode + partial refresh, LVGL may call this multiple times per
 // frame (one per dirty area). Only the LAST call actually swaps + waits vsync.
 // =============================================================================
+// Software 180 rotation: with direct_mode's zero-copy DPI framebuffers we
+// can't use LVGL's built-in sw_rotate (it needs to own a copy of the flush
+// buffer, which would break the zero-copy pointer-swap this driver relies
+// on). A 180-degree flip needs no width/height transpose though — it is
+// exactly equivalent to reversing the whole row-major pixel buffer in
+// place, so it stays a single O(N) in-place pass over the SAME buffer LVGL
+// already rendered, no extra allocation. Gated behind p4.screen_rotated
+// (off by default) since — unlike direct_mode's usual dirty-rect-only
+// cost — this touches every pixel on every flush.
+static void flip_framebuffer_180(lv_color_t* buf) {
+    lv_color_t* lo = buf;
+    lv_color_t* hi = buf + (LCD_H_RES * LCD_V_RES) - 1;
+    while (lo < hi) {
+        lv_color_t tmp = *lo;
+        *lo = *hi;
+        *hi = tmp;
+        lo++;
+        hi--;
+    }
+}
+
 static void disp_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t* color_p) {
     (void)area;
     // Intermediate dirty regions \u2014 LVGL is still composing the frame.
@@ -100,6 +122,7 @@ static void disp_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
 #endif
 
     // Step 1: swap active FB (DPI recognises internal pointer \u2192 zero-copy)
+    if (p4.screen_rotated) flip_framebuffer_180(color_p);
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, color_p);
 
     // Step 2: arm handshake \u2014 must come AFTER draw_bitmap
@@ -227,8 +250,16 @@ static void gt911_poll_all(void) {
             uint16_t x    = buf[i*8+1] | ((uint16_t)buf[i*8+2] << 8);
             uint16_t y    = buf[i*8+3] | ((uint16_t)buf[i*8+4] << 8);
             uint16_t size = buf[i*8+5] | ((uint16_t)buf[i*8+6] << 8);
-            next[idx].point.x = (x < LCD_H_RES) ? (lv_coord_t)x : (lv_coord_t)(LCD_H_RES - 1);
-            next[idx].point.y = (y < LCD_V_RES) ? (lv_coord_t)y : (lv_coord_t)(LCD_V_RES - 1);
+            x = (x < LCD_H_RES) ? x : (LCD_H_RES - 1);
+            y = (y < LCD_V_RES) ? y : (LCD_V_RES - 1);
+            // Single choke point for the touch side of the 180-degree flip
+            // (the pixel side is flip_framebuffer_180() in disp_flush_cb) —
+            // every consumer of touch_data (LVGL's indev AND ui_pad_from_xy's
+            // raw poll) reads coordinates published from here, so inverting
+            // once here keeps what's drawn and what's touched consistent.
+            if (p4.screen_rotated) { x = (LCD_H_RES - 1) - x; y = (LCD_V_RES - 1) - y; }
+            next[idx].point.x = (lv_coord_t)x;
+            next[idx].point.y = (lv_coord_t)y;
             next[idx].area  = (size > 255) ? 255 : (uint8_t)size;
             next[idx].state = LV_INDEV_STATE_PR;
         }
