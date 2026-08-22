@@ -180,7 +180,9 @@ void ProcessMidiMonitor()
         {
             const int pad = MidiNoteToUiPad(channel, event.data0);
             if(pad >= 0)
+            {
                 ui_external_pad_flash(static_cast<uint8_t>(pad), event.data1);
+            }
         }
     }
 }
