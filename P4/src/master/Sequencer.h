@@ -2,6 +2,31 @@
  * Sequencer.h
  * Sequencer de 16 steps per Drum Machine (8 tracks)
  * (OPCIONAL - per afegir funcionalitat de sequencer)
+ *
+ * ROLE ON THE P4: PATTERN DATA STORE ONLY — NOT the playback engine.
+ *
+ * DaisyPod3 owns playback: its step clock is a sample counter advanced
+ * inside AudioCallback (see DsqFireStep() in DaisyPod3/main.cpp), which is
+ * sample-accurate and drives the actual voices. The P4 learns the current
+ * step/pattern from Daisy telemetry (transport.step), not from this class.
+ *
+ * So on the P4 only the pattern-storage half of this class is live: the
+ * accessors for steps, velocities, notes, flags, per-step locks, plus
+ * selectPattern()/currentPattern which those 1-argument accessors use as
+ * their implicit target.
+ *
+ * The playback half — update(), processStep(), processLoops(), the four
+ * *Callback hooks, the loop system, song/queued-pattern advance — is NOT
+ * driven here. Do not call update() from the P4: none of the callbacks are
+ * ever registered (so every step it computes is discarded), and worse, its
+ * wrap logic writes currentPattern from its own micros()-based clock. That
+ * made it a second writer racing selectPattern(), and since currentPattern
+ * is the implicit target for step edits, a wrap at a slightly different
+ * moment than Daisy's could land an edit on the wrong pattern.
+ *
+ * The playback half is kept (it compiles, it is just never driven) because
+ * it predates the split — this class started life as the standalone engine.
+ * Removing it outright is a separate, larger cleanup.
  */
 
 #ifndef SEQUENCER_H
