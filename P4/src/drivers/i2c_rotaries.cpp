@@ -33,6 +33,15 @@ constexpr uint32_t kRotaryTaskPeriodMs = 1;
 constexpr uint32_t kRotaryI2cTimeoutMs = 3;
 constexpr uint32_t kAbsentRetryMs = 1000;
 constexpr uint32_t kMuxRetryMs = 2000;
+// Every probe attempt logs an ESP32-hal-i2c/RMT error at the framework
+// level when nothing answers (Wire1/rmtInit have no "quiet" mode), so
+// retrying forever means permanent log spam on a rig with no rotary/mux/
+// fader-LED hardware attached. Give up after this many failed attempts —
+// plenty to catch hardware that's already plugged in at boot — instead of
+// polling indefinitely. Trade-off: hardware plugged in mid-session needs a
+// reboot to be picked up, same as it would with a fixed retry interval
+// long enough to actually go quiet.
+constexpr uint8_t kFastProbeAttempts = 5;
 constexpr uint8_t kFailuresBeforeOffline = 3;
 constexpr uint32_t kButtonReleaseQuietMs = 80;
 constexpr uint32_t kButtonDebounceMs = 180;
@@ -62,6 +71,7 @@ std::atomic<uint16_t> s_faderValue{0};
 std::atomic<bool> s_faderChanged{false};
 
 uint32_t s_lastProbeMs[kRotaryCount] = {};
+uint8_t s_probeAttempts[kRotaryCount] = {};
 uint8_t s_failures[kRotaryCount] = {};
 bool s_haveValue[kRotaryCount] = {};
 bool s_buttonLatched[kRotaryCount] = {};
@@ -72,12 +82,15 @@ uint8_t s_nextI2cDevice = 0;
 std::atomic<uint8_t> s_muxAddress{0};
 uint8_t s_rotaryAddresses[kRotaryCount] = {};
 uint32_t s_lastMuxProbeMs = 0;
+uint8_t s_muxProbeAttempts = 0;
 uint32_t s_lastFaderPollMs = 0;
 uint32_t s_faderFilteredQ3 = 0;
 bool s_haveFaderValue = false;
 std::atomic<bool> s_faderLedReady{false};
 uint32_t s_lastFaderLedRefreshMs = 0;
 uint32_t s_lastFaderLedRetryMs = 0;
+uint8_t s_faderLedFailures = 0;
+bool s_faderLedGaveUp = false;
 rmt_data_t s_faderLedData[kFaderLedSymbols] = {};
 TaskHandle_t s_rotaryTask = nullptr;
 
@@ -314,12 +327,18 @@ void faderLedByte(size_t& symbol, uint8_t value)
     }
 }
 
+// rmtInit() succeeds even with nothing physically wired to the GPIO — it
+// only configures the SoC's own peripheral — so an absent LED strip usually
+// shows up later, at rmtWrite() time in updateFaderLeds(), not here. Both
+// failure points share s_faderLedFailures/s_faderLedGaveUp so an absent
+// strip goes fully quiet (no more Wire/RMT calls, no more log lines) after
+// kFastProbeAttempts total failures, however they're split between the two.
 bool ensureFaderLedDriver(uint32_t now)
 {
     if(s_faderLedReady.load(std::memory_order_acquire)) return true;
+    if(s_faderLedGaveUp) return false;
     if(s_lastFaderLedRetryMs != 0
-       && static_cast<uint32_t>(now - s_lastFaderLedRetryMs)
-            < kFaderLedRetryMs)
+       && static_cast<uint32_t>(now - s_lastFaderLedRetryMs) < kFaderLedRetryMs)
         return false;
     s_lastFaderLedRetryMs = now;
     pinMode(kFaderLedGpio, OUTPUT);
@@ -327,8 +346,24 @@ bool ensureFaderLedDriver(uint32_t now)
     const bool ready = rmtInit(kFaderLedGpio, RMT_TX_MODE,
                                RMT_MEM_NUM_BLOCKS_1, 10000000);
     s_faderLedReady.store(ready, std::memory_order_release);
-    P4_LOG_PRINTF("[Fader LED] RMT %s on GPIO%u\n",
-                  ready ? "ready" : "retry pending", kFaderLedGpio);
+    if(!ready)
+    {
+        if(++s_faderLedFailures >= kFastProbeAttempts)
+        {
+            s_faderLedGaveUp = true;
+            P4_LOG_PRINTLN("[Fader LED] not found, giving up until reboot");
+        }
+        else
+        {
+            P4_LOG_PRINTF("[Fader LED] RMT retry pending on GPIO%u (%u/%u)\n",
+                          kFaderLedGpio, s_faderLedFailures, kFastProbeAttempts);
+        }
+    }
+    else
+    {
+        s_faderLedFailures = 0;
+        P4_LOG_PRINTF("[Fader LED] RMT ready on GPIO%u\n", kFaderLedGpio);
+    }
     return ready;
 }
 
@@ -355,8 +390,27 @@ void updateFaderLeds(uint16_t value, uint32_t now)
         faderLedByte(symbol, red);
         faderLedByte(symbol, blue);
     }
+    // See the comment above ensureFaderLedDriver(): an absent LED strip
+    // usually fails here (write time), not at init. Shares the same failure
+    // budget/give-up flag so it goes fully quiet either way.
     if(!rmtWrite(kFaderLedGpio, s_faderLedData, kFaderLedSymbols, 20))
-        P4_LOG_PRINTLN("[Fader LED] RMT write timed out");
+    {
+        if(++s_faderLedFailures >= kFastProbeAttempts)
+        {
+            s_faderLedReady.store(false, std::memory_order_release);
+            s_faderLedGaveUp = true;
+            P4_LOG_PRINTLN("[Fader LED] RMT writes failing, giving up until reboot");
+        }
+        else
+        {
+            P4_LOG_PRINTF("[Fader LED] RMT write timed out (%u/%u)\n",
+                          s_faderLedFailures, kFastProbeAttempts);
+        }
+    }
+    else
+    {
+        s_faderLedFailures = 0;
+    }
     s_lastFaderLedRefreshMs = now;
 }
 
@@ -614,6 +668,10 @@ void i2c_rotaries_init()
     s_faderLedReady.store(false, std::memory_order_relaxed);
     s_lastFaderLedRefreshMs = 0;
     s_lastFaderLedRetryMs = 0;
+    s_faderLedFailures = 0;
+    s_faderLedGaveUp = false;
+    s_muxProbeAttempts = 0;
+    for(uint8_t i = 0; i < kRotaryCount; ++i) s_probeAttempts[i] = 0;
     updateFaderLeds(0, millis());
 }
 
@@ -624,12 +682,19 @@ void i2c_rotaries_poll()
     // Once a PCA9548A/TCA9548A responds, keep the topology latched until
     // reboot. A single missed ACK must never switch live hardware to the
     // incompatible passive-address mode.
-    if(s_muxAddress == 0 && (s_lastMuxProbeMs == 0
-       || static_cast<uint32_t>(now - s_lastMuxProbeMs) >= kMuxRetryMs)
+    if(s_muxAddress == 0 && s_muxProbeAttempts < kFastProbeAttempts
+       && (s_lastMuxProbeMs == 0
+           || static_cast<uint32_t>(now - s_lastMuxProbeMs) >= kMuxRetryMs)
       )
     {
         s_lastMuxProbeMs = now;
         const uint8_t detectedMux = findMux();
+        if(detectedMux == 0)
+        {
+            ++s_muxProbeAttempts;
+            if(s_muxProbeAttempts >= kFastProbeAttempts)
+                P4_LOG_PRINTLN("[I2C Rotary] no mux found, giving up until reboot");
+        }
         if(detectedMux != 0)
         {
             s_muxAddress = detectedMux;
@@ -662,6 +727,8 @@ void i2c_rotaries_poll()
 
     uint8_t present = s_presentMask.load(std::memory_order_acquire);
     const bool wasPresent = (present & bit) != 0;
+    if(!wasPresent && s_probeAttempts[index] >= kFastProbeAttempts)
+        return;
     if(!wasPresent && s_lastProbeMs[index] != 0
        && static_cast<uint32_t>(now - s_lastProbeMs[index]) < kAbsentRetryMs)
         return;
@@ -672,6 +739,13 @@ void i2c_rotaries_poll()
     if(!ok)
     {
         s_lastProbeMs[index] = now;
+        if(!wasPresent)
+        {
+            ++s_probeAttempts[index];
+            if(s_probeAttempts[index] >= kFastProbeAttempts)
+                P4_LOG_PRINTF("[I2C Rotary] #%u not found, giving up until reboot\n",
+                              index + 1u);
+        }
         if(wasPresent && ++s_failures[index] >= kFailuresBeforeOffline)
         {
             s_failures[index] = 0;
@@ -685,6 +759,7 @@ void i2c_rotaries_poll()
             s_presentMask.fetch_and(static_cast<uint8_t>(~bit),
                                     std::memory_order_release);
             s_changedMask.fetch_or(bit, std::memory_order_release);
+            s_probeAttempts[index] = 0;
             P4_LOG_PRINTF("[I2C Rotary] #%u 0x%02X disconnected\n",
                           index + 1u, rotaryAddress(index));
         }
@@ -694,6 +769,7 @@ void i2c_rotaries_poll()
     s_failures[index] = 0;
     if(!wasPresent)
     {
+        s_probeAttempts[index] = 0;
         s_presentMask.fetch_or(bit, std::memory_order_release);
         if(s_muxAddress != 0)
             P4_LOG_PRINTF("[I2C Rotary] #%u SEN0502 channel %u at 0x%02X\n",
