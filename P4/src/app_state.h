@@ -18,7 +18,6 @@ struct P4State
     bool is_playing;
     bool master_connected;    // true after Daisy responds over USB-C
     int theme;
-    bool screen_rotated;      // v3.4 — flip the physical panel 180 degrees
     int master_volume;
     int seq_volume;
     int live_volume;

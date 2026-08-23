@@ -735,7 +735,6 @@ static lv_obj_t* s_pad_inst_modal_kit_btns[3][5] = {};   // [engine 0=808/1=909/
 static lv_obj_t* s_pad_inst_modal_kit_lbl_eng[3] = {};   // labels "808"/"909"/"505"
 static lv_obj_t* s_pod_status_modal = NULL;
 static lv_obj_t* s_pod_status_label = NULL;
-static lv_obj_t* s_pod_rotate_label = NULL;
 // ── AKAI MPD218 MIDI MAP + LEARN ─────────────────────────────────────
 static lv_obj_t* s_mpd_map_modal = NULL;
 static lv_obj_t* s_mpd_map_summary_label = NULL;
@@ -4141,7 +4140,6 @@ static void pod_status_modal_close_cb(lv_event_t* e) {
     if (s_pod_status_modal) lv_obj_del(s_pod_status_modal);
     s_pod_status_modal = NULL;
     s_pod_status_label = NULL;
-    s_pod_rotate_label = NULL;
     memset(s_pod_control_value_labels, 0, sizeof(s_pod_control_value_labels));
     memset(s_pod_led_function_labels, 0, sizeof(s_pod_led_function_labels));
     memset(s_pod_led_color_labels, 0, sizeof(s_pod_led_color_labels));
@@ -4279,26 +4277,6 @@ static void pod_status_popup_cb(lv_event_t* e) {
     lv_obj_center(closeLabel);
     lv_obj_add_event_cb(close, [](lv_event_t*) { pod_status_modal_close_cb(NULL); },
                         LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* rotate = lv_btn_create(card);
-    lv_obj_set_size(rotate, 100, 42);
-    lv_obj_set_pos(rotate, 816, 496);
-    apply_control_button_style(rotate, RED808_ACCENT2, false, 10);
-    s_pod_rotate_label = lv_label_create(rotate);
-    lv_obj_set_width(s_pod_rotate_label, 88);
-    lv_obj_set_style_text_align(s_pod_rotate_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s_pod_rotate_label, &lv_font_montserrat_12, 0);
-    lv_label_set_text(s_pod_rotate_label, p4.screen_rotated ? "ROTATE\n180 ON" : "ROTATE\n180 OFF");
-    lv_obj_center(s_pod_rotate_label);
-    lv_obj_add_event_cb(rotate, [](lv_event_t*) {
-        p4.screen_rotated = !p4.screen_rotated;
-        if (s_pod_rotate_label)
-            lv_label_set_text(s_pod_rotate_label, p4.screen_rotated ? "ROTATE\n180 ON" : "ROTATE\n180 OFF");
-        // direct_mode only flushes dirty areas — force one now so the flip
-        // (applied in disp_flush_cb) is visible immediately, not just after
-        // the next unrelated screen update.
-        lv_obj_invalidate(lv_scr_act());
-    }, LV_EVENT_CLICKED, NULL);
 
     pod_status_modal_refresh();
     pod_status_modal_update();

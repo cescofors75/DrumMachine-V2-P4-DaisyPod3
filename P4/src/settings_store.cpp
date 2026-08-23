@@ -23,7 +23,6 @@ struct PersistedSettings {
     uint8_t pattern       = 0;
     uint8_t track_volume[16] = {75, 75, 75, 75, 75, 75, 75, 75,
                                 75, 75, 75, 75, 75, 75, 75, 75};
-    uint8_t screen_rotated = 0;
 };
 static PersistedSettings s_loaded;
 static bool s_nvs_ok = false;
@@ -112,7 +111,6 @@ void settings_load(void) {
             repaired = true;
         }
     }
-    if (s_loaded.screen_rotated > 1) { s_loaded.screen_rotated = 0; repaired = true; }
     if (repaired) s_needs_migration = true;
     P4_LOG_PRINTF("[CFG] loaded theme=%u bpm=%u.%u pat=%u\n",
                   s_loaded.theme, s_loaded.bpm_int, s_loaded.bpm_frac, s_loaded.pattern);
@@ -133,7 +131,6 @@ void settings_apply(void) {
     p4.bpm_frac        = s_loaded.bpm_frac;
     p4.current_pattern = s_loaded.pattern;
     for (int i = 0; i < 16; i++) p4.track_volume[i] = s_loaded.track_volume[i];
-    p4.screen_rotated  = s_loaded.screen_rotated != 0;
 }
 
 void settings_tick(void) {
@@ -179,7 +176,6 @@ void settings_tick(void) {
         cur.pattern       = (uint8_t)constrain(p4.current_pattern, 0, Config::MAX_PATTERNS - 1);
         for (int i = 0; i < 16; i++)
             cur.track_volume[i] = (uint8_t)constrain(p4.track_volume[i], 0, 150);
-        cur.screen_rotated = p4.screen_rotated ? 1 : 0;
 
         if (memcmp(&cur, &snap, sizeof(cur)) != 0) {
             snap = cur;
