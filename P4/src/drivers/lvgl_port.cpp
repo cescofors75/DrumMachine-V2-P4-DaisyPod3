@@ -149,6 +149,16 @@ static void disp_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
         P4_LOG_PRINTLN("[LVGL] Vsync timeout");
     }
 
+    // Undo the flip now that the panel has actually consumed this buffer
+    // (confirmed by the vsync wait above). direct_mode reuses fb0/fb1 across
+    // frames, copying forward whatever's still in a buffer's untouched
+    // regions — if it were left flipped, the NEXT frame would copy-forward
+    // already-mirrored pixels into "unchanged" areas, corrupting them a bit
+    // more each frame (the flicker/drift seen on real hardware). Undoing it
+    // here keeps every buffer in LVGL's expected (non-rotated) orientation
+    // between flushes; only the panel ever sees the flipped version.
+    if (p4.screen_rotated) flip_framebuffer_180(color_p);
+
     lv_disp_flush_ready(drv);
 }
 
