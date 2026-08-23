@@ -58,6 +58,18 @@ const ThemeColors theme_presets[THEME_COUNT] = {
       .track_colors={0xFFFFFF,0xEEEEEE,0xDDDDDD,0xCCCCCC,0xBBBBBB,0xAAAAAA,0x999999,0x888888,
                      0x777777,0x666666,0x555555,0x444444,0x333333,0x222222,0xF0F0F0,0xD0D0D0},
       .name="GREYSCALE" },
+    // THEME_MPD218 — Akai MPD218 hardware look: matte-black body, white
+    // print/labels, red pad LEDs. Functional colors (warning/error) stay
+    // in the red family on purpose, same as THEME_RED808 already does.
+    { .bg=0x000000, .panel=0x121212, .surface=0x1C1C1C, .border=0x2E2E2E,
+      .text=0xFFFFFF, .text_dim=0x999999,
+      .accent=0xFF1E1E, .accent2=0xFF5C3D,
+      .success=0xFFFFFF, .warning=0xFF7A1A, .error=0xCC1111, .info=0xFFFFFF, .cyan=0xFFFFFF,
+      .track_colors={0x8B0000,0x9E0A0A,0xB11414,0xC41E1E,
+                     0xD72828,0xEA3232,0xFF3B3B,0xFF4747,
+                     0xFF5353,0xFF5F5F,0xFF6B6B,0xFF7777,
+                     0xFF8383,0xFF8F8F,0xFF9B9B,0xFFA7A7},
+      .name="MPD218" },
 };
 
 uint8_t ui_theme_index() {

@@ -180,7 +180,9 @@ void ProcessMidiMonitor()
         {
             const int pad = MidiNoteToUiPad(channel, event.data0);
             if(pad >= 0)
+            {
                 ui_external_pad_flash(static_cast<uint8_t>(pad), event.data1);
+            }
         }
     }
 }
@@ -537,10 +539,11 @@ void control_process()
         p4.bpm_frac = transport.pod.bpmX10 % 10;
         p4.is_playing = transport.pod.playing != 0;
         SequencerInstance().setTempo(transport.pod.bpmX10 / 10.0f);
-        if(p4.is_playing && !SequencerInstance().isPlaying())
-            SequencerInstance().start();
-        else if(!p4.is_playing && SequencerInstance().isPlaying())
-            SequencerInstance().stop();
+        // Transport state is mirrored into p4.is_playing (which the UI reads)
+        // straight from Daisy telemetry above. The P4 Sequencer's own
+        // playing/step state used to be started and stopped here to match,
+        // but nothing consumes it — see the note next to control_process()'s
+        // removed update() call.
         fxDirty.store(true, std::memory_order_release);
     }
     // Daisy only exposes its 20 resident slots. They are not the P4 logical
@@ -623,7 +626,11 @@ void control_process()
         midiLearnArmed.store(false, std::memory_order_release);
         midiLearnTimeoutRevision.fetch_add(1, std::memory_order_release);
     }
-    SequencerInstance().update();
+    // NOTE: Sequencer::update() is deliberately NOT called. DaisyPod3 owns
+    // playback (sample-accurate step clock inside its AudioCallback); the P4
+    // Sequencer is only a pattern data store here. Running its step engine
+    // too made it a second, drifting writer of currentPattern — see the
+    // header comment in Sequencer.h.
 }
 
 // ── User MIDI map / LEARN API ────────────────────────────────────────
@@ -779,7 +786,8 @@ void control_send_start()
     }
     else
     {
-        SequencerInstance().start();
+        // daisyUsb.start() is what actually starts playback; the P4
+        // Sequencer's own transport flags drive nothing (see Sequencer.h).
         daisyUsb.start();
     }
     p4.is_playing = true;
@@ -787,7 +795,6 @@ void control_send_start()
 
 void control_send_stop()
 {
-    SequencerInstance().stop();
     if(midiSongPrepared)
     {
         SequencerInstance().songChainStop();
