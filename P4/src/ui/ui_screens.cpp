@@ -2813,6 +2813,22 @@ static void seq_row_fx_cb(lv_event_t* e) {
     pad_fx_modal_show_for_pad((uint8_t)track);
 }
 
+// Quick "X" button per row: clears that track's instrument FX (filter,
+// drive, bitcrush, sends) without opening the panel first.
+static void seq_row_fx_clear_cb(lv_event_t* e) {
+    int track = (int)(intptr_t)lv_event_get_user_data(e);
+    if (track < 0 || track >= 16) return;
+    if (!control_available() && !control_engine_connected()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    s_pad_fx_state[track] = PadFxState{0, 127, 0, 0, 0, 0, 0};
+    s_pad_fx_state_init[track] = true;
+    control_send_track_clear_fx((uint8_t)track);
+    if (s_pad_fx_modal && s_pad_fx_focus_pad == track) pad_fx_modal_refresh();
+    ui_show_toast("FX de la pista borrados", RED808_SUCCESS);
+}
+
 // Helper: styled control button
 static lv_obj_t* create_ctrl_btn(lv_obj_t* parent, int x, int y, int w, int h,
                                   const char* text, lv_color_t border_color,
@@ -7128,6 +7144,7 @@ static lv_obj_t* seq_mute_btns[16]      = {};
 static lv_obj_t* seq_solo_btns[16]      = {};
 static lv_obj_t* seq_solo_labels[16]    = {};
 static lv_obj_t* seq_fx_btns[16]        = {};
+static lv_obj_t* seq_fx_clear_btns[16]  = {};
 static lv_obj_t* seq_ruler_labels[16]   = {};  // beat/step number ruler
 static lv_obj_t* seq_beat_bg[4]         = {};  // beat group shading panels
 static lv_obj_t* seq_playhead_line      = NULL; // glowing vertical playhead
@@ -7924,6 +7941,8 @@ static const int SEQ_FX_X       = 858;  // per-row instrument FX button X
 static const int SEQ_FX_W       = 52;   // per-row instrument FX button width
 static const int SEQ_SOLO_X     = 916;  // solo button X
 static const int SEQ_SOLO_W     = 32;   // solo button width
+static const int SEQ_FXCLR_X    = 956;  // per-row "clear FX" button X
+static const int SEQ_FXCLR_W    = 60;   // per-row "clear FX" button width
 static const int SEQ_STATUS_Y   = 586;  // bottom status bar Y
 static const int SEQ_STATUS_H   = 14;   // bottom status bar height
 
@@ -8427,6 +8446,20 @@ static void create_sequencer_screen(void) {
         lv_obj_set_style_text_font(seq_solo_labels[t], &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(seq_solo_labels[t], RED808_TEXT_DIM, 0);
         lv_obj_center(seq_solo_labels[t]);
+
+        // ── Clear FX button — resets this track's instrument FX in one tap ──
+        seq_fx_clear_btns[t] = lv_btn_create(scr_sequencer);
+        lv_obj_set_size(seq_fx_clear_btns[t], SEQ_FXCLR_W, SEQ_TRACK_H);
+        lv_obj_set_pos(seq_fx_clear_btns[t], SEQ_FXCLR_X, rowY);
+        apply_control_button_style(seq_fx_clear_btns[t], RED808_ERROR, false, 4);
+        lv_obj_set_style_bg_opa(seq_fx_clear_btns[t], LV_OPA_20, 0);
+        lv_obj_set_style_pad_all(seq_fx_clear_btns[t], 0, 0);
+        lv_obj_add_event_cb(seq_fx_clear_btns[t], seq_row_fx_clear_cb, LV_EVENT_CLICKED, (void*)(intptr_t)t);
+        lv_obj_t* fx_clear_lbl = lv_label_create(seq_fx_clear_btns[t]);
+        lv_label_set_text(fx_clear_lbl, LV_SYMBOL_CLOSE " FX");
+        lv_obj_set_style_text_font(fx_clear_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(fx_clear_lbl, RED808_ERROR, 0);
+        lv_obj_center(fx_clear_lbl);
     }   // end for(t)
 
     // ── Glowing vertical playhead (spans all rows, created last = on top) ──
@@ -14327,6 +14360,7 @@ static void ui_reload_themed_screens(void) {
         seq_solo_btns[i] = NULL;
         seq_solo_labels[i] = NULL;
         seq_fx_btns[i] = NULL;
+        seq_fx_clear_btns[i] = NULL;
         seq_ruler_labels[i] = NULL;
     }
     for (int b = 0; b < 4; b++) seq_beat_bg[b] = NULL;
