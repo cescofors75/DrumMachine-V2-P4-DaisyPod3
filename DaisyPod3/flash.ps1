@@ -36,7 +36,9 @@ if(-not (Test-Path -LiteralPath $firmware)) {
 }
 
 $dfuCandidates = @(
-    'C:\Espressif\tools\dfu-util\0.11\dfu-util-0.11-win64\dfu-util.exe'
+    'C:\Espressif\tools\dfu-util\0.11\dfu-util-0.11-win64\dfu-util.exe',
+    'C:\msys64\mingw64\bin\dfu-util.exe',
+    'C:\msys64\usr\bin\dfu-util.exe'
 )
 $dfuCommand = Get-Command dfu-util.exe -ErrorAction SilentlyContinue
 if($dfuCommand) { $dfuCandidates += $dfuCommand.Source }
