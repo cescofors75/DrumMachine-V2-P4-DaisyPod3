@@ -89,3 +89,11 @@ void ui_pad_sound_sync_track_engines(const int8_t engines[16]);
 // nag with a toast every few bars during a live set; manual taps pass true.
 void fx_random_apply(bool showToast = true);
 void mix_random_apply(bool showToast = true);
+
+// Refreshes every step's corner "customized" dot (probability<100% or a
+// parameter lock) on the sequencer's step grid from the Sequencer's stored
+// state. Safe to call even when the sequencer screen was never built (the
+// dot pointers are all NULL then, and each refresh no-ops). Called by
+// control_api.cpp after an EVOLVE pass touches step probabilities in the
+// background, so the grid stays honest even on a different screen.
+void ui_sequencer_refresh_all_step_dots(void);

@@ -8095,6 +8095,210 @@ static void seq_song_stop_badge_cb(lv_event_t* e) {
     seq_var_btn_refresh();
 }
 
+// ── EVOLVE — third piece of PATTERN -> MUTATE -> EVOLVE ─────────────────
+// Same bar-clock AUTO family as RANDOM SONG/AUTO FX/MIX, but it never
+// swaps the pattern or its hit layout: control_random_evolve_apply_now()
+// (control_api.cpp) only nudges the probability of already-active steps
+// and the pattern's humanize amount, both scaled by the AMOUNT dial here
+// and a fixed per-track freedom weight (kick close to fixed, hats/percs
+// free) — the pattern keeps its identity, only its feel drifts.
+static lv_obj_t* seq_hdr_evolve_btn = NULL;
+static lv_obj_t* seq_evolve_stop_badge = NULL;
+static lv_obj_t* seq_evolve_modal = NULL;
+static lv_obj_t* seq_evolve_amount_slider = NULL;
+static lv_obj_t* seq_evolve_amount_lbl = NULL;
+static lv_obj_t* seq_evolve_bars_btns[4] = {};
+static lv_obj_t* seq_evolve_toggle_btn = NULL;
+static const uint8_t SEQ_EVOLVE_BAR_OPTIONS[4] = {1, 2, 4, 8};
+
+static void seq_evolve_btn_refresh(void) {
+    if (!seq_hdr_evolve_btn) return;
+    const bool active = control_random_evolve_active();
+    apply_control_button_style(seq_hdr_evolve_btn,
+        active ? RED808_SUCCESS : RED808_ACCENT2, false, 7);
+    if (seq_evolve_stop_badge) {
+        if (active) lv_obj_clear_flag(seq_evolve_stop_badge, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(seq_evolve_stop_badge, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void seq_evolve_stop_badge_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    control_random_evolve_set_active(false);
+    seq_evolve_btn_refresh();
+}
+
+static void seq_evolve_modal_refresh(void) {
+    if (!seq_evolve_modal) return;
+    const uint8_t amount = control_random_evolve_amount();
+    if (seq_evolve_amount_slider)
+        lv_slider_set_value(seq_evolve_amount_slider, amount, LV_ANIM_OFF);
+    if (seq_evolve_amount_lbl) lv_label_set_text_fmt(seq_evolve_amount_lbl, "%d%%", amount);
+
+    const uint8_t bars = control_random_evolve_bars();
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t* btn = seq_evolve_bars_btns[i];
+        if (!btn) continue;
+        const bool sel = SEQ_EVOLVE_BAR_OPTIONS[i] == bars;
+        apply_control_button_style(btn, sel ? RED808_ACCENT : RED808_BORDER, false, 8);
+    }
+
+    if (seq_evolve_toggle_btn) {
+        const bool active = control_random_evolve_active();
+        apply_control_button_style(seq_evolve_toggle_btn,
+            active ? RED808_SUCCESS : RED808_BORDER, false, 10);
+        lv_obj_t* lbl = lv_obj_get_child(seq_evolve_toggle_btn, 0);
+        if (lbl) lv_label_set_text(lbl,
+            active ? LV_SYMBOL_OK "  EVOLVE: ON" : LV_SYMBOL_CLOSE "  EVOLVE: OFF");
+    }
+}
+
+static void seq_evolve_modal_hide(lv_event_t* e = NULL) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (seq_evolve_modal) lv_obj_del(seq_evolve_modal);
+    seq_evolve_modal = NULL;
+    seq_evolve_amount_slider = NULL;
+    seq_evolve_amount_lbl = NULL;
+    for (int i = 0; i < 4; i++) seq_evolve_bars_btns[i] = NULL;
+    seq_evolve_toggle_btn = NULL;
+}
+
+static void seq_evolve_amount_cb(lv_event_t* e) {
+    lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
+    control_random_evolve_set_amount((uint8_t)lv_slider_get_value(slider));
+    seq_evolve_modal_refresh();
+}
+
+static void seq_evolve_bars_cb(lv_event_t* e) {
+    const int bars = (int)(intptr_t)lv_event_get_user_data(e);
+    control_random_evolve_set_bars((uint8_t)bars);
+    seq_evolve_modal_refresh();
+}
+
+static void seq_evolve_toggle_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    control_random_evolve_set_active(!control_random_evolve_active());
+    seq_evolve_modal_refresh();
+    seq_evolve_btn_refresh();
+}
+
+static void seq_evolve_apply_now_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    control_random_evolve_apply_now();
+}
+
+static void seq_evolve_modal_show(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (seq_evolve_modal) return;
+
+    seq_evolve_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(seq_evolve_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(seq_evolve_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(seq_evolve_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(seq_evolve_modal, 0, 0);
+    lv_obj_set_style_pad_all(seq_evolve_modal, 0, 0);
+    lv_obj_clear_flag(seq_evolve_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(seq_evolve_modal, seq_evolve_modal_hide, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(seq_evolve_modal);
+    lv_obj_set_size(card, 420, 344);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_SUCCESS, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "EVOLVE");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_SUCCESS, 0);
+    lv_obj_set_pos(title, 0, 0);
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "Muta el patron actual sin cambiar su identidad");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(hint, 0, 26);
+
+    lv_obj_t* amountLbl = lv_label_create(card);
+    lv_label_set_text(amountLbl, "CANTIDAD:");
+    lv_obj_set_style_text_font(amountLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(amountLbl, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(amountLbl, 0, 48);
+
+    seq_evolve_amount_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(seq_evolve_amount_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(seq_evolve_amount_lbl, RED808_SUCCESS, 0);
+    lv_obj_set_pos(seq_evolve_amount_lbl, 340, 44);
+
+    seq_evolve_amount_slider = lv_slider_create(card);
+    lv_obj_set_size(seq_evolve_amount_slider, 388, 16);
+    lv_obj_set_pos(seq_evolve_amount_slider, 0, 68);
+    lv_slider_set_range(seq_evolve_amount_slider, 0, 100);
+    lv_obj_set_style_bg_color(seq_evolve_amount_slider, RED808_SURFACE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(seq_evolve_amount_slider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(seq_evolve_amount_slider, RED808_SUCCESS, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(seq_evolve_amount_slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(seq_evolve_amount_slider, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(seq_evolve_amount_slider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(seq_evolve_amount_slider, 8, LV_PART_KNOB);
+    lv_obj_set_style_radius(seq_evolve_amount_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_add_event_cb(seq_evolve_amount_slider, seq_evolve_amount_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(seq_evolve_amount_slider, seq_evolve_amount_cb, LV_EVENT_RELEASED, NULL);
+
+    lv_obj_t* barsLbl = lv_label_create(card);
+    lv_label_set_text(barsLbl, "CADA CUANTOS COMPASES:");
+    lv_obj_set_style_text_font(barsLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(barsLbl, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(barsLbl, 0, 96);
+
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t* btn = lv_btn_create(card);
+        seq_evolve_bars_btns[i] = btn;
+        lv_obj_set_size(btn, 86, 36);
+        lv_obj_set_pos(btn, i * (86 + 8), 116);
+        lv_obj_add_event_cb(btn, seq_evolve_bars_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)SEQ_EVOLVE_BAR_OPTIONS[i]);
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_label_set_text_fmt(lbl, "%d", SEQ_EVOLVE_BAR_OPTIONS[i]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_center(lbl);
+    }
+
+    seq_evolve_toggle_btn = lv_btn_create(card);
+    lv_obj_set_size(seq_evolve_toggle_btn, 388, 48);
+    lv_obj_set_pos(seq_evolve_toggle_btn, 0, 160);
+    lv_obj_add_event_cb(seq_evolve_toggle_btn, seq_evolve_toggle_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* toggleLbl = lv_label_create(seq_evolve_toggle_btn);
+    lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(toggleLbl);
+
+    lv_obj_t* applyBtn = lv_btn_create(card);
+    lv_obj_set_size(applyBtn, 388, 40);
+    lv_obj_set_pos(applyBtn, 0, 220);
+    apply_control_button_style(applyBtn, RED808_INFO, false, 10);
+    lv_obj_add_event_cb(applyBtn, seq_evolve_apply_now_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* applyLbl = lv_label_create(applyBtn);
+    lv_label_set_text(applyLbl, LV_SYMBOL_SHUFFLE "  APLICAR AHORA");
+    lv_obj_set_style_text_font(applyLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(applyLbl);
+
+    lv_obj_t* closeBtn = lv_btn_create(card);
+    lv_obj_set_size(closeBtn, 388, 36);
+    lv_obj_set_pos(closeBtn, 0, 268);
+    apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
+    lv_obj_add_event_cb(closeBtn, seq_evolve_modal_hide, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "CERRAR");
+    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(closeLbl);
+
+    seq_evolve_modal_refresh();
+}
+
 static void seq_variation_modal_hide(lv_event_t* e = NULL) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     if (seq_variation_modal) lv_obj_del(seq_variation_modal);
@@ -8842,6 +9046,16 @@ static void seq_install_raw_and_show_page0(int raw_len) {
     seq_apply_page_styles();
 }
 
+// Probability/locks aren't part of p4.steps/prev_cell_key, so they need
+// their own explicit refresh here — deliberately NOT polled per-frame (see
+// the comment at seq_step_prob_dot's creation). Public so control_api.cpp
+// can call it too, after an EVOLVE pass touches probabilities directly.
+void ui_sequencer_refresh_all_step_dots(void) {
+    for (int t = 0; t < 16; t++)
+        for (int s = 0; s < 16; s++)
+            seq_step_prob_dot_refresh(t, s);
+}
+
 void ui_sequencer_sync_from_current_pattern(void) {
     seq_raw_len = 16;
     seq_page = 0;
@@ -8855,12 +9069,7 @@ void ui_sequencer_sync_from_current_pattern(void) {
     // A different pattern slot became authoritative — including the jumps
     // RANDOM SONG itself makes. Keep the VAR button's indicator in sync.
     seq_var_btn_refresh();
-    // Probability isn't part of p4.steps/prev_cell_key, so it needs its own
-    // explicit refresh here — deliberately NOT polled per-frame (see the
-    // comment at seq_step_prob_dot's creation).
-    for (int t = 0; t < 16; t++)
-        for (int s = 0; s < 16; s++)
-            seq_step_prob_dot_refresh(t, s);
+    ui_sequencer_refresh_all_step_dots();
 }
 
 void ui_sequencer_load_external_pattern(const bool steps[16][64], int raw_len) {
@@ -8877,9 +9086,7 @@ void ui_sequencer_load_external_pattern(const bool steps[16][64], int raw_len) {
     seq_force_refresh_cells = true;  // force full cell repaint — prev_cell_key may be stale
     seq_page_styles_dirty = true;
     seq_pattern_dirty = true;
-    for (int t = 0; t < 16; t++)
-        for (int s = 0; s < 16; s++)
-            seq_step_prob_dot_refresh(t, s);
+    ui_sequencer_refresh_all_step_dots();
 }
 
 static void create_sequencer_screen(void) {
@@ -8995,6 +9202,11 @@ static void create_sequencer_screen(void) {
                                            seq_variation_modal_show);
         seq_song_stop_badge = ui_create_auto_stop_badge(seq_hdr_var_btn, seq_song_stop_badge_cb);
         seq_var_btn_refresh();
+
+        seq_hdr_evolve_btn = makeHeaderButton(72, "EVOLVE", RED808_ACCENT2,
+                                              seq_evolve_modal_show);
+        seq_evolve_stop_badge = ui_create_auto_stop_badge(seq_hdr_evolve_btn, seq_evolve_stop_badge_cb);
+        seq_evolve_btn_refresh();
 
         makeHeaderButton(68, "GROUPS", RED808_BORDER, seq_groups_modal_show);
 
@@ -15264,6 +15476,13 @@ static void ui_reload_themed_screens(void) {
     seq_hdr_queue_lbl = NULL;
     seq_hdr_var_btn = NULL;
     seq_song_stop_badge = NULL;
+    seq_hdr_evolve_btn = NULL;
+    seq_evolve_stop_badge = NULL;
+    seq_evolve_modal = NULL;
+    seq_evolve_amount_slider = NULL;
+    seq_evolve_amount_lbl = NULL;
+    for (int i = 0; i < 4; i++) seq_evolve_bars_btns[i] = NULL;
+    seq_evolve_toggle_btn = NULL;
     seq_variation_modal = NULL;
     seq_hdr_save_btn = NULL;
     seq_hdr_save_lbl = NULL;

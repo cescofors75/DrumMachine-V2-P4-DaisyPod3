@@ -1313,7 +1313,19 @@ struct BarClock
 BarClock songClock;
 BarClock fxClock;
 BarClock mixClock;
+BarClock evolveClock;
 uint8_t songStyle = RND_STYLE_TECHNO;
+uint8_t evolveAmount = 40;   // 0-100, dial default
+
+// Per-track base "freedom" (0-100): how much a track's step probabilities
+// are allowed to drift on each EVOLVE pass. Mirrors the musician's own
+// framing — kick stays close to fixed, snare barely moves, hats/cymbals
+// wander more, toms/percs are freest. Track order: BD SD CH OH CY CP RS
+// CB LT MT HT MA CL HC MC LC (matches trackNames in ui_screens.cpp).
+const uint8_t kEvolveTrackWeight[16] = {
+    8, 20, 55, 50, 45, 40, 45, 40,
+    65, 65, 65, 70, 70, 70, 70, 70,
+};
 
 // Wall-clock bar timer (derived from the current BPM), not a step-sample
 // comparison: sampling p4.current_step once per control_process() tick is
@@ -1418,6 +1430,48 @@ void triggerRandomSongJump()
     const int pick = pool[randomRange(0, poolCount - 1)];
     control_send_queue_pattern(pick);
 }
+
+// One EVOLVE pass. Deliberately narrow: it only nudges the probability of
+// steps that are ALREADY active (never turns a step on/off — the pattern's
+// hit layout, its identity, never changes) and refreshes the pattern's
+// global humanize amount from the dial. Both are scaled by evolveAmount x
+// each track's fixed freedom weight, so kick/snare drift rarely while
+// hats/percs drift often. A 40-100 floor keeps EVOLVE from ever silencing
+// a track entirely on its own — that stays a manual, deliberate act.
+void EvolveApply()
+{
+    if(evolveAmount == 0) return;
+    Sequencer& sequencer = SequencerInstance();
+    const int pattern = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+
+    // Global microtiming/velocity fluctuation — continuous per-hit, not
+    // bar-gated, once set. DaisyPod3 already anchors kick/snare timing
+    // (quarters their max jitter) so this alone gives "velocity/microtiming
+    // fluctuan suavemente" without any extra per-track logic here.
+    const uint8_t timingMs = (uint8_t)((evolveAmount * 15) / 100);
+    const uint8_t velAmount = (uint8_t)((evolveAmount * 35) / 100);
+    sequencer.setHumanize(timingMs, velAmount);
+    const uint8_t humanizePayload[2] = {timingMs, velAmount};
+    SendWithRetry(CMD_DSQ_SET_HUMANIZE, humanizePayload, sizeof(humanizePayload));
+
+    bool anyChanged = false;
+    for(int track = 0; track < 16; ++track)
+    {
+        const int weight = (evolveAmount * kEvolveTrackWeight[track]) / 100;
+        if(weight <= 0) continue;
+        for(int step = 0; step < 16; ++step)
+        {
+            if(!p4.steps[track][step]) continue;
+            if(randomRange(0, 99) >= weight) continue;
+            const uint8_t current = sequencer.getStepProbability(pattern, track, step);
+            const int next = Clamp((int)current + (int)randomRange(-25, 25), 40, 100);
+            if(next == (int)current) continue;
+            control_send_set_step_probability(track, step, next);
+            anyChanged = true;
+        }
+    }
+    if(anyChanged) ui_sequencer_refresh_all_step_dots();
+}
 } // namespace
 
 void control_random_song_set_active(bool active)
@@ -1461,15 +1515,35 @@ void control_random_mix_set_bars(uint8_t bars)
 }
 uint8_t control_random_mix_bars() { return mixClock.bars; }
 
+void control_random_evolve_set_active(bool active)
+{
+    evolveClock.active = active;
+    evolveClock.windowOpen = false;
+}
+bool control_random_evolve_active() { return evolveClock.active; }
+void control_random_evolve_set_bars(uint8_t bars)
+{
+    evolveClock.bars = bars < 1 ? 1 : (bars > 8 ? 8 : bars);
+}
+uint8_t control_random_evolve_bars() { return evolveClock.bars; }
+void control_random_evolve_set_amount(uint8_t amount)
+{
+    evolveAmount = amount > 100 ? 100 : amount;
+}
+uint8_t control_random_evolve_amount() { return evolveAmount; }
+void control_random_evolve_apply_now() { EvolveApply(); }
+
 // Called once per control_process() tick — the auto-mode "conductor". Pure
-// control-layer logic for the song jump; FX/mix re-randomization delegates
-// to the same LVGL-side apply functions the manual RANDOM buttons use, so
-// there is exactly one implementation of what "random" means for each.
+// control-layer logic for the song jump and EVOLVE; FX/mix re-randomization
+// delegates to the same LVGL-side apply functions the manual RANDOM
+// buttons use, so there is exactly one implementation of what "random"
+// means for each.
 void control_random_auto_tick()
 {
     if(barClockTick(songClock)) triggerRandomSongJump();
     if(barClockTick(fxClock)) fx_random_apply(false);
     if(barClockTick(mixClock)) mix_random_apply(false);
+    if(barClockTick(evolveClock)) EvolveApply();
 }
 
 bool control_variation_can_undo()
