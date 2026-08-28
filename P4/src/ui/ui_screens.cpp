@@ -7492,13 +7492,10 @@ static lv_obj_t*  seq_variation_modal   = NULL;
 static lv_obj_t*  seq_song_style_btns[6] = {};
 static lv_obj_t*  seq_song_bars_btns[4]  = {};
 static lv_obj_t*  seq_song_toggle_btn    = NULL;
-static lv_obj_t*  seq_hdr_mix_btn       = NULL;
-static lv_obj_t*  seq_hdr_mix_lbl       = NULL;
 static lv_obj_t*  seq_hdr_save_btn      = NULL;
 static lv_obj_t*  seq_hdr_save_lbl      = NULL;
 static lv_obj_t*  seq_hdr_group_btns[4] = {};
 static uint8_t    seq_hdr_group_state[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-static bool       seq_club_warm         = false;
 static lv_obj_t*  seq_pattern_list_modal = NULL;
 static bool       seq_pattern_list_save_mode = false;
 static lv_obj_t*  seq_save_confirm_modal = NULL;
@@ -7811,6 +7808,93 @@ static void seq_group_mute_cb(lv_event_t* e) {
     if (ui_control_available()) enqueue_mute_mask_control(fullMask);
     ui_show_toast(mute ? "Grupo en MUTE" : "Grupo activo",
                   mute ? RED808_ERROR : RED808_SUCCESS);
+}
+
+// GROUPS popup — replaces 4 separate always-visible header buttons
+// (DRUMS/BASS/SYNTH/XTRA) with a single "GROUPS" entry point, freeing header
+// width that was overlapping with the buttons next to it.
+static lv_obj_t* seq_groups_modal = NULL;
+static lv_obj_t* seq_groups_modal_btns[4] = {};
+
+static void seq_groups_modal_hide(lv_event_t* e = NULL) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (seq_groups_modal) lv_obj_del(seq_groups_modal);
+    seq_groups_modal = NULL;
+    for (int i = 0; i < 4; i++) seq_groups_modal_btns[i] = NULL;
+}
+
+static void seq_groups_modal_refresh(void) {
+    if (!seq_groups_modal) return;
+    for (int g = 0; g < 4; ++g) {
+        lv_obj_t* btn = seq_groups_modal_btns[g];
+        if (!btn) continue;
+        const uint16_t groupMask = seq_group_mask(g);
+        bool allMuted = true;
+        for (int t = 0; t < 16; ++t)
+            if ((groupMask & (1u << t)) && !p4.track_muted[t]) allMuted = false;
+        apply_control_button_style(btn, allMuted ? RED808_ERROR : RED808_BORDER, false, 10);
+    }
+}
+
+static void seq_groups_modal_btn_cb(lv_event_t* e) {
+    seq_group_mute_cb(e);   // reuse the existing mask/toggle logic
+    seq_groups_modal_refresh();
+}
+
+static void seq_groups_modal_show(lv_event_t* /*e*/) {
+    if (seq_groups_modal) return;
+
+    seq_groups_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(seq_groups_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(seq_groups_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(seq_groups_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(seq_groups_modal, 0, 0);
+    lv_obj_set_style_pad_all(seq_groups_modal, 0, 0);
+    lv_obj_clear_flag(seq_groups_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(seq_groups_modal, seq_groups_modal_hide, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(seq_groups_modal);
+    lv_obj_set_size(card, 300, 296);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "MUTE POR GRUPO");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 0, 0);
+
+    static const char* const groupNames[4] = {"DRUMS", "BASS", "SYNTH", "XTRA"};
+    for (int g = 0; g < 4; ++g) {
+        lv_obj_t* btn = lv_btn_create(card);
+        seq_groups_modal_btns[g] = btn;
+        lv_obj_set_size(btn, 268, 40);
+        lv_obj_set_pos(btn, 0, 36 + g * (40 + 8));
+        lv_obj_add_event_cb(btn, seq_groups_modal_btn_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)g);
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, groupNames[g]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_center(lbl);
+    }
+
+    lv_obj_t* close = lv_btn_create(card);
+    lv_obj_set_size(close, 268, 40);
+    lv_obj_set_pos(close, 0, 36 + 4 * (40 + 8));
+    apply_control_button_style(close, RED808_BORDER, false, 10);
+    lv_obj_add_event_cb(close, seq_groups_modal_hide, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl = lv_label_create(close);
+    lv_label_set_text(closeLbl, "CERRAR");
+    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(closeLbl);
+
+    seq_groups_modal_refresh();
 }
 
 static void seq_fill_cb(lv_event_t* /*e*/) {
@@ -8163,15 +8247,6 @@ static void seq_drop_cb(lv_event_t* /*e*/) {
     ui_show_toast("DROP armado para el proximo compas", RED808_ACCENT);
 }
 
-static void seq_mix_preset_cb(lv_event_t* /*e*/) {
-    seq_club_warm = !seq_club_warm;
-    control_send_mix_preset(seq_club_warm);
-    if (seq_hdr_mix_lbl) lv_label_set_text(seq_hdr_mix_lbl, seq_club_warm ? "CLUB WARM" : "DRY");
-    if (seq_hdr_mix_btn) lv_obj_set_style_bg_color(seq_hdr_mix_btn,
-        seq_club_warm ? RED808_WARNING : RED808_SURFACE, 0);
-    ui_show_toast(seq_club_warm ? "Mix CLUB WARM" : "Mix DRY", RED808_ACCENT);
-}
-
 // Last-loaded MIDI info — kept so the info button in the sequencer header
 // can re-open the summary modal on demand.
 static char   seq_last_midi_name[64]   = "";
@@ -8268,12 +8343,13 @@ static const int SEQ_GRID_X     = 62;   // step grid start X
 static const int SEQ_CELL_W     = 48;   // step cell width
 static const int SEQ_BEAT_GAP   = 4;    // gap between beat groups (every 4 steps)
 static const int SEQ_CELL_GAP   = 1;    // gap between cells within a beat
+// Row order (left to right): FX, XFX (clear FX), SOLO.
 static const int SEQ_FX_X       = 858;  // per-row instrument FX button X
 static const int SEQ_FX_W       = 52;   // per-row instrument FX button width
-static const int SEQ_SOLO_X     = 916;  // solo button X
-static const int SEQ_SOLO_W     = 32;   // solo button width
-static const int SEQ_FXCLR_X    = 956;  // per-row "clear FX" button X
+static const int SEQ_FXCLR_X    = 914;  // per-row "clear FX" (XFX) button X
 static const int SEQ_FXCLR_W    = 60;   // per-row "clear FX" button width
+static const int SEQ_SOLO_X     = 978;  // solo button X
+static const int SEQ_SOLO_W     = 32;   // solo button width
 static const int SEQ_STATUS_Y   = 586;  // bottom status bar Y
 static const int SEQ_STATUS_H   = 14;   // bottom status bar height
 
@@ -8578,19 +8654,8 @@ static void create_sequencer_screen(void) {
                                            seq_variation_modal_show);
         seq_var_btn_refresh();
 
-        static const char* const groupNames[4] = {"DRUMS", "BASS", "SYNTH", "XTRA"};
-        for (int g = 0; g < 4; ++g) {
-            seq_hdr_group_btns[g] = makeHeaderButton(g == 0 ? 54 : 48,
-                                                     groupNames[g], RED808_BORDER,
-                                                     seq_group_mute_cb);
-            lv_obj_remove_event_cb(seq_hdr_group_btns[g], seq_group_mute_cb);
-            lv_obj_add_event_cb(seq_hdr_group_btns[g], seq_group_mute_cb,
-                                LV_EVENT_CLICKED, (void*)(intptr_t)g);
-        }
+        makeHeaderButton(68, "GROUPS", RED808_BORDER, seq_groups_modal_show);
 
-        seq_hdr_mix_btn = makeHeaderButton(88, seq_club_warm ? "CLUB WARM" : "DRY",
-                                           RED808_WARNING, seq_mix_preset_cb);
-        seq_hdr_mix_lbl = lv_obj_get_child(seq_hdr_mix_btn, 0);
         makeHeaderButton(52, "LIST", RED808_ACCENT,
             [](lv_event_t*) { seq_pattern_list_show(); });
         makeHeaderButton(56, LV_SYMBOL_DOWNLOAD " MIDI", RED808_CYAN,
@@ -14752,8 +14817,6 @@ static void ui_reload_themed_screens(void) {
     seq_hdr_queue_lbl = NULL;
     seq_hdr_var_btn = NULL;
     seq_variation_modal = NULL;
-    seq_hdr_mix_btn = NULL;
-    seq_hdr_mix_lbl = NULL;
     seq_hdr_save_btn = NULL;
     seq_hdr_save_lbl = NULL;
     seq_pattern_list_modal = NULL;
@@ -14761,6 +14824,8 @@ static void ui_reload_themed_screens(void) {
     seq_save_confirm_slot = -1;
     memset(seq_hdr_group_btns, 0, sizeof(seq_hdr_group_btns));
     memset(seq_hdr_group_state, 0xFF, sizeof(seq_hdr_group_state));
+    seq_groups_modal = NULL;
+    memset(seq_groups_modal_btns, 0, sizeof(seq_groups_modal_btns));
     seq_pattern_modal = NULL;
     seq_pattern_modal_lbl = NULL;
     seq_pattern_modal_spin = NULL;
