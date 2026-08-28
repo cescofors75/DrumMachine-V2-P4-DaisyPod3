@@ -43,6 +43,16 @@ uint8_t activeDaisyPattern = 0;
 uint8_t queuedDaisyPattern = 0xFF;
 uint8_t expectedDaisyPattern = 0xFF;
 uint32_t expectedDaisyPatternSinceMs = 0;
+// Debounces the physical Daisy pattern encoder: spinning it fast reports a
+// new transport.pattern on almost every poll, and uploading a full pattern
+// (16 tracks, retried) on each one can queue up enough blocking USB work to
+// stall the main loop and trip the watchdog. The UI still follows the
+// encoder live (cheap, in-memory); the actual step-data upload only fires
+// once the encoder has been still for kPatternUploadDebounceMs.
+constexpr uint32_t kPatternUploadDebounceMs = 200;
+int pendingUploadLogicalPattern = -1;
+uint8_t pendingUploadDaisySlot = 0xFF;
+uint32_t pendingUploadSinceMs = 0;
 std::atomic<bool> midiSongPrepared{false};
 std::atomic<bool> midiSongPersisted{false};
 uint8_t midiSongPatternCount = 0;
@@ -592,9 +602,10 @@ void control_process()
             && transport.pattern != activeDaisyPattern)
     {
         // This is a physical Daisy pattern control. Translate the movement of
-        // the 20-slot ring into a relative change in the 128-pattern P4 bank,
-        // then immediately populate the new Daisy slot with that logical
-        // pattern. This preserves Pattern 1 and also handles wrap-around.
+        // the 20-slot ring into a relative change in the 128-pattern P4 bank.
+        // This preserves Pattern 1 and also handles wrap-around. The UI
+        // follows every step live; the actual step-data upload is debounced
+        // below so a fast spin doesn't queue a burst of full uploads.
         int delta = static_cast<int>(transport.pattern)
                   - static_cast<int>(activeDaisyPattern);
         if(delta > 10) delta -= 20;
@@ -605,8 +616,19 @@ void control_process()
         SequencerInstance().selectPattern(logicalPattern);
         LoadPatternToUi(logicalPattern);
         ui_sequencer_sync_from_current_pattern();
-        UploadPattern(activeDaisyPattern, logicalPattern);
-        ApplyPatternPerformance(logicalPattern);
+        pendingUploadLogicalPattern = logicalPattern;
+        pendingUploadDaisySlot = activeDaisyPattern;
+        pendingUploadSinceMs = millis();
+    }
+    if(pendingUploadLogicalPattern >= 0
+       && millis() - pendingUploadSinceMs >= kPatternUploadDebounceMs)
+    {
+        if(transport.engine_responding)
+        {
+            UploadPattern(pendingUploadDaisySlot, pendingUploadLogicalPattern);
+            ApplyPatternPerformance(pendingUploadLogicalPattern);
+        }
+        pendingUploadLogicalPattern = -1;
     }
     if(transport.engine_responding && !engineWasConnected)
     {
