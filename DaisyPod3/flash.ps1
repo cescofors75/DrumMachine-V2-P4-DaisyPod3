@@ -25,7 +25,7 @@ if(-not $SkipBuild) {
         Write-Host 'Build incremental de DaisyPod3 (usa -Clean para reconstruir todo).' `
             -ForegroundColor DarkGray
     }
-    & pwsh.exe @buildArgs
+    & powershell.exe @buildArgs
     if($LASTEXITCODE -ne 0) {
         throw "La compilacion de DaisyPod3 fallo con codigo $LASTEXITCODE"
     }
