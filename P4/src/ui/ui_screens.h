@@ -85,5 +85,7 @@ void ui_pad_sound_sync_track_engines(const int8_t engines[16]);
 // random MIXER rebalance, respectively — the same logic the manual RANDOM
 // buttons run on tap. Exposed so control_random_auto_tick() (control_api.cpp)
 // can call them from AUTO FX / AUTO MIX without any LVGL event to hand it.
-void fx_random_apply(void);
-void mix_random_apply(void);
+// showToast is false for AUTO's periodic re-randomization so it does not
+// nag with a toast every few bars during a live set; manual taps pass true.
+void fx_random_apply(bool showToast = true);
+void mix_random_apply(bool showToast = true);

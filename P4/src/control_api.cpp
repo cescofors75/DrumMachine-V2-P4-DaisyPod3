@@ -1468,8 +1468,8 @@ uint8_t control_random_mix_bars() { return mixClock.bars; }
 void control_random_auto_tick()
 {
     if(barClockTick(songClock)) triggerRandomSongJump();
-    if(barClockTick(fxClock)) fx_random_apply();
-    if(barClockTick(mixClock)) mix_random_apply();
+    if(barClockTick(fxClock)) fx_random_apply(false);
+    if(barClockTick(mixClock)) mix_random_apply(false);
 }
 
 bool control_variation_can_undo()

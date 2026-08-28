@@ -521,6 +521,34 @@ static lv_obj_t* ui_create_midi_badge(lv_obj_t* parent, int x, int y) {
     return badge;
 }
 
+// Small "kill this AUTO mode" corner badge for a header/random button —
+// lets the user turn off RANDOM SONG / AUTO FX / AUTO MIX with one tap
+// instead of opening its modal just to reach the AUTO toggle. Overlays the
+// button's own top-right corner so it costs no extra header width. Caller
+// owns showing/hiding it (via LV_OBJ_FLAG_HIDDEN) to reflect active state.
+static lv_obj_t* ui_create_auto_stop_badge(lv_obj_t* parent, lv_event_cb_t cb) {
+    lv_obj_t* badge = lv_btn_create(parent);
+    lv_obj_set_size(badge, 15, 15);
+    lv_obj_align(badge, LV_ALIGN_TOP_RIGHT, 2, -4);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(badge, RED808_ERROR, 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(badge, 1, 0);
+    lv_obj_set_style_border_color(badge, lv_color_white(), 0);
+    lv_obj_set_style_pad_all(badge, 0, 0);
+    lv_obj_set_style_shadow_width(badge, 5, 0);
+    lv_obj_set_style_shadow_color(badge, RED808_ERROR, 0);
+    lv_obj_set_style_shadow_opa(badge, LV_OPA_60, 0);
+    lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(badge, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* lbl = lv_label_create(badge);
+    lv_label_set_text(lbl, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_center(lbl);
+    return badge;
+}
+
 static void ui_midi_badge_refresh(lv_obj_t* badge) {
     if (!badge) return;
     static uint32_t prevMidiRev = 0;
@@ -5941,11 +5969,14 @@ struct AutoModalConfig {
     uint8_t (*getBars)();
     void (*setBars)(uint8_t);
     void (*applyNow)();
+    bool (*isSmooth)();     // transition style: false = brusca, true = suave
+    void (*setSmooth)(bool);
 };
 
 static lv_obj_t*      s_auto_modal            = NULL;
 static lv_obj_t*      s_auto_modal_bars_btns[4] = {};
 static lv_obj_t*      s_auto_modal_toggle_btn  = NULL;
+static lv_obj_t*      s_auto_modal_smooth_btn  = NULL;
 static AutoModalConfig s_auto_modal_cfg = {};
 static const uint8_t  AUTO_MODAL_BAR_OPTIONS[4] = {1, 2, 4, 8};
 
@@ -5957,6 +5988,14 @@ static void auto_modal_refresh(void) {
         if (!btn) continue;
         const bool sel = AUTO_MODAL_BAR_OPTIONS[i] == bars;
         apply_control_button_style(btn, sel ? RED808_ACCENT : RED808_BORDER, false, 8);
+    }
+    if (s_auto_modal_smooth_btn && s_auto_modal_cfg.isSmooth) {
+        const bool smooth = s_auto_modal_cfg.isSmooth();
+        apply_control_button_style(s_auto_modal_smooth_btn,
+            smooth ? RED808_CYAN : RED808_BORDER, false, 10);
+        lv_obj_t* lbl = lv_obj_get_child(s_auto_modal_smooth_btn, 0);
+        if (lbl) lv_label_set_text(lbl,
+            smooth ? LV_SYMBOL_LOOP "  TRANSICION: SUAVE" : LV_SYMBOL_SHUFFLE "  TRANSICION: BRUSCA");
     }
     if (s_auto_modal_toggle_btn) {
         const bool active = s_auto_modal_cfg.isActive();
@@ -5975,6 +6014,7 @@ static void auto_modal_close_cb(lv_event_t* e = NULL) {
         s_auto_modal = NULL;
         for (int i = 0; i < 4; i++) s_auto_modal_bars_btns[i] = NULL;
         s_auto_modal_toggle_btn = NULL;
+        s_auto_modal_smooth_btn = NULL;
     }
 }
 
@@ -5987,6 +6027,13 @@ static void auto_modal_bars_cb(lv_event_t* e) {
 static void auto_modal_toggle_cb(lv_event_t* e) {
     LV_UNUSED(e);
     s_auto_modal_cfg.setActive(!s_auto_modal_cfg.isActive());
+    auto_modal_refresh();
+}
+
+static void auto_modal_smooth_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_auto_modal_cfg.isSmooth && s_auto_modal_cfg.setSmooth)
+        s_auto_modal_cfg.setSmooth(!s_auto_modal_cfg.isSmooth());
     auto_modal_refresh();
 }
 
@@ -6009,7 +6056,7 @@ static void auto_modal_show(const AutoModalConfig& cfg) {
     lv_obj_add_event_cb(s_auto_modal, auto_modal_close_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(s_auto_modal);
-    lv_obj_set_size(card, 420, 300);
+    lv_obj_set_size(card, 420, 340);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_border_width(card, 2, 0);
@@ -6044,17 +6091,26 @@ static void auto_modal_show(const AutoModalConfig& cfg) {
         lv_obj_center(lbl);
     }
 
+    s_auto_modal_smooth_btn = lv_btn_create(card);
+    lv_obj_set_size(s_auto_modal_smooth_btn, 388, 44);
+    lv_obj_set_pos(s_auto_modal_smooth_btn, 0, 112);
+    lv_obj_add_event_cb(s_auto_modal_smooth_btn, auto_modal_smooth_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* smoothLbl = lv_label_create(s_auto_modal_smooth_btn);
+    lv_obj_set_style_text_font(smoothLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(smoothLbl);
+    if (!cfg.isSmooth) lv_obj_add_flag(s_auto_modal_smooth_btn, LV_OBJ_FLAG_HIDDEN);
+
     s_auto_modal_toggle_btn = lv_btn_create(card);
-    lv_obj_set_size(s_auto_modal_toggle_btn, 388, 52);
-    lv_obj_set_pos(s_auto_modal_toggle_btn, 0, 120);
+    lv_obj_set_size(s_auto_modal_toggle_btn, 388, 48);
+    lv_obj_set_pos(s_auto_modal_toggle_btn, 0, 164);
     lv_obj_add_event_cb(s_auto_modal_toggle_btn, auto_modal_toggle_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* toggleLbl = lv_label_create(s_auto_modal_toggle_btn);
     lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_16, 0);
     lv_obj_center(toggleLbl);
 
     lv_obj_t* applyBtn = lv_btn_create(card);
-    lv_obj_set_size(applyBtn, 388, 44);
-    lv_obj_set_pos(applyBtn, 0, 182);
+    lv_obj_set_size(applyBtn, 388, 40);
+    lv_obj_set_pos(applyBtn, 0, 224);
     apply_control_button_style(applyBtn, RED808_INFO, false, 10);
     lv_obj_add_event_cb(applyBtn, auto_modal_apply_now_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* applyLbl = lv_label_create(applyBtn);
@@ -6063,8 +6119,8 @@ static void auto_modal_show(const AutoModalConfig& cfg) {
     lv_obj_center(applyLbl);
 
     lv_obj_t* closeBtn = lv_btn_create(card);
-    lv_obj_set_size(closeBtn, 388, 40);
-    lv_obj_set_pos(closeBtn, 0, 236);
+    lv_obj_set_size(closeBtn, 388, 36);
+    lv_obj_set_pos(closeBtn, 0, 272);
     apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
     lv_obj_add_event_cb(closeBtn, auto_modal_close_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* closeLbl = lv_label_create(closeBtn);
@@ -6147,6 +6203,13 @@ static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX bu
 static float    s_fx_arc_anim[FX_CARD_COUNT] = {};    // file-scope for snap access
 static uint32_t s_fx_arc_user_ms[FX_CARD_COUNT] = {}; // last user-touch timestamp
 static uint8_t  s_fx_last_active_u7[FX_CARD_COUNT] = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64};
+// True current value of every card, updated on every send (unlike
+// s_fx_last_active_u7 above, which only tracks the last non-neutral value).
+// Used as the ramp start point for the smooth-transition RANDOM mode.
+static uint8_t  s_fx_current_u7[FX_CARD_COUNT]     = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64};
+static bool     s_fx_random_smooth = false;   // false = brusca (snap), true = suave (ramp)
+static bool     fx_random_smooth_get(void) { return s_fx_random_smooth; }
+static void     fx_random_smooth_set(bool v) { s_fx_random_smooth = v; }
 
 static const char* fx_names[FX_CARD_COUNT] = {
     "FLANGE", "DELAY", "REVERB", "FOLD", "CRUSH", "PHASER",
@@ -6279,6 +6342,7 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
     if (u7 != neutral_u7) {
         s_fx_last_active_u7[cell] = (uint8_t)u7;
     }
+    if (cell >= 0 && cell < FX_CARD_COUNT) s_fx_current_u7[cell] = (uint8_t)u7;
 
     switch (cell) {
         case FX_CARD_FLANGE:
@@ -6502,14 +6566,28 @@ static void fx_card_turn_off(int cell) {
     }
 }
 
+static lv_obj_t* s_fx_random_stop_badge = NULL;
+
 // Reflects AUTO FX (control_random_fx_active()) on the RANDOM button:
 // highlighted while AUTO keeps re-randomizing every few bars, plain
 // shuffle icon otherwise. Manual one-shot taps no longer change this —
-// see fx_random_modal_show / the AUTO popup.
+// see fx_random_modal_show / the AUTO popup. The corner badge lets AUTO be
+// killed with one tap, without opening the modal.
 static void fx_random_btn_refresh(void) {
     if (!s_fx_random_btn) return;
+    const bool active = control_random_fx_active();
     apply_control_button_style(s_fx_random_btn,
-        control_random_fx_active() ? RED808_SUCCESS : RED808_ACCENT2, false, 8);
+        active ? RED808_SUCCESS : RED808_ACCENT2, false, 8);
+    if (s_fx_random_stop_badge) {
+        if (active) lv_obj_clear_flag(s_fx_random_stop_badge, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_fx_random_stop_badge, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void fx_random_stop_badge_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    control_random_fx_set_active(false);
+    fx_random_btn_refresh();
 }
 
 static void fx_all_turn_off(void) {
@@ -6539,14 +6617,46 @@ static int fx_random_range(int mn, int mx) {
     return mn + (int)(fx_random_rand_u32() % (uint32_t)(mx - mn + 1));
 }
 
+// Smooth-transition ramp for RANDOM FX ("suave" mode): interpolates the
+// touched cards from their current value to the new random target over
+// ~700ms instead of snapping instantly ("brusca" mode, the default).
+struct FxRampStep { uint8_t cell; uint8_t fromU7; uint8_t toU7; };
+static FxRampStep s_fx_ramp_steps[5];
+static int        s_fx_ramp_count = 0;
+
+static void fx_ramp_anim_cb(void* /*var*/, int32_t v) {
+    for (int i = 0; i < s_fx_ramp_count; i++) {
+        const FxRampStep& st = s_fx_ramp_steps[i];
+        int u7 = st.fromU7 + (int)(((int32_t)(st.toU7 - st.fromU7) * v) / 1000);
+        fx_card_send_value(st.cell, u7);
+    }
+    fx_active_header_refresh();
+}
+
+static void fx_ramp_start(int count) {
+    s_fx_ramp_count = count;
+    if (count <= 0) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_fx_ramp_steps);
+    lv_anim_set_exec_cb(&a, fx_ramp_anim_cb);
+    lv_anim_set_values(&a, 0, 1000);
+    lv_anim_set_time(&a, 700);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
 // Applies one random filter/cutoff/reso/drive/bits/srate pass. Called both
 // by a manual tap on the RANDOM button and by AUTO FX's bar clock
 // (control_random_auto_tick(), control_api.cpp) — one implementation of
 // what "random" means for the FX LAB, regardless of who triggers it.
-void fx_random_apply(void) {
+// showToast is false for AUTO's periodic re-randomization so it does not
+// nag every few bars during a live set; manual taps still confirm.
+void fx_random_apply(bool showToast) {
     // FILTER model: weighted toward musical, commonly-useful types, with a
     // real chance of landing back on OFF so RANDOM does not always engage
-    // a filter.
+    // a filter. The filter type itself is discrete, so it always snaps
+    // immediately even in "suave" mode — only the continuous knobs ramp.
     static const uint8_t filterPool[] = {
         0, 0, 1, 1, 1, 2, 2, 3, 3, 7, 8, 9, 10, 11, 11, 13
     };
@@ -6555,39 +6665,50 @@ void fx_random_apply(void) {
     const int filterU7 = (int)((float)filterType / 14.0f * 127.0f + 0.5f);
     fx_card_send_value(FX_CARD_FILTER, filterU7);
 
+    int cutoffU7, resoU7;
     if (filterType == 0) {
         // No filter this round: keep cutoff/resonance neutral so the mix
         // stays clean rather than leaving a stray sweep engaged.
-        fx_card_send_value(FX_CARD_CUTOFF, 127);
-        fx_card_send_value(FX_CARD_RESO, 0);
+        cutoffU7 = 127;
+        resoU7 = 0;
     } else {
         // Half the time keep the sweep fully open (filter colors the tone
         // without an audible cutoff move); otherwise land somewhere musical.
-        const int cutoffU7 = (fx_random_range(0, 1) == 0)
-            ? 127 : fx_random_range(40, 100);
-        fx_card_send_value(FX_CARD_CUTOFF, cutoffU7);
+        cutoffU7 = (fx_random_range(0, 1) == 0) ? 127 : fx_random_range(40, 100);
         // Resonance is usually gentle; only occasionally spicier.
         const int resoMax = (fx_random_range(0, 3) == 0) ? 110 : 45;
-        fx_card_send_value(FX_CARD_RESO, fx_random_range(0, resoMax));
+        resoU7 = fx_random_range(0, resoMax);
     }
 
     // DRIVE / BITS / SRATE: mostly left bypassed, occasionally a subtle
     // touch — "no siempre", varied, kept professional rather than extreme.
-    fx_card_send_value(FX_CARD_DRIVE,
-        (fx_random_range(0, 4) == 0) ? fx_random_range(15, 55) : 0);
-    fx_card_send_value(FX_CARD_BITS,
-        (fx_random_range(0, 5) == 0) ? fx_random_range(20, 60) : 0);
-    fx_card_send_value(FX_CARD_SRATE,
-        (fx_random_range(0, 5) == 0) ? fx_random_range(15, 50) : 0);
+    const int driveU7 = (fx_random_range(0, 4) == 0) ? fx_random_range(15, 55) : 0;
+    const int bitsU7  = (fx_random_range(0, 5) == 0) ? fx_random_range(20, 60) : 0;
+    const int srateU7 = (fx_random_range(0, 5) == 0) ? fx_random_range(15, 50) : 0;
+
+    if (s_fx_random_smooth) {
+        s_fx_ramp_steps[0] = {FX_CARD_CUTOFF, s_fx_current_u7[FX_CARD_CUTOFF], (uint8_t)cutoffU7};
+        s_fx_ramp_steps[1] = {FX_CARD_RESO,   s_fx_current_u7[FX_CARD_RESO],   (uint8_t)resoU7};
+        s_fx_ramp_steps[2] = {FX_CARD_DRIVE,  s_fx_current_u7[FX_CARD_DRIVE],  (uint8_t)driveU7};
+        s_fx_ramp_steps[3] = {FX_CARD_BITS,   s_fx_current_u7[FX_CARD_BITS],   (uint8_t)bitsU7};
+        s_fx_ramp_steps[4] = {FX_CARD_SRATE,  s_fx_current_u7[FX_CARD_SRATE],  (uint8_t)srateU7};
+        fx_ramp_start(5);
+    } else {
+        fx_card_send_value(FX_CARD_CUTOFF, cutoffU7);
+        fx_card_send_value(FX_CARD_RESO, resoU7);
+        fx_card_send_value(FX_CARD_DRIVE, driveU7);
+        fx_card_send_value(FX_CARD_BITS, bitsU7);
+        fx_card_send_value(FX_CARD_SRATE, srateU7);
+    }
 
     fx_active_header_refresh();
-    ui_show_toast(filterType == 0 ? "RANDOM: FILTRO OFF" : "RANDOM: FILTRO APLICADO",
-                  RED808_CYAN);
+    if (showToast)
+        ui_show_toast(filterType == 0 ? "RANDOM: FILTRO OFF" : "RANDOM: FILTRO APLICADO",
+                      RED808_CYAN);
 }
 
-static void fx_random_cb(lv_event_t* e) {
-    LV_UNUSED(e);
-    fx_random_apply();
+static void fx_random_apply_now(void) {
+    fx_random_apply(true);
 }
 
 // Tapping the RANDOM button opens the AUTO FX popup (cadence + on/off +
@@ -6597,7 +6718,8 @@ static void fx_random_modal_show(lv_event_t* e) {
     LV_UNUSED(e);
     static const AutoModalConfig cfg = {
         "AUTO FX", control_random_fx_active, control_random_fx_set_active,
-        control_random_fx_bars, control_random_fx_set_bars, fx_random_apply
+        control_random_fx_bars, control_random_fx_set_bars, fx_random_apply_now,
+        fx_random_smooth_get, fx_random_smooth_set
     };
     auto_modal_show(cfg);
 }
@@ -6868,6 +6990,7 @@ static void create_fx_screen(void) {
     lv_label_set_text(randomLabel, LV_SYMBOL_SHUFFLE);
     lv_obj_set_style_text_font(randomLabel, &lv_font_montserrat_16, 0);
     lv_obj_center(randomLabel);
+    s_fx_random_stop_badge = ui_create_auto_stop_badge(s_fx_random_btn, fx_random_stop_badge_cb);
     fx_random_btn_refresh();
 
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
@@ -7949,15 +8072,28 @@ static const char* seq_random_style_name(int8_t style) {
     return nullptr;
 }
 
+static lv_obj_t* seq_song_stop_badge = NULL;
+
 // Reflects RANDOM SONG (control_random_song_active()) on the VAR button
 // itself: a shuffle icon and accent color while the mode keeps jumping
-// between saved patterns every few bars, plain "VAR" otherwise.
+// between saved patterns every few bars, plain "VAR" otherwise. The corner
+// badge lets RANDOM SONG be killed with one tap, without opening VAR's modal.
 static void seq_var_btn_refresh(void) {
     if (!seq_hdr_var_btn) return;
     const bool active = control_random_song_active();
     apply_control_button_style(seq_hdr_var_btn, active ? RED808_ACCENT2 : RED808_CYAN, false, 7);
     lv_obj_t* lbl = lv_obj_get_child(seq_hdr_var_btn, 0);
     if (lbl) lv_label_set_text(lbl, active ? LV_SYMBOL_SHUFFLE " VAR" : "VAR");
+    if (seq_song_stop_badge) {
+        if (active) lv_obj_clear_flag(seq_song_stop_badge, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(seq_song_stop_badge, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void seq_song_stop_badge_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    control_random_song_set_active(false);
+    seq_var_btn_refresh();
 }
 
 static void seq_variation_modal_hide(lv_event_t* e = NULL) {
@@ -8652,6 +8788,7 @@ static void create_sequencer_screen(void) {
         }
         seq_hdr_var_btn = makeHeaderButton(64, "VAR", RED808_CYAN,
                                            seq_variation_modal_show);
+        seq_song_stop_badge = ui_create_auto_stop_badge(seq_hdr_var_btn, seq_song_stop_badge_cb);
         seq_var_btn_refresh();
 
         makeHeaderButton(68, "GROUPS", RED808_BORDER, seq_groups_modal_show);
@@ -9247,6 +9384,7 @@ static lv_obj_t* mix_master_lbl = NULL;
 static lv_obj_t* mix_seq_lbl = NULL;
 static lv_obj_t* mix_live_lbl = NULL;
 static lv_obj_t* mix_bpm_lbl = NULL;
+static lv_obj_t* mix_pattern_lbl = NULL;   // active pattern number, shown in the header
 
 static void mix_global_slider_cb(lv_event_t* e) {
     int which = (int)(intptr_t)lv_event_get_user_data(e);
@@ -9559,11 +9697,51 @@ static const MixStyleProfile MIX_STYLE_PROFILES[6] = {
 
 static lv_obj_t* s_mix_random_btn = NULL;
 static uint8_t   s_mix_last_style = 0xFF;   // 0xFF = none applied yet this session
+static bool      s_mix_random_smooth = false; // false = brusca (snap), true = suave (ramp)
+static bool      mix_random_smooth_get(void) { return s_mix_random_smooth; }
+static void      mix_random_smooth_set(bool v) { s_mix_random_smooth = v; }
+
+// Smooth-transition ramp for RANDOM MIX ("suave" mode): interpolates every
+// fader from its current volume to the new random target over ~700ms
+// instead of snapping instantly ("brusca" mode, the default).
+struct MixRampStep { uint8_t track; uint8_t fromVol; uint8_t toVol; };
+static MixRampStep s_mix_ramp_steps[16];
+static int         s_mix_ramp_count = 0;
+
+static void mix_ramp_anim_cb(void* /*var*/, int32_t v) {
+    for (int i = 0; i < s_mix_ramp_count; i++) {
+        const MixRampStep& st = s_mix_ramp_steps[i];
+        int vol = st.fromVol + (int)(((int32_t)(st.toVol - st.fromVol) * v) / 1000);
+        control_send_set_track_volume(st.track, vol);
+        local_apply_message(MSG_TRACK, TRK_VOLUME | (st.track & 0x0F), (uint8_t)vol);
+        if (vol_sliders[st.track]) lv_slider_set_value(vol_sliders[st.track], vol, LV_ANIM_OFF);
+    }
+}
+
+static void mix_ramp_start(int count) {
+    s_mix_ramp_count = count;
+    if (count <= 0) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_mix_ramp_steps);
+    lv_anim_set_exec_cb(&a, mix_ramp_anim_cb);
+    lv_anim_set_values(&a, 0, 1000);
+    lv_anim_set_time(&a, 700);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static lv_obj_t* s_mix_random_stop_badge = NULL;
 
 static void mix_random_btn_refresh(void) {
     if (!s_mix_random_btn) return;
+    const bool active = control_random_mix_active();
     apply_control_button_style(s_mix_random_btn,
-        control_random_mix_active() ? RED808_SUCCESS : RED808_INFO, false, 10);
+        active ? RED808_SUCCESS : RED808_INFO, false, 10);
+    if (s_mix_random_stop_badge) {
+        if (active) lv_obj_clear_flag(s_mix_random_stop_badge, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_mix_random_stop_badge, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_t* lbl = lv_obj_get_child(s_mix_random_btn, 0);
     if (!lbl) return;
     if (s_mix_last_style < 6)
@@ -9572,10 +9750,16 @@ static void mix_random_btn_refresh(void) {
         lv_label_set_text(lbl, LV_SYMBOL_SHUFFLE "  RANDOM MIX");
 }
 
+static void mix_random_stop_badge_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    control_random_mix_set_active(false);
+    mix_random_btn_refresh();
+}
+
 // Applies one random per-style volume rebalance across all 16 faders.
 // Called both by a manual tap and by AUTO MIX's bar clock
 // (control_random_auto_tick(), control_api.cpp).
-void mix_random_apply(void) {
+void mix_random_apply(bool showToast) {
     if (!control_available() && !control_engine_connected()) {
         ui_show_toast("Master no conectado", RED808_WARNING);
         return;
@@ -9593,23 +9777,33 @@ void mix_random_apply(void) {
 
     const int styleIdx = randRange(0, 5);
     const MixStyleProfile& style = MIX_STYLE_PROFILES[styleIdx];
-    for (int t = 0; t < 16; t++) {
-        int vol = randRange(style.volMin[t], style.volMax[t]);
-        control_send_set_track_volume(t, vol);
-        local_apply_message(MSG_TRACK, TRK_VOLUME | (t & 0x0F), (uint8_t)p4.track_volume[t]);
-        if (vol_sliders[t]) lv_slider_set_value(vol_sliders[t], p4.track_volume[t], LV_ANIM_OFF);
+
+    if (s_mix_random_smooth) {
+        for (int t = 0; t < 16; t++) {
+            int vol = randRange(style.volMin[t], style.volMax[t]);
+            s_mix_ramp_steps[t] = {(uint8_t)t, (uint8_t)p4.track_volume[t], (uint8_t)vol};
+        }
+        mix_ramp_start(16);
+    } else {
+        for (int t = 0; t < 16; t++) {
+            int vol = randRange(style.volMin[t], style.volMax[t]);
+            control_send_set_track_volume(t, vol);
+            local_apply_message(MSG_TRACK, TRK_VOLUME | (t & 0x0F), (uint8_t)p4.track_volume[t]);
+            if (vol_sliders[t]) lv_slider_set_value(vol_sliders[t], p4.track_volume[t], LV_ANIM_OFF);
+        }
     }
 
     s_mix_last_style = (uint8_t)styleIdx;
     mix_random_btn_refresh();
-    char msg[48];
-    snprintf(msg, sizeof(msg), "RANDOM MIX: %s", style.name);
-    ui_show_toast(msg, RED808_INFO);
+    if (showToast) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "RANDOM MIX: %s", style.name);
+        ui_show_toast(msg, RED808_INFO);
+    }
 }
 
-static void mix_random_style_cb(lv_event_t* e) {
-    LV_UNUSED(e);
-    mix_random_apply();
+static void mix_random_apply_now(void) {
+    mix_random_apply(true);
 }
 
 // Tapping RANDOM MIX opens the AUTO MIX popup (cadence + on/off + "apply
@@ -9618,7 +9812,8 @@ static void mix_random_modal_show(lv_event_t* e) {
     LV_UNUSED(e);
     static const AutoModalConfig cfg = {
         "AUTO MIX", control_random_mix_active, control_random_mix_set_active,
-        control_random_mix_bars, control_random_mix_set_bars, mix_random_apply
+        control_random_mix_bars, control_random_mix_set_bars, mix_random_apply_now,
+        mix_random_smooth_get, mix_random_smooth_set
     };
     auto_modal_show(cfg);
 }
@@ -9638,6 +9833,14 @@ static void create_volumes_screen(void) {
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(title, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(title, 60, 10);
+
+    // Active pattern number — so it's clear which pattern the mixer is
+    // shaping without having to switch to the sequencer to check.
+    mix_pattern_lbl = lv_label_create(scr_volumes);
+    lv_label_set_text_fmt(mix_pattern_lbl, "P%02d", p4.current_pattern + 1);
+    lv_obj_set_style_text_font(mix_pattern_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(mix_pattern_lbl, RED808_ACCENT, 0);
+    lv_obj_set_pos(mix_pattern_lbl, LCD_H_RES - 120, 10);
 
     // Global controls row: MAIN gain + BPM, restructured (narrower) to make
     // room for RANDOM MIX alongside them instead of hiding it in a submenu.
@@ -9704,6 +9907,7 @@ static void create_volumes_screen(void) {
         lv_obj_t* random_lbl = lv_label_create(s_mix_random_btn);
         lv_obj_set_style_text_font(random_lbl, &lv_font_montserrat_14, 0);
         lv_obj_center(random_lbl);
+        s_mix_random_stop_badge = ui_create_auto_stop_badge(s_mix_random_btn, mix_random_stop_badge_cb);
         mix_random_btn_refresh();
     }
 
@@ -9850,6 +10054,7 @@ static void update_volumes_screen(void) {
     static bool prev_init = false;
     static int prev_master = -1;
     static int prev_bpm = -1;
+    static int prev_pattern = -1;
     static uint32_t vol_gen = 0;
     if (vol_gen != s_ui_refresh_gen) {
         // Theme reload recreated the strips; redo the first full repaint.
@@ -9857,6 +10062,7 @@ static void update_volumes_screen(void) {
         prev_init = false;
         prev_master = -1;
         prev_bpm = -1;
+        prev_pattern = -1;
         for (int i = 0; i < 16; i++) {
             prev_volume[i] = -1;
         }
@@ -9871,6 +10077,10 @@ static void update_volumes_screen(void) {
         prev_bpm = p4.bpm_int;
         lv_slider_set_value(mix_bpm_slider, p4.bpm_int, LV_ANIM_OFF);
         if (mix_bpm_lbl) lv_label_set_text_fmt(mix_bpm_lbl, "%d", p4.bpm_int);
+    }
+    if (mix_pattern_lbl && p4.current_pattern != prev_pattern) {
+        prev_pattern = p4.current_pattern;
+        lv_label_set_text_fmt(mix_pattern_lbl, "P%02d", p4.current_pattern + 1);
     }
 
     for (int i = 0; i < 16; i++) {
@@ -14785,6 +14995,7 @@ static void ui_reload_themed_screens(void) {
     fx_active_lbl = NULL;
     fx_all_off_btn = NULL;
     s_fx_random_btn = NULL;
+    s_fx_random_stop_badge = NULL;
     fx_page = 0;
     fx_view_mode = 0;
     for (int i = 0; i < 16; i++) {
@@ -14816,6 +15027,7 @@ static void ui_reload_themed_screens(void) {
     seq_hdr_queue_btn = NULL;
     seq_hdr_queue_lbl = NULL;
     seq_hdr_var_btn = NULL;
+    seq_song_stop_badge = NULL;
     seq_variation_modal = NULL;
     seq_hdr_save_btn = NULL;
     seq_hdr_save_lbl = NULL;
@@ -14841,7 +15053,9 @@ static void ui_reload_themed_screens(void) {
     mix_live_slider = NULL; mix_bpm_slider = NULL;
     mix_master_lbl = NULL; mix_seq_lbl = NULL;
     mix_live_lbl = NULL; mix_bpm_lbl = NULL;
+    mix_pattern_lbl = NULL;
     s_mix_random_btn = NULL;
+    s_mix_random_stop_badge = NULL;
 
     // Clear SD screen widgets
     sd_left_panel = NULL; sd_right_panel = NULL; sd_status_lbl = NULL;
