@@ -8505,32 +8505,56 @@ static void seq_step_cb(lv_event_t* e) {
     }
 }
 
-// ── STEP PROBABILITY popup (EVOLVE groundwork) ──────────────────────────
-// Long-press a step cell to tune how often it actually fires — the engine
-// already rolls this dice sample-accurately on DaisyPod3 at trigger time
-// (used for years to author the factory patterns); this is the first UI
-// that lets the user reach it on their own patterns.
+// ── STEP PROBABILITY + PARAMETER LOCK popup (EVOLVE groundwork) ─────────
+// Long-press a step cell to tune how often it fires and whether it carries
+// a one-hit flourish. Both already exist end-to-end in the engine — the
+// probability dice roll and the three param locks (cutoff/reverb/volume)
+// are applied sample-accurately at trigger time on DaisyPod3
+// (DsqFireStep/DsqTriggerTrackNow), the same mechanism used for years to
+// author the factory patterns. This popup is the first UI that lets the
+// user reach any of it on their own patterns.
+//
+// Locks use one fixed "flourish" value each rather than a free value
+// picker (cutoff opens bright, reverb tails long, volume accents hard) —
+// enough expressive range for now without a second layer of sliders
+// crammed into an already-small popup; a finer editor can follow later
+// if it turns out to be wanted.
 static lv_obj_t* seq_step_prob_modal = NULL;
 static lv_obj_t* seq_step_prob_title = NULL;
 static lv_obj_t* seq_step_prob_btns[5] = {};
+static lv_obj_t* seq_step_lock_btns[3] = {};  // 0=cutoff, 1=reverb, 2=volume
 static int8_t    seq_step_prob_track = -1;
 static int8_t    seq_step_prob_step = -1;
-static const uint8_t SEQ_STEP_PROB_OPTIONS[5] = {100, 75, 50, 25, 10};
+static const uint8_t  SEQ_STEP_PROB_OPTIONS[5] = {100, 75, 50, 25, 10};
+static const char* const SEQ_STEP_LOCK_NAMES[3] = {"CUTOFF", "REVERB", "VOLUMEN"};
+static const int SEQ_STEP_LOCK_CUTOFF_HZ = 6000;
+static const int SEQ_STEP_LOCK_REVERB_PCT = 80;
+static const int SEQ_STEP_LOCK_VOLUME = 127;
+
+// True if the step carries any customization — probability<100 or a lock —
+// so the grid's single corner dot can flag "long-press to see what's set
+// here" without needing one indicator per customization type.
+static bool seq_step_is_customized(int track, int step) {
+    if (control_get_step_probability(track, step) < 100) return true;
+    StepParamLock lock;
+    control_get_step_param_lock(track, step, lock);
+    return lock.cutoffEnabled || lock.reverbEnabled || lock.volumeEnabled;
+}
 
 static void seq_step_prob_dot_refresh(int track, int step) {
     if (track < 0 || track >= 16 || step < 0 || step >= 16) return;
     lv_obj_t* dot = seq_step_prob_dot[track][step];
     if (!dot) return;
-    if (control_get_step_probability(track, step) >= 100)
-        lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
-    else
+    if (seq_step_is_customized(track, step))
         lv_obj_clear_flag(dot, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void seq_step_prob_modal_refresh(void) {
     if (!seq_step_prob_modal || seq_step_prob_track < 0) return;
     if (seq_step_prob_title)
-        lv_label_set_text_fmt(seq_step_prob_title, "%s - STEP %02d - PROBABILIDAD",
+        lv_label_set_text_fmt(seq_step_prob_title, "%s - STEP %02d",
                               trackNames[seq_step_prob_track], seq_step_prob_step + 1);
     const uint8_t current = control_get_step_probability(seq_step_prob_track, seq_step_prob_step);
     for (int i = 0; i < 5; i++) {
@@ -8538,6 +8562,17 @@ static void seq_step_prob_modal_refresh(void) {
         if (!btn) continue;
         const bool sel = SEQ_STEP_PROB_OPTIONS[i] == current;
         apply_control_button_style(btn, sel ? RED808_WARNING : RED808_BORDER, false, 8);
+    }
+    StepParamLock lock;
+    control_get_step_param_lock(seq_step_prob_track, seq_step_prob_step, lock);
+    const bool enabled[3] = {lock.cutoffEnabled, lock.reverbEnabled, lock.volumeEnabled};
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t* btn = seq_step_lock_btns[i];
+        if (!btn) continue;
+        apply_control_button_style(btn, enabled[i] ? RED808_CYAN : RED808_BORDER, false, 8);
+        lv_obj_t* lbl = lv_obj_get_child(btn, 0);
+        if (lbl) lv_label_set_text_fmt(lbl, "%s: %s", SEQ_STEP_LOCK_NAMES[i],
+                                       enabled[i] ? "ON" : "OFF");
     }
 }
 
@@ -8547,6 +8582,7 @@ static void seq_step_prob_modal_hide(lv_event_t* e = NULL) {
     seq_step_prob_modal = NULL;
     seq_step_prob_title = NULL;
     for (int i = 0; i < 5; i++) seq_step_prob_btns[i] = NULL;
+    for (int i = 0; i < 3; i++) seq_step_lock_btns[i] = NULL;
     seq_step_prob_track = -1;
     seq_step_prob_step = -1;
 }
@@ -8555,6 +8591,30 @@ static void seq_step_prob_btn_cb(lv_event_t* e) {
     if (seq_step_prob_track < 0 || seq_step_prob_step < 0) return;
     const int probability = (int)(intptr_t)lv_event_get_user_data(e);
     control_send_set_step_probability(seq_step_prob_track, seq_step_prob_step, probability);
+    seq_step_prob_dot_refresh(seq_step_prob_track, seq_step_prob_step);
+    seq_step_prob_modal_refresh();
+}
+
+static void seq_step_lock_btn_cb(lv_event_t* e) {
+    if (seq_step_prob_track < 0 || seq_step_prob_step < 0) return;
+    const int which = (int)(intptr_t)lv_event_get_user_data(e);
+    StepParamLock lock;
+    control_get_step_param_lock(seq_step_prob_track, seq_step_prob_step, lock);
+    switch (which) {
+        case 0:
+            control_send_set_step_cutoff_lock(seq_step_prob_track, seq_step_prob_step,
+                !lock.cutoffEnabled, SEQ_STEP_LOCK_CUTOFF_HZ);
+            break;
+        case 1:
+            control_send_set_step_reverb_lock(seq_step_prob_track, seq_step_prob_step,
+                !lock.reverbEnabled, SEQ_STEP_LOCK_REVERB_PCT);
+            break;
+        case 2:
+            control_send_set_step_volume_lock(seq_step_prob_track, seq_step_prob_step,
+                !lock.volumeEnabled, SEQ_STEP_LOCK_VOLUME);
+            break;
+        default: return;
+    }
     seq_step_prob_dot_refresh(seq_step_prob_track, seq_step_prob_step);
     seq_step_prob_modal_refresh();
 }
@@ -8578,7 +8638,7 @@ static void seq_step_long_press_cb(lv_event_t* e) {
     lv_obj_add_event_cb(seq_step_prob_modal, seq_step_prob_modal_hide, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(seq_step_prob_modal);
-    lv_obj_set_size(card, 420, 220);
+    lv_obj_set_size(card, 420, 352);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_border_width(card, 2, 0);
@@ -8593,10 +8653,16 @@ static void seq_step_long_press_cb(lv_event_t* e) {
     lv_obj_set_style_text_color(seq_step_prob_title, RED808_WARNING, 0);
     lv_obj_set_pos(seq_step_prob_title, 0, 0);
 
+    lv_obj_t* probLbl = lv_label_create(card);
+    lv_label_set_text(probLbl, "PROBABILIDAD:");
+    lv_obj_set_style_text_font(probLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(probLbl, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(probLbl, 0, 26);
+
     for (int i = 0; i < 5; i++) {
         lv_obj_t* btn = lv_btn_create(card);
         seq_step_prob_btns[i] = btn;
-        lv_obj_set_size(btn, 70, 52);
+        lv_obj_set_size(btn, 70, 48);
         lv_obj_set_pos(btn, i * (70 + 8), 44);
         lv_obj_add_event_cb(btn, seq_step_prob_btn_cb, LV_EVENT_CLICKED,
                             (void*)(intptr_t)SEQ_STEP_PROB_OPTIONS[i]);
@@ -8606,9 +8672,26 @@ static void seq_step_long_press_cb(lv_event_t* e) {
         lv_obj_center(lbl);
     }
 
+    lv_obj_t* lockLbl = lv_label_create(card);
+    lv_label_set_text(lockLbl, "PARAMETER LOCK (flourish al disparar este step):");
+    lv_obj_set_style_text_font(lockLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lockLbl, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(lockLbl, 0, 104);
+
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t* btn = lv_btn_create(card);
+        seq_step_lock_btns[i] = btn;
+        lv_obj_set_size(btn, 388, 40);
+        lv_obj_set_pos(btn, 0, 122 + i * (40 + 8));
+        lv_obj_add_event_cb(btn, seq_step_lock_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_center(lbl);
+    }
+
     lv_obj_t* closeBtn = lv_btn_create(card);
     lv_obj_set_size(closeBtn, 388, 40);
-    lv_obj_set_pos(closeBtn, 0, 108);
+    lv_obj_set_pos(closeBtn, 0, 122 + 3 * (40 + 8) + 4);
     apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
     lv_obj_add_event_cb(closeBtn, seq_step_prob_modal_hide, LV_EVENT_CLICKED, NULL);
     lv_obj_t* closeLbl = lv_label_create(closeBtn);
@@ -9077,11 +9160,12 @@ static void create_sequencer_screen(void) {
                 if (!act) lv_obj_add_flag(accent, LV_OBJ_FLAG_HIDDEN);
             }
 
-            // EVOLVE groundwork: small corner dot flags a step whose
-            // probability was tuned below 100% (long-press to edit).
-            // Refreshed here at construction and again whenever a pattern
-            // becomes authoritative (ui_sequencer_sync_from_current_pattern) —
-            // never polled per-frame, since it needs a Sequencer getter call.
+            // EVOLVE groundwork: small corner dot flags a step with a
+            // custom probability and/or an active parameter lock
+            // (long-press to edit/inspect). Refreshed here at construction
+            // and again whenever a pattern becomes authoritative
+            // (ui_sequencer_sync_from_current_pattern) — never polled
+            // per-frame, since it needs Sequencer getter calls.
             {
                 lv_obj_t* dot = lv_obj_create(seq_step_btns[t][s]);
                 seq_step_prob_dot[t][s] = dot;
@@ -9093,7 +9177,7 @@ static void create_sequencer_screen(void) {
                 lv_obj_set_style_border_width(dot, 0, 0);
                 lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
                 lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
-                if (control_get_step_probability(t, s) >= 100)
+                if (!seq_step_is_customized(t, s))
                     lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
             }
 
@@ -15160,6 +15244,7 @@ static void ui_reload_themed_screens(void) {
     seq_step_prob_modal = NULL;
     seq_step_prob_title = NULL;
     for (int i = 0; i < 5; i++) seq_step_prob_btns[i] = NULL;
+    for (int i = 0; i < 3; i++) seq_step_lock_btns[i] = NULL;
     seq_step_prob_track = -1;
     seq_step_prob_step = -1;
     s_seq_midi_badge = NULL;

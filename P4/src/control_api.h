@@ -111,6 +111,23 @@ void control_send_set_step_velocity(int track, int step, int velocity);
 // live single-step setter/getter pair so the UI can finally reach it.
 void control_send_set_step_probability(int track, int step, int probability);
 uint8_t control_get_step_probability(int track, int step);
+
+// PARAMETER LOCK groundwork — same story as probability: setStepCutoffLock/
+// setStepVolumeLock/setStepReverbSendLock and CMD_DSQ_SET_PARAM_LOCK (0xD8)
+// already exist and are already honored at trigger time on DaisyPod3
+// (DsqTriggerTrackNow); only the live single-step setter/getter was missing.
+struct StepParamLock {
+    bool     cutoffEnabled;
+    uint16_t cutoffHz;
+    bool     reverbEnabled;
+    uint8_t  reverbSend;   // 0-100
+    bool     volumeEnabled;
+    uint8_t  volume;       // 0-127
+};
+void control_get_step_param_lock(int track, int step, StepParamLock& out);
+void control_send_set_step_cutoff_lock(int track, int step, bool enabled, int cutoffHz);
+void control_send_set_step_reverb_lock(int track, int step, bool enabled, int sendPercent);
+void control_send_set_step_volume_lock(int track, int step, bool enabled, int volume);
 void control_send_mute(int track, bool muted);
 void control_send_set_volume(int value);
 void control_send_set_seq_volume(int value);

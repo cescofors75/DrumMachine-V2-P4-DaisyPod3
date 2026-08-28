@@ -1699,6 +1699,73 @@ uint8_t control_get_step_probability(int track, int step)
     return SequencerInstance().getStepProbability(p4.current_pattern, track, step);
 }
 
+void control_get_step_param_lock(int track, int step, StepParamLock& out)
+{
+    out = StepParamLock{false, 1000, false, 30, false, 100};
+    if(track < 0 || track >= 16 || step < 0 || step >= 16) return;
+    Sequencer& sequencer = SequencerInstance();
+    out.cutoffEnabled = sequencer.hasStepCutoffLock(p4.current_pattern, track, step);
+    uint16_t cutoffHz = sequencer.getStepCutoffLock(p4.current_pattern, track, step);
+    if(cutoffHz > 0) out.cutoffHz = cutoffHz;
+    out.reverbEnabled = sequencer.hasStepReverbSendLock(p4.current_pattern, track, step);
+    out.reverbSend = sequencer.getStepReverbSendLock(p4.current_pattern, track, step);
+    out.volumeEnabled = sequencer.hasStepVolumeLock(p4.current_pattern, track, step);
+    uint8_t volume = sequencer.getStepVolumeLock(p4.current_pattern, track, step);
+    if(volume > 0) out.volume = volume;
+}
+
+// Sends the full CMD_DSQ_SET_PARAM_LOCK payload — the wire command always
+// carries all three locks together, so every setter below re-reads the
+// other two from the Sequencer first to avoid clobbering them.
+static void SendStepParamLock(int track, int step, const StepParamLock& lock)
+{
+    DsqSetParamLockPayload payload = {};
+    payload.pattern = (uint8_t)Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+    payload.track = (uint8_t)track;
+    payload.step = (uint8_t)step;
+    payload.cutoffEn = lock.cutoffEnabled ? 1u : 0u;
+    payload.cutoffHi = (uint8_t)(lock.cutoffHz >> 8);
+    payload.cutoffLo = (uint8_t)(lock.cutoffHz & 0xFFu);
+    payload.reverbEn = lock.reverbEnabled ? 1u : 0u;
+    payload.reverbSend = lock.reverbSend;
+    payload.volEn = lock.volumeEnabled ? 1u : 0u;
+    payload.volume = lock.volume;
+    daisyUsb.send(CMD_DSQ_SET_PARAM_LOCK, &payload, sizeof(payload));
+}
+
+void control_send_set_step_cutoff_lock(int track, int step, bool enabled, int cutoffHz)
+{
+    if(track < 0 || track >= 16 || step < 0 || step >= 16) return;
+    cutoffHz = Clamp(cutoffHz, 20, 20000);
+    SequencerInstance().setStepCutoffLock(p4.current_pattern, track, step,
+                                          enabled, (uint16_t)cutoffHz);
+    StepParamLock lock;
+    control_get_step_param_lock(track, step, lock);
+    SendStepParamLock(track, step, lock);
+}
+
+void control_send_set_step_reverb_lock(int track, int step, bool enabled, int sendPercent)
+{
+    if(track < 0 || track >= 16 || step < 0 || step >= 16) return;
+    sendPercent = Clamp(sendPercent, 0, 100);
+    SequencerInstance().setStepReverbSendLock(p4.current_pattern, track, step,
+                                              enabled, (uint8_t)sendPercent);
+    StepParamLock lock;
+    control_get_step_param_lock(track, step, lock);
+    SendStepParamLock(track, step, lock);
+}
+
+void control_send_set_step_volume_lock(int track, int step, bool enabled, int volume)
+{
+    if(track < 0 || track >= 16 || step < 0 || step >= 16) return;
+    volume = Clamp(volume, 0, 127);
+    SequencerInstance().setStepVolumeLock(p4.current_pattern, track, step,
+                                          enabled, (uint8_t)volume);
+    StepParamLock lock;
+    control_get_step_param_lock(track, step, lock);
+    SendStepParamLock(track, step, lock);
+}
+
 void control_send_mute(int track, bool muted)
 {
     if(track < 0 || track >= 16) return;
