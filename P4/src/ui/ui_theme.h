@@ -12,6 +12,10 @@ enum VisualTheme : uint8_t {
     THEME_SUNSET,
     THEME_RAINBOW,
     THEME_GREYSCALE,
+    THEME_MPD218,   // appended at the end, not inserted — keeps every
+                    // earlier enum value's numeric index stable, so a
+                    // theme index already saved in NVS (settings_store)
+                    // keeps pointing at the same theme after this update.
     THEME_COUNT
 };
 

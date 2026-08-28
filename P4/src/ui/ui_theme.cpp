@@ -58,6 +58,23 @@ const ThemeColors theme_presets[THEME_COUNT] = {
       .track_colors={0xFFFFFF,0xEEEEEE,0xDDDDDD,0xCCCCCC,0xBBBBBB,0xAAAAAA,0x999999,0x888888,
                      0x777777,0x666666,0x555555,0x444444,0x333333,0x222222,0xF0F0F0,0xD0D0D0},
       .name="GREYSCALE" },
+    // THEME_MPD218 — matte black chassis, AKAI-red pad borders, white
+    // labels: the AKAI MPD218 controller's own look. Deliberately just
+    // black/red/white/grey (no orange or gold, unlike THEME_RED808) so it
+    // reads as a distinct hardware skin rather than a RED808 variant.
+    // success/error/warning lean on brightness (white=good, dark red=bad)
+    // instead of hue, the same trick THEME_GREYSCALE uses, since red is
+    // the only hue in the palette and can't do double duty as both the
+    // brand accent and an error color without losing the distinction.
+    { .bg=0x0A0A0A, .panel=0x141414, .surface=0x1E1A1A, .border=0x3D1418,
+      .text=0xFFFFFF, .text_dim=0x9A9A9A,
+      .accent=0xE2222C, .accent2=0xFF4D4D,
+      .success=0xFFFFFF, .warning=0xFF8A3D, .error=0xB0121C, .info=0xE6E6E6, .cyan=0xFFFFFF,
+      .track_colors={0x8C0F16,0xA31620,0xBB1E29,0xD22532,
+                     0xE2222C,0xEB3B44,0xF25560,0xFA6E77,
+                     0xFF8A90,0xFFA8AC,0xFFC6C8,0xFFE0E1,
+                     0xFFFFFF,0xF0F0F0,0xD8D8D8,0xC0C0C0},
+      .name="MPD218" },
 };
 
 uint8_t ui_theme_index() {
