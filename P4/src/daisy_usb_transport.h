@@ -83,6 +83,16 @@ class DaisyUsbTransport
     void setTrackSoloMask(uint16_t mask);
     void setTrackVolume(uint8_t track, uint8_t volume);
     void setTrackEngine(uint8_t track, int8_t engine);
+
+    // Per-instrument FX (dormant chain on DaisyPod3, CMD_TRACK_* 0x50-0x5A).
+    void setTrackFilter(uint8_t track, uint8_t filterType, float cutoffHz,
+                        float resonance);
+    void clearTrackFilter(uint8_t track);
+    void setTrackDistortion(uint8_t track, float amount01);
+    void setTrackBitcrush(uint8_t track, uint8_t bits);
+    void setTrackReverbSend(uint8_t track, uint8_t percent);
+    void setTrackDelaySend(uint8_t track, uint8_t percent);
+    void clearTrackFx(uint8_t track);
     void synthTrigger(uint8_t engine, uint8_t instrument, uint8_t velocity);
     void synthNoteOn(uint8_t engine, uint8_t note, uint8_t velocity,
                      bool accent, bool slide);

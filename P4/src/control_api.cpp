@@ -1056,6 +1056,222 @@ bool control_apply_sequencer_variation(uint8_t variation)
     return changed;
 }
 
+// ── PLAY RANDOM: fresh pattern generator (Euclidean rhythms, per style) ────
+namespace
+{
+// Track roles: 0 BD 1 SD 2 CH 3 OH 4 CY 5 CP 6 RS 7 CB 8 LT 9 MT 10 HT
+//              11 MA 12 CL 13 HC 14 MC 15 LC  (see trackNames in ui_screens.cpp)
+struct RandomTrackSpec
+{
+    uint8_t track;
+    uint8_t hitsMin, hitsMax;   // Euclidean pulse count, randomized per generation
+    uint8_t velBase, velVar;    // velocity = velBase +/- velVar
+    uint8_t probMin, probMax;   // per-step trigger probability range
+    uint8_t ratchetPct;         // chance (0-100) a hit gets a 2-4x ratchet
+    bool    anchored;           // true: rotation fixed at 0 (kick/snare backbone)
+};
+
+const RandomTrackSpec RND_TECHNO[] = {
+    {0, 4, 4,  120, 4,  100, 100, 0,  true},
+    {2, 10, 13, 78, 18, 80, 95,  10, false},
+    {3, 2, 4,   92, 10, 75, 90,  0,  false},
+    {5, 2, 2,  104, 6,  90, 100, 0,  false},
+    {6, 2, 4,   58, 14, 40, 65,  20, false},
+};
+const RandomTrackSpec RND_HOUSE[] = {
+    {0, 4, 4,  122, 4,  100, 100, 0, true},
+    {2, 7, 9,   72, 16, 75, 90,  0, false},
+    {3, 3, 5,   96, 8,  80, 95,  0, false},
+    {5, 2, 2,  108, 6,  95, 100, 0, false},
+    {7, 1, 3,   50, 10, 30, 50,  0, false},
+};
+// Hit-count centers deliberately kept close to 2,2,3,2,5,5 across BD/SD/CH/OH/CP/RS.
+const RandomTrackSpec RND_BREAKBEAT[] = {
+    {0, 2, 3,  116, 10, 90, 100, 0,  true},
+    {1, 2, 2,  112, 8,  95, 100, 0,  true},
+    {2, 2, 4,   74, 18, 70, 85,  15, false},
+    {3, 1, 3,   90, 10, 55, 75,  0,  false},
+    {5, 4, 6,   96, 12, 60, 80,  10, false},
+    {6, 4, 6,   62, 16, 40, 65,  25, false},
+};
+const RandomTrackSpec RND_HIPHOP[] = {
+    {0, 2, 4,  114, 10, 85, 95,  0,  true},
+    {1, 2, 2,  110, 8,  95, 100, 0,  true},
+    {2, 6, 8,   64, 18, 65, 85,  10, false},
+    {5, 1, 3,   88, 10, 25, 45,  0,  false},
+    {8, 1, 2,   80, 10, 20, 40,  0,  false},
+};
+const RandomTrackSpec RND_TRAP[] = {
+    {0, 2, 4,  120, 6,  95, 100, 0,  true},
+    {1, 2, 2,  112, 6,  95, 100, 0,  true},
+    {2, 11, 15, 55, 30, 85, 98,  45, false},
+    {3, 1, 3,   85, 10, 45, 65,  0,  false},
+    {7, 1, 3,   58, 10, 20, 40,  0,  false},
+};
+const RandomTrackSpec RND_MINIMAL[] = {
+    {0, 2, 4,  100, 8,  70, 90, 0,  true},
+    {2, 4, 6,   58, 14, 60, 80, 0,  false},
+    {6, 2, 4,   54, 12, 40, 65, 15, false},
+    {11, 1, 3,  48, 10, 25, 50, 0,  false},
+    {12, 1, 3,  46, 10, 20, 45, 0,  false},
+};
+
+template<typename T, size_t N>
+constexpr size_t arrayLen(const T (&)[N]) { return N; }
+
+uint32_t randomFastRand()
+{
+    static uint32_t s = 0;
+    if(s == 0) s = (uint32_t)millis() ^ 0x9E3779B9u | 1u;
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return s;
+}
+long randomRange(long mn, long mx)
+{
+    if(mx <= mn) return mn;
+    return mn + (long)(randomFastRand() % (uint32_t)(mx - mn + 1));
+}
+
+// Places `hits` pulses as evenly as possible across `steps` (bucketed
+// approximation of Bjorklund's algorithm), then rotates the result.
+void euclideanRhythm(uint8_t hits, uint8_t steps, uint8_t rotation, bool out[16])
+{
+    for(uint8_t i = 0; i < 16; ++i) out[i] = false;
+    if(steps == 0 || steps > 16) return;
+    if(hits == 0) return;
+    if(hits >= steps)
+    {
+        for(uint8_t i = 0; i < steps; ++i) out[i] = true;
+        return;
+    }
+    bool raw[16] = {};
+    int prevBucket = -1;
+    for(uint8_t i = 0; i < steps; ++i)
+    {
+        const int bucket = (int)i * (int)hits / (int)steps;
+        if(bucket != prevBucket) raw[i] = true;
+        prevBucket = bucket;
+    }
+    const uint8_t r = rotation % steps;
+    for(uint8_t i = 0; i < steps; ++i)
+        out[i] = raw[(i + r) % steps];
+}
+} // namespace
+
+bool control_apply_random_pattern(uint8_t style)
+{
+    if(style < RND_STYLE_TECHNO || style > RND_STYLE_MINIMAL)
+        return false;
+
+    const RandomTrackSpec* specs = RND_TECHNO;
+    size_t specCount = arrayLen(RND_TECHNO);
+    switch(style)
+    {
+        case RND_STYLE_TECHNO:    specs = RND_TECHNO;    specCount = arrayLen(RND_TECHNO);    break;
+        case RND_STYLE_HOUSE:     specs = RND_HOUSE;     specCount = arrayLen(RND_HOUSE);     break;
+        case RND_STYLE_BREAKBEAT: specs = RND_BREAKBEAT; specCount = arrayLen(RND_BREAKBEAT); break;
+        case RND_STYLE_HIPHOP:    specs = RND_HIPHOP;    specCount = arrayLen(RND_HIPHOP);    break;
+        case RND_STYLE_TRAP:      specs = RND_TRAP;      specCount = arrayLen(RND_TRAP);      break;
+        case RND_STYLE_MINIMAL:   specs = RND_MINIMAL;   specCount = arrayLen(RND_MINIMAL);   break;
+        default: return false;
+    }
+
+    Sequencer& sequencer = SequencerInstance();
+    const int pattern = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+
+    bool active[16][16] = {};
+    uint8_t velocity[16][16] = {};
+    uint8_t probability[16][16] = {};
+    uint8_t ratchet[16][16] = {};
+
+    for(int track = 0; track < 16; ++track)
+        for(int step = 0; step < 16; ++step)
+        {
+            active[track][step] = sequencer.getStep(pattern, track, step);
+            velocity[track][step] = sequencer.getStepVelocity(pattern, track, step);
+            probability[track][step] = sequencer.getStepProbability(pattern, track, step);
+            ratchet[track][step] = Clamp<uint8_t>(
+                sequencer.getStepRatchet(pattern, track, step), 1, 4);
+        }
+
+    variationBackup.valid = true;
+    variationBackup.pattern = pattern;
+    memcpy(variationBackup.active, active, sizeof(active));
+    memcpy(variationBackup.velocity, velocity, sizeof(velocity));
+    memcpy(variationBackup.probability, probability, sizeof(probability));
+    memcpy(variationBackup.ratchet, ratchet, sizeof(ratchet));
+
+    // Start from a blank pattern: a fresh generation should read as one
+    // coherent groove for the chosen style, not a blend with whatever was
+    // on the tracks the style does not use.
+    for(int track = 0; track < 16; ++track)
+        for(int step = 0; step < 16; ++step)
+        {
+            active[track][step] = false;
+            velocity[track][step] = 100;
+            probability[track][step] = 100;
+            ratchet[track][step] = 1;
+        }
+
+    for(size_t i = 0; i < specCount; ++i)
+    {
+        const RandomTrackSpec& spec = specs[i];
+        if(spec.track >= 16) continue;
+        const uint8_t hits = (uint8_t)randomRange(spec.hitsMin, spec.hitsMax);
+        if(hits == 0) continue;
+        const uint8_t rotation = spec.anchored
+            ? 0 : (uint8_t)randomRange(0, 15);
+        bool hitSteps[16];
+        euclideanRhythm(hits, 16, rotation, hitSteps);
+        for(int step = 0; step < 16; ++step)
+        {
+            if(!hitSteps[step]) continue;
+            active[spec.track][step] = true;
+            velocity[spec.track][step] = (uint8_t)Clamp<long>(
+                spec.velBase + randomRange(-(long)spec.velVar, (long)spec.velVar),
+                1, 127);
+            probability[spec.track][step] = (uint8_t)randomRange(
+                spec.probMin, spec.probMax);
+            const bool ratchetHit = spec.ratchetPct > 0
+                && randomRange(0, 99) < spec.ratchetPct;
+            ratchet[spec.track][step] = ratchetHit
+                ? (uint8_t)randomRange(2, 4) : 1;
+        }
+    }
+
+    bool changed = false;
+    for(int track = 0; track < 16; ++track)
+    {
+        for(int step = 0; step < 16; ++step)
+        {
+            const bool oldActive = sequencer.getStep(pattern, track, step);
+            const uint8_t oldVelocity = sequencer.getStepVelocity(pattern, track, step);
+            const uint8_t oldProbability = sequencer.getStepProbability(pattern, track, step);
+            const uint8_t oldRatchet = Clamp<uint8_t>(
+                sequencer.getStepRatchet(pattern, track, step), 1, 4);
+            if(oldActive == active[track][step]
+               && oldVelocity == velocity[track][step]
+               && oldProbability == probability[track][step]
+               && oldRatchet == ratchet[track][step])
+            {
+                p4.steps[track][step] = active[track][step];
+                continue;
+            }
+
+            sequencer.setStep(pattern, track, step, active[track][step],
+                              velocity[track][step]);
+            sequencer.setStepProbability(pattern, track, step,
+                                         probability[track][step]);
+            sequencer.setStepRatchet(pattern, track, step, ratchet[track][step]);
+            p4.steps[track][step] = active[track][step];
+            changed = true;
+        }
+    }
+
+    if(!changed) variationBackup.valid = false;
+    return changed;
+}
+
 bool control_variation_can_undo()
 {
     return variationBackup.valid
@@ -1312,6 +1528,56 @@ void control_send_set_track_engine(int track, int engine)
 {
     if(track >= 0 && track < 16)
         daisyUsb.setTrackEngine(track, static_cast<int8_t>(engine));
+}
+
+void control_send_track_filter(int track, int filterType, float cutoffHz,
+                               float resonance)
+{
+    if(track < 0 || track >= 16) return;
+    daisyUsb.setTrackFilter(static_cast<uint8_t>(track),
+                            static_cast<uint8_t>(Clamp(filterType, 0, 14)),
+                            Clamp(cutoffHz, 20.0f, 20000.0f),
+                            Clamp(resonance, 0.3f, 40.0f));
+}
+
+void control_send_track_clear_filter(int track)
+{
+    if(track >= 0 && track < 16)
+        daisyUsb.clearTrackFilter(static_cast<uint8_t>(track));
+}
+
+void control_send_track_distortion(int track, float amount01)
+{
+    if(track < 0 || track >= 16) return;
+    daisyUsb.setTrackDistortion(static_cast<uint8_t>(track),
+                                Clamp(amount01, 0.0f, 1.0f));
+}
+
+void control_send_track_bitcrush(int track, int bits)
+{
+    if(track < 0 || track >= 16) return;
+    daisyUsb.setTrackBitcrush(static_cast<uint8_t>(track),
+                              static_cast<uint8_t>(Clamp(bits, 4, 16)));
+}
+
+void control_send_track_reverb_send(int track, int percent)
+{
+    if(track < 0 || track >= 16) return;
+    daisyUsb.setTrackReverbSend(static_cast<uint8_t>(track),
+                                static_cast<uint8_t>(Clamp(percent, 0, 100)));
+}
+
+void control_send_track_delay_send(int track, int percent)
+{
+    if(track < 0 || track >= 16) return;
+    daisyUsb.setTrackDelaySend(static_cast<uint8_t>(track),
+                               static_cast<uint8_t>(Clamp(percent, 0, 100)));
+}
+
+void control_send_track_clear_fx(int track)
+{
+    if(track >= 0 && track < 16)
+        daisyUsb.clearTrackFx(static_cast<uint8_t>(track));
 }
 
 void control_send_set_filter(int type)

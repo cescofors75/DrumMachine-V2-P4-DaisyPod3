@@ -207,6 +207,55 @@ void DaisyUsbTransport::setTrackEngine(uint8_t track, int8_t engine)
     send(CMD_DSQ_SET_TRACK_ENGINE, payload, sizeof(payload));
 }
 
+// CMD_TRACK_FILTER payload (16B): [track, filterType, rsvd, rsvd,
+// float cutoffHz(4B), float resonance(4B), float gain(4B, unused here=0)]
+void DaisyUsbTransport::setTrackFilter(uint8_t track, uint8_t filterType,
+                                       float cutoffHz, float resonance)
+{
+    uint8_t payload[16] = {track, filterType, 0, 0};
+    memcpy(payload + 4, &cutoffHz, 4);
+    memcpy(payload + 8, &resonance, 4);
+    const float gain = 0.0f;
+    memcpy(payload + 12, &gain, 4);
+    send(CMD_TRACK_FILTER, payload, sizeof(payload));
+}
+
+void DaisyUsbTransport::clearTrackFilter(uint8_t track)
+{
+    sendU8(CMD_TRACK_CLEAR_FILTER, track);
+}
+
+// CMD_TRACK_DISTORTION payload (8B): [track, mode, rsvd, rsvd, float amount(4B) 0..1]
+void DaisyUsbTransport::setTrackDistortion(uint8_t track, float amount01)
+{
+    uint8_t payload[8] = {track, 0, 0, 0};
+    memcpy(payload + 4, &amount01, 4);
+    send(CMD_TRACK_DISTORTION, payload, sizeof(payload));
+}
+
+void DaisyUsbTransport::setTrackBitcrush(uint8_t track, uint8_t bits)
+{
+    const uint8_t payload[2] = {track, bits};
+    send(CMD_TRACK_BITCRUSH, payload, sizeof(payload));
+}
+
+void DaisyUsbTransport::setTrackReverbSend(uint8_t track, uint8_t percent)
+{
+    const uint8_t payload[2] = {track, percent};
+    send(CMD_TRACK_REVERB_SEND, payload, sizeof(payload));
+}
+
+void DaisyUsbTransport::setTrackDelaySend(uint8_t track, uint8_t percent)
+{
+    const uint8_t payload[2] = {track, percent};
+    send(CMD_TRACK_DELAY_SEND, payload, sizeof(payload));
+}
+
+void DaisyUsbTransport::clearTrackFx(uint8_t track)
+{
+    sendU8(CMD_TRACK_CLEAR_FX, track);
+}
+
 void DaisyUsbTransport::synthTrigger(uint8_t engine, uint8_t instrument,
                                      uint8_t velocity)
 {

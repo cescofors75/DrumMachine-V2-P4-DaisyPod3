@@ -45,6 +45,21 @@ enum SequencerVariation : uint8_t {
 };
 bool control_apply_sequencer_variation(uint8_t variation);
 bool control_variation_can_undo();
+
+// "PLAY RANDOM" — generates a brand new pattern from scratch using
+// Euclidean-rhythm placement, with per-style hit-count/velocity/probability
+// tables (kick/snare/hats/perc). Shares the VARIATIONS undo backup, so
+// SEQ_VAR_UNDO also restores the pattern that was active before a random
+// generation.
+enum RandomPatternStyle : uint8_t {
+    RND_STYLE_TECHNO = 1,
+    RND_STYLE_HOUSE,
+    RND_STYLE_BREAKBEAT,
+    RND_STYLE_HIPHOP,
+    RND_STYLE_TRAP,
+    RND_STYLE_MINIMAL,
+};
+bool control_apply_random_pattern(uint8_t style);
 bool control_sync_current_pattern();
 bool control_patterns_ready();
 uint8_t control_factory_patterns_found();
@@ -70,6 +85,17 @@ void control_send_set_seq_volume(int value);
 void control_send_set_live_volume(int value);
 void control_send_set_track_volume(int track, int volume);
 void control_send_set_track_engine(int track, int engine);
+
+// Per-instrument FX (idea 2): one instrument's own filter/drive/crush/sends,
+// independent from the FX LAB's global chain.
+void control_send_track_filter(int track, int filterType, float cutoffHz,
+                               float resonance);
+void control_send_track_clear_filter(int track);
+void control_send_track_distortion(int track, float amount01);
+void control_send_track_bitcrush(int track, int bits);
+void control_send_track_reverb_send(int track, int percent);
+void control_send_track_delay_send(int track, int percent);
+void control_send_track_clear_fx(int track);
 void control_send_set_filter(int type);
 void control_send_set_filter_cutoff(int hz);
 void control_send_set_filter_resonance(float value);

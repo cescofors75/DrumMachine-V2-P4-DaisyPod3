@@ -733,6 +733,39 @@ static lv_obj_t* s_pad_inst_modal_pad_btns[16] = {};
 static lv_obj_t* s_pad_inst_modal_inst_btns[8] = {};
 static lv_obj_t* s_pad_inst_modal_kit_btns[3][5] = {};   // [engine 0=808/1=909/2=505][preset 0..4]
 static lv_obj_t* s_pad_inst_modal_kit_lbl_eng[3] = {};   // labels "808"/"909"/"505"
+
+// ── Per-instrument FX (idea 2): filter + distortion/bitcrush + sends, one
+// track (pad) at a time. P4-local only — DaisyPod3 does not report these
+// back, so the panel keeps the last value it sent per pad as its state. ──
+struct PadFxState {
+    uint8_t filterType;   // 0 OFF, else matches fx_filter_model_name() codes
+    uint8_t cutoffU7;     // 0..127, default 127 (fully open)
+    uint8_t resoU7;       // 0..127, default 0 (gentle)
+    uint8_t driveU7;      // 0..127, default 0 (bypass)
+    uint8_t bitsU7;       // 0..127, default 0 (bypass, 16-bit)
+    uint8_t rvbU7;        // 0..127, default 0 (no send)
+    uint8_t dlyU7;        // 0..127, default 0 (no send)
+};
+static PadFxState s_pad_fx_state[16] = {};
+static bool       s_pad_fx_state_init[16] = {};
+static lv_obj_t*  s_pad_fx_modal = NULL;
+static lv_obj_t*  s_pad_fx_modal_title = NULL;
+static lv_obj_t*  s_pad_fx_filter_btns[6] = {};
+static lv_obj_t*  s_pad_fx_cutoff_slider = NULL;
+static lv_obj_t*  s_pad_fx_reso_slider = NULL;
+static lv_obj_t*  s_pad_fx_drive_slider = NULL;
+static lv_obj_t*  s_pad_fx_bits_slider = NULL;
+static lv_obj_t*  s_pad_fx_rvb_slider = NULL;
+static lv_obj_t*  s_pad_fx_dly_slider = NULL;
+static lv_obj_t*  s_pad_fx_cutoff_lbl = NULL;
+static lv_obj_t*  s_pad_fx_reso_lbl = NULL;
+static lv_obj_t*  s_pad_fx_drive_lbl = NULL;
+static lv_obj_t*  s_pad_fx_bits_lbl = NULL;
+static lv_obj_t*  s_pad_fx_rvb_lbl = NULL;
+static lv_obj_t*  s_pad_fx_dly_lbl = NULL;
+static lv_obj_t*  s_pad_fx_subtitle_lbl = NULL;
+static uint8_t    s_pad_fx_focus_pad = 0;
+
 static lv_obj_t* s_pod_status_modal = NULL;
 static lv_obj_t* s_pod_status_label = NULL;
 // ── AKAI MPD218 MIDI MAP + LEARN ─────────────────────────────────────
@@ -1900,6 +1933,8 @@ static void pad_inst_modal_close_cb(lv_event_t* e) {
 
 // fwd decl: defined later; used inside the PAD SOUND modal builder
 static void grid_pad_kit_select_cb(lv_event_t* e);
+// fwd decl: instrument-FX modal (idea 2), opened from a button in this popup
+static void pad_fx_modal_show(lv_event_t* e);
 
 static void pad_inst_modal_pick_pad_cb(lv_event_t* e) {
     int pad = (int)(intptr_t)lv_event_get_user_data(e);
@@ -2071,6 +2106,44 @@ static void pad_inst_modal_assign_cb(lv_event_t* e) {
     pad_inst_commit_pending(pad);
     ui_show_toast("Asignado", RED808_SUCCESS);
     pad_inst_modal_close_cb(NULL);
+}
+
+// RANDOM: re-rolls each pad's drum engine (Sampler/808/909/505), the same
+// pool a kick can already cycle through by hand. Tasteful on purpose: only
+// a majority of pads reroll each tap, and a pad never rerolls to the engine
+// it already had, so results stay varied instead of a uniform reset.
+static void pad_random_all_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (!control_available() && !control_engine_connected()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    static uint32_t s = 0;
+    if (s == 0) s = (uint32_t)millis() ^ 0x2545F491u | 1u;
+    static const uint8_t drumPool[4] = {0, 1, 2, 3}; // Sampler, 808, 909, 505
+    int rerolled = 0;
+    for (int pad = 0; pad < 16; pad++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        if ((s % 100u) >= 65u) continue;   // ~65% of pads reroll per tap
+
+        uint8_t current = s_pad_inst_sel[pad];
+        if (current > 3) current = 0;      // melodic engine: treat as sampler slot
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        const uint8_t choice = (uint8_t)(s % 3u);   // pick among the OTHER 3
+        const uint8_t next = drumPool[choice >= current ? choice + 1 : choice];
+
+        s_pad_inst_pending[pad] = next;
+        if (pad_inst_commit_pending(pad)) rerolled++;
+    }
+    pad_inst_modal_refresh();
+    if (rerolled == 0) {
+        ui_show_toast("RANDOM: sin cambios esta vez", RED808_TEXT_DIM);
+    } else {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "RANDOM: %d pad%s reasignados",
+                 rerolled, rerolled == 1 ? "" : "s");
+        ui_show_toast(msg, RED808_INFO);
+    }
 }
 
 static void grid_pad_inst_popup_cb(lv_event_t* e) {
@@ -2289,6 +2362,18 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_center(original_lbl);
     lv_obj_add_event_cb(original_btn, pad_inst_sampler_original_cb, LV_EVENT_CLICKED, NULL);
 
+    // Per-instrument FX page (idea 2): filter + drive/crush + sends, scoped
+    // to just the focused pad, with its own RANDOM.
+    lv_obj_t* inst_fx_btn = lv_btn_create(card);
+    lv_obj_set_size(inst_fx_btn, 68, 48);
+    lv_obj_align(inst_fx_btn, LV_ALIGN_BOTTOM_LEFT, 226, -14);
+    apply_control_button_style(inst_fx_btn, RED808_CYAN, false, 10);
+    lv_obj_t* inst_fx_lbl = lv_label_create(inst_fx_btn);
+    lv_label_set_text(inst_fx_lbl, "FX");
+    lv_obj_set_style_text_font(inst_fx_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(inst_fx_lbl);
+    lv_obj_add_event_cb(inst_fx_btn, pad_fx_modal_show, LV_EVENT_CLICKED, NULL);
+
     lv_obj_t* preview_btn = lv_btn_create(card);
     lv_obj_set_size(preview_btn, 180, 48);
     lv_obj_align(preview_btn, LV_ALIGN_BOTTOM_MID, -100, -14);
@@ -2315,6 +2400,18 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_center(assign_lbl);
     lv_obj_add_event_cb(assign_btn, pad_inst_modal_assign_cb, LV_EVENT_CLICKED, NULL);
 
+    // RANDOM: re-roll pad engines across the 16-pad kit (Sampler/808/909/505).
+    lv_obj_t* random_btn = lv_btn_create(card);
+    lv_obj_set_size(random_btn, 130, 48);
+    lv_obj_align(random_btn, LV_ALIGN_BOTTOM_RIGHT, -158, -14);
+    apply_control_button_style(random_btn, RED808_INFO, false, 10);
+    lv_obj_t* random_lbl = lv_label_create(random_btn);
+    lv_label_set_text(random_lbl, LV_SYMBOL_SHUFFLE "  RANDOM");
+    lv_obj_set_style_text_font(random_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(random_lbl, RED808_TEXT, 0);
+    lv_obj_center(random_lbl);
+    lv_obj_add_event_cb(random_btn, pad_random_all_cb, LV_EVENT_CLICKED, NULL);
+
     lv_obj_t* close_btn = lv_btn_create(card);
     lv_obj_set_size(close_btn, 130, 48);
     lv_obj_align(close_btn, LV_ALIGN_BOTTOM_RIGHT, -18, -14);
@@ -2325,6 +2422,378 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_add_event_cb(close_btn, pad_inst_modal_close_cb, LV_EVENT_CLICKED, NULL);
 
     pad_inst_modal_refresh();
+}
+
+// =============================================================================
+// PER-INSTRUMENT FX modal (idea 2) — filter + drive/crush + sends for a
+// single pad, independent from the FX LAB's global chain. Reachable from
+// the "FX" button inside the PAD INSTRUMENT SELECT popup above.
+// =============================================================================
+enum PadFxSliderId : uint8_t { PFX_CUTOFF = 0, PFX_RESO, PFX_DRIVE, PFX_BITS, PFX_RVB, PFX_DLY };
+
+static const uint8_t PAD_FX_FILTER_TYPES[6] = {0, 1, 2, 3, 9, 10};
+static const char* const PAD_FX_FILTER_NAMES[6] = {
+    "OFF", "LOWPASS", "HIGHPASS", "BANDPASS", "RESONANT", "LADDER"
+};
+
+static PadFxState& pad_fx_state_for(uint8_t pad) {
+    if (pad > 15) pad = 15;
+    if (!s_pad_fx_state_init[pad]) {
+        s_pad_fx_state[pad] = PadFxState{0, 127, 0, 0, 0, 0, 0};
+        s_pad_fx_state_init[pad] = true;
+    }
+    return s_pad_fx_state[pad];
+}
+
+static float pad_fx_cutoff_hz(uint8_t u7) {
+    return 20.0f * powf(1000.0f, (float)u7 / 127.0f);
+}
+static float pad_fx_resonance(uint8_t u7) {
+    return 0.7f + ((float)u7 / 127.0f) * 19.3f;
+}
+static uint8_t pad_fx_bits(uint8_t u7) {
+    return (uint8_t)constrain((int)(16.0f - ((float)u7 / 127.0f) * 12.0f + 0.5f), 4, 16);
+}
+static uint8_t pad_fx_percent(uint8_t u7) {
+    return (uint8_t)constrain((int)(((float)u7 / 127.0f) * 100.0f + 0.5f), 0, 100);
+}
+
+// Sends the pad's current filter (or clears it when OFF). Cutoff/resonance
+// only matter while a filter type is selected.
+static void pad_fx_send_filter(uint8_t pad) {
+    const PadFxState& st = pad_fx_state_for(pad);
+    if (st.filterType == 0) {
+        control_send_track_clear_filter(pad);
+    } else {
+        control_send_track_filter(pad, st.filterType,
+                                  pad_fx_cutoff_hz(st.cutoffU7),
+                                  pad_fx_resonance(st.resoU7));
+    }
+}
+
+static void pad_fx_modal_refresh(void) {
+    if (!s_pad_fx_modal) return;
+    uint8_t pad = s_pad_fx_focus_pad;
+    if (pad > 15) pad = 15;
+    const PadFxState& st = pad_fx_state_for(pad);
+    uint8_t inst = s_pad_inst_sel[pad];
+    if (inst > 7) inst = 0;
+
+    if (s_pad_fx_subtitle_lbl)
+        lv_label_set_text_fmt(s_pad_fx_subtitle_lbl, "PAD %02d  -  %s",
+                              (int)pad + 1, PAD_INST_NAMES[inst]);
+
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t* btn = s_pad_fx_filter_btns[i];
+        if (!btn) continue;
+        bool active = (PAD_FX_FILTER_TYPES[i] == st.filterType);
+        lv_obj_set_style_bg_color(btn, active ? RED808_ACCENT : RED808_SURFACE, 0);
+        lv_obj_set_style_border_color(btn, active ? RED808_CYAN : RED808_BORDER, 0);
+        lv_obj_set_style_bg_opa(btn, active ? LV_OPA_COVER : LV_OPA_80, 0);
+        lv_obj_set_style_border_width(btn, active ? 2 : 1, 0);
+    }
+
+    if (s_pad_fx_cutoff_slider) lv_slider_set_value(s_pad_fx_cutoff_slider, st.cutoffU7, LV_ANIM_OFF);
+    if (s_pad_fx_reso_slider)   lv_slider_set_value(s_pad_fx_reso_slider, st.resoU7, LV_ANIM_OFF);
+    if (s_pad_fx_drive_slider)  lv_slider_set_value(s_pad_fx_drive_slider, st.driveU7, LV_ANIM_OFF);
+    if (s_pad_fx_bits_slider)   lv_slider_set_value(s_pad_fx_bits_slider, st.bitsU7, LV_ANIM_OFF);
+    if (s_pad_fx_rvb_slider)    lv_slider_set_value(s_pad_fx_rvb_slider, st.rvbU7, LV_ANIM_OFF);
+    if (s_pad_fx_dly_slider)    lv_slider_set_value(s_pad_fx_dly_slider, st.dlyU7, LV_ANIM_OFF);
+
+    if (s_pad_fx_cutoff_lbl) {
+        float hz = pad_fx_cutoff_hz(st.cutoffU7);
+        if (hz >= 1000.0f) lv_label_set_text_fmt(s_pad_fx_cutoff_lbl, "%d.%01dkHz",
+                                                 (int)(hz / 1000.0f),
+                                                 ((int)(hz / 100.0f)) % 10);
+        else lv_label_set_text_fmt(s_pad_fx_cutoff_lbl, "%dHz", (int)hz);
+    }
+    if (s_pad_fx_reso_lbl) {
+        float q = pad_fx_resonance(st.resoU7);
+        lv_label_set_text_fmt(s_pad_fx_reso_lbl, "Q %d.%01d", (int)q, ((int)(q * 10.0f)) % 10);
+    }
+    if (s_pad_fx_drive_lbl)
+        lv_label_set_text_fmt(s_pad_fx_drive_lbl, "%d%%", pad_fx_percent(st.driveU7));
+    if (s_pad_fx_bits_lbl)
+        lv_label_set_text_fmt(s_pad_fx_bits_lbl, "%d bit", pad_fx_bits(st.bitsU7));
+    if (s_pad_fx_rvb_lbl)
+        lv_label_set_text_fmt(s_pad_fx_rvb_lbl, "%d%%", pad_fx_percent(st.rvbU7));
+    if (s_pad_fx_dly_lbl)
+        lv_label_set_text_fmt(s_pad_fx_dly_lbl, "%d%%", pad_fx_percent(st.dlyU7));
+}
+
+static void pad_fx_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_pad_fx_modal) {
+        lv_obj_del(s_pad_fx_modal);
+        s_pad_fx_modal = NULL;
+        for (int i = 0; i < 6; i++) s_pad_fx_filter_btns[i] = NULL;
+        s_pad_fx_cutoff_slider = s_pad_fx_reso_slider = s_pad_fx_drive_slider = NULL;
+        s_pad_fx_bits_slider = s_pad_fx_rvb_slider = s_pad_fx_dly_slider = NULL;
+        s_pad_fx_cutoff_lbl = s_pad_fx_reso_lbl = s_pad_fx_drive_lbl = NULL;
+        s_pad_fx_bits_lbl = s_pad_fx_rvb_lbl = s_pad_fx_dly_lbl = NULL;
+        s_pad_fx_subtitle_lbl = NULL;
+        s_pad_fx_modal_title = NULL;
+    }
+}
+
+static void pad_fx_filter_select_cb(lv_event_t* e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= 6) return;
+    uint8_t pad = s_pad_fx_focus_pad;
+    if (!control_available() && !control_engine_connected()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    PadFxState& st = pad_fx_state_for(pad);
+    st.filterType = PAD_FX_FILTER_TYPES[idx];
+    pad_fx_send_filter(pad);
+    pad_fx_modal_refresh();
+}
+
+static void pad_fx_slider_cb(lv_event_t* e) {
+    int id = (int)(intptr_t)lv_event_get_user_data(e);
+    lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
+    uint8_t u7 = (uint8_t)constrain(lv_slider_get_value(slider), 0, 127);
+    uint8_t pad = s_pad_fx_focus_pad;
+
+    static uint32_t lastTxMs = 0;
+    uint32_t now = millis();
+    bool finalValue = (lv_event_get_code(e) == LV_EVENT_RELEASED ||
+                       lv_event_get_code(e) == LV_EVENT_PRESS_LOST);
+    bool transmit = finalValue || lastTxMs == 0 || (uint32_t)(now - lastTxMs) >= 30;
+
+    PadFxState& st = pad_fx_state_for(pad);
+    switch (id) {
+        case PFX_CUTOFF: st.cutoffU7 = u7; break;
+        case PFX_RESO:   st.resoU7 = u7;   break;
+        case PFX_DRIVE:  st.driveU7 = u7;  break;
+        case PFX_BITS:   st.bitsU7 = u7;   break;
+        case PFX_RVB:    st.rvbU7 = u7;    break;
+        case PFX_DLY:    st.dlyU7 = u7;    break;
+        default: return;
+    }
+
+    if (!transmit || (!control_available() && !control_engine_connected())) {
+        pad_fx_modal_refresh();
+        return;
+    }
+    lastTxMs = now;
+
+    switch (id) {
+        case PFX_CUTOFF:
+        case PFX_RESO:
+            if (st.filterType == 0) st.filterType = 1;  // moving cutoff/reso engages LOWPASS
+            pad_fx_send_filter(pad);
+            break;
+        case PFX_DRIVE:
+            control_send_track_distortion(pad, (float)st.driveU7 / 127.0f);
+            break;
+        case PFX_BITS:
+            control_send_track_bitcrush(pad, pad_fx_bits(st.bitsU7));
+            break;
+        case PFX_RVB:
+            control_send_track_reverb_send(pad, pad_fx_percent(st.rvbU7));
+            break;
+        case PFX_DLY:
+            control_send_track_delay_send(pad, pad_fx_percent(st.dlyU7));
+            break;
+    }
+    pad_fx_modal_refresh();
+}
+
+// RANDOM FX: tasteful, single-instrument version of the FX LAB randomizer —
+// mostly bypassed, occasionally engages a musical filter and a light touch
+// of drive/crush/sends. "no siempre", varied, kept subtle.
+static void pad_fx_random_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    uint8_t pad = s_pad_fx_focus_pad;
+    if (!control_available() && !control_engine_connected()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    static uint32_t s = 0;
+    if (s == 0) s = (uint32_t)millis() ^ 0x1F123BB5u | 1u;
+    auto nextRand = [&]() -> uint32_t {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        return s;
+    };
+    auto randRange = [&](int mn, int mx) -> int {
+        if (mx <= mn) return mn;
+        return mn + (int)(nextRand() % (uint32_t)(mx - mn + 1));
+    };
+
+    PadFxState& st = pad_fx_state_for(pad);
+
+    static const uint8_t filterPool[6] = {0, 0, 0, 1, 2, 9};  // OFF is common
+    st.filterType = filterPool[randRange(0, 5)];
+    st.cutoffU7 = (st.filterType == 0) ? 127
+        : (uint8_t)((randRange(0, 1) == 0) ? 127 : randRange(35, 100));
+    st.resoU7 = (st.filterType == 0) ? 0 : (uint8_t)randRange(0, 55);
+    pad_fx_send_filter(pad);
+
+    st.driveU7 = (randRange(0, 4) == 0) ? (uint8_t)randRange(15, 55) : 0;
+    control_send_track_distortion(pad, (float)st.driveU7 / 127.0f);
+
+    st.bitsU7 = (randRange(0, 5) == 0) ? (uint8_t)randRange(20, 55) : 0;
+    control_send_track_bitcrush(pad, pad_fx_bits(st.bitsU7));
+
+    st.rvbU7 = (randRange(0, 2) == 0) ? (uint8_t)randRange(15, 60) : 0;
+    control_send_track_reverb_send(pad, pad_fx_percent(st.rvbU7));
+
+    st.dlyU7 = (randRange(0, 3) == 0) ? (uint8_t)randRange(15, 50) : 0;
+    control_send_track_delay_send(pad, pad_fx_percent(st.dlyU7));
+
+    pad_fx_modal_refresh();
+    ui_show_toast(st.filterType == 0 ? "RANDOM FX: sutil" : "RANDOM FX aplicado",
+                  RED808_CYAN);
+}
+
+static void pad_fx_clear_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    uint8_t pad = s_pad_fx_focus_pad;
+    if (!control_available() && !control_engine_connected()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    s_pad_fx_state[pad] = PadFxState{0, 127, 0, 0, 0, 0, 0};
+    s_pad_fx_state_init[pad] = true;
+    control_send_track_clear_fx(pad);
+    pad_fx_modal_refresh();
+    ui_show_toast("FX del instrumento reseteados", RED808_SUCCESS);
+}
+
+static void pad_fx_modal_show(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_pad_fx_modal) return;
+    if (!control_available() && !control_engine_connected()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    s_pad_fx_focus_pad = s_pad_inst_focus_pad > 15 ? 15 : s_pad_inst_focus_pad;
+
+    s_pad_fx_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_pad_fx_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_pad_fx_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_pad_fx_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_pad_fx_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_pad_fx_modal, 0, 0);
+    lv_obj_clear_flag(s_pad_fx_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_pad_fx_modal, pad_fx_modal_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_pad_fx_modal);
+    lv_obj_set_size(card, 720, 540);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    s_pad_fx_modal_title = lv_label_create(card);
+    lv_label_set_text(s_pad_fx_modal_title, "INSTRUMENT FX");
+    lv_obj_set_style_text_font(s_pad_fx_modal_title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(s_pad_fx_modal_title, RED808_CYAN, 0);
+    lv_obj_align(s_pad_fx_modal_title, LV_ALIGN_TOP_MID, 0, 2);
+
+    s_pad_fx_subtitle_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(s_pad_fx_subtitle_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_pad_fx_subtitle_lbl, RED808_TEXT_DIM, 0);
+    lv_obj_align(s_pad_fx_subtitle_lbl, LV_ALIGN_TOP_MID, 0, 32);
+
+    lv_obj_t* filter_hdr = lv_label_create(card);
+    lv_label_set_text(filter_hdr, "FILTER");
+    lv_obj_set_style_text_font(filter_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(filter_hdr, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(filter_hdr, 4, 58);
+
+    {
+        constexpr int btnW = 104, btnH = 40, gapX = 8, y0 = 76;
+        for (int i = 0; i < 6; i++) {
+            lv_obj_t* fb = lv_btn_create(card);
+            s_pad_fx_filter_btns[i] = fb;
+            lv_obj_set_size(fb, btnW, btnH);
+            lv_obj_set_pos(fb, 4 + i * (btnW + gapX), y0);
+            apply_control_button_style(fb, RED808_BORDER, false, 8);
+            lv_obj_t* fl = lv_label_create(fb);
+            lv_label_set_text(fl, PAD_FX_FILTER_NAMES[i]);
+            lv_obj_set_style_text_font(fl, &lv_font_montserrat_12, 0);
+            lv_obj_center(fl);
+            lv_obj_add_event_cb(fb, pad_fx_filter_select_cb, LV_EVENT_CLICKED,
+                                (void*)(intptr_t)i);
+        }
+    }
+
+    // ── Sliders: label | slider | value readout ──
+    auto makeRow = [&](int y, int id, const char* name, lv_obj_t** slider,
+                       lv_obj_t** valueLbl) {
+        lv_obj_t* nameLbl = lv_label_create(card);
+        lv_label_set_text(nameLbl, name);
+        lv_obj_set_style_text_font(nameLbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(nameLbl, RED808_TEXT, 0);
+        lv_obj_set_pos(nameLbl, 4, y + 4);
+        lv_obj_set_width(nameLbl, 112);
+
+        *slider = lv_slider_create(card);
+        lv_obj_set_pos(*slider, 122, y + 6);
+        lv_obj_set_size(*slider, 470, 16);
+        lv_slider_set_range(*slider, 0, 127);
+        lv_obj_set_style_bg_color(*slider, RED808_SURFACE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(*slider, RED808_ACCENT, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(*slider, lv_color_white(), LV_PART_KNOB);
+        lv_obj_add_event_cb(*slider, pad_fx_slider_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)id);
+        lv_obj_add_event_cb(*slider, pad_fx_slider_cb, LV_EVENT_RELEASED, (void*)(intptr_t)id);
+        lv_obj_add_event_cb(*slider, pad_fx_slider_cb, LV_EVENT_PRESS_LOST, (void*)(intptr_t)id);
+
+        *valueLbl = lv_label_create(card);
+        lv_obj_set_style_text_font(*valueLbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(*valueLbl, RED808_ACCENT, 0);
+        lv_obj_set_pos(*valueLbl, 606, y + 4);
+        lv_obj_set_width(*valueLbl, 96);
+    };
+
+    const int rowY0 = 134, rowH = 58;
+    makeRow(rowY0 + 0 * rowH, PFX_CUTOFF, "CUTOFF",      &s_pad_fx_cutoff_slider, &s_pad_fx_cutoff_lbl);
+    makeRow(rowY0 + 1 * rowH, PFX_RESO,   "RESONANCE",   &s_pad_fx_reso_slider,   &s_pad_fx_reso_lbl);
+    makeRow(rowY0 + 2 * rowH, PFX_DRIVE,  "DRIVE",       &s_pad_fx_drive_slider,  &s_pad_fx_drive_lbl);
+    makeRow(rowY0 + 3 * rowH, PFX_BITS,   "BITCRUSH",    &s_pad_fx_bits_slider,   &s_pad_fx_bits_lbl);
+    makeRow(rowY0 + 4 * rowH, PFX_RVB,    "REVERB SEND", &s_pad_fx_rvb_slider,    &s_pad_fx_rvb_lbl);
+    makeRow(rowY0 + 5 * rowH, PFX_DLY,    "DELAY SEND",  &s_pad_fx_dly_slider,    &s_pad_fx_dly_lbl);
+
+    lv_obj_t* random_btn = lv_btn_create(card);
+    lv_obj_set_size(random_btn, 160, 48);
+    lv_obj_align(random_btn, LV_ALIGN_BOTTOM_LEFT, 4, -14);
+    apply_control_button_style(random_btn, RED808_INFO, false, 10);
+    lv_obj_t* random_lbl = lv_label_create(random_btn);
+    lv_label_set_text(random_lbl, LV_SYMBOL_SHUFFLE "  RANDOM FX");
+    lv_obj_set_style_text_font(random_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(random_lbl);
+    lv_obj_add_event_cb(random_btn, pad_fx_random_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* clear_btn = lv_btn_create(card);
+    lv_obj_set_size(clear_btn, 140, 48);
+    lv_obj_align(clear_btn, LV_ALIGN_BOTTOM_MID, 0, -14);
+    apply_control_button_style(clear_btn, RED808_ERROR, false, 10);
+    lv_obj_t* clear_lbl = lv_label_create(clear_btn);
+    lv_label_set_text(clear_lbl, "CLEAR FX");
+    lv_obj_set_style_text_font(clear_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(clear_lbl);
+    lv_obj_add_event_cb(clear_btn, pad_fx_clear_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* close_btn2 = lv_btn_create(card);
+    lv_obj_set_size(close_btn2, 110, 48);
+    lv_obj_align(close_btn2, LV_ALIGN_BOTTOM_RIGHT, -4, -14);
+    apply_control_button_style(close_btn2, RED808_BORDER, false, 10);
+    lv_obj_t* close_lbl2 = lv_label_create(close_btn2);
+    lv_label_set_text(close_lbl2, "CERRAR");
+    lv_obj_center(close_lbl2);
+    lv_obj_add_event_cb(close_btn2, pad_fx_modal_close_cb, LV_EVENT_CLICKED, NULL);
+
+    pad_fx_modal_refresh();
 }
 
 // Helper: styled control button
@@ -5743,6 +6212,62 @@ static void fx_all_off_cb(lv_event_t* e) {
     fx_all_turn_off();
 }
 
+// ── RANDOM: tasteful global filter randomizer (not always-on) ──────────────
+static uint32_t fx_random_rand_u32(void) {
+    static uint32_t s = 0;
+    if (s == 0) s = (uint32_t)millis() ^ 0xB5297A4Du | 1u;
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return s;
+}
+static int fx_random_range(int mn, int mx) {
+    if (mx <= mn) return mn;
+    return mn + (int)(fx_random_rand_u32() % (uint32_t)(mx - mn + 1));
+}
+
+static void fx_random_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+
+    // FILTER model: weighted toward musical, commonly-useful types, with a
+    // real chance of landing back on OFF so RANDOM does not always engage
+    // a filter.
+    static const uint8_t filterPool[] = {
+        0, 0, 1, 1, 1, 2, 2, 3, 3, 7, 8, 9, 10, 11, 11, 13
+    };
+    const uint8_t filterType =
+        filterPool[fx_random_range(0, (int)(sizeof(filterPool) / sizeof(filterPool[0])) - 1)];
+    const int filterU7 = (int)((float)filterType / 14.0f * 127.0f + 0.5f);
+    fx_card_send_value(FX_CARD_FILTER, filterU7);
+
+    if (filterType == 0) {
+        // No filter this round: keep cutoff/resonance neutral so the mix
+        // stays clean rather than leaving a stray sweep engaged.
+        fx_card_send_value(FX_CARD_CUTOFF, 127);
+        fx_card_send_value(FX_CARD_RESO, 0);
+    } else {
+        // Half the time keep the sweep fully open (filter colors the tone
+        // without an audible cutoff move); otherwise land somewhere musical.
+        const int cutoffU7 = (fx_random_range(0, 1) == 0)
+            ? 127 : fx_random_range(40, 100);
+        fx_card_send_value(FX_CARD_CUTOFF, cutoffU7);
+        // Resonance is usually gentle; only occasionally spicier.
+        const int resoMax = (fx_random_range(0, 3) == 0) ? 110 : 45;
+        fx_card_send_value(FX_CARD_RESO, fx_random_range(0, resoMax));
+    }
+
+    // DRIVE / BITS / SRATE: mostly left bypassed, occasionally a subtle
+    // touch — "no siempre", varied, kept professional rather than extreme.
+    fx_card_send_value(FX_CARD_DRIVE,
+        (fx_random_range(0, 4) == 0) ? fx_random_range(15, 55) : 0);
+    fx_card_send_value(FX_CARD_BITS,
+        (fx_random_range(0, 5) == 0) ? fx_random_range(20, 60) : 0);
+    fx_card_send_value(FX_CARD_SRATE,
+        (fx_random_range(0, 5) == 0) ? fx_random_range(15, 50) : 0);
+
+    fx_active_header_refresh();
+    ui_show_toast(filterType == 0 ? "RANDOM: FILTRO OFF" : "RANDOM: FILTRO APLICADO",
+                  RED808_CYAN);
+}
+
 static int fx_page_count(void) {
     int perPage = fx_view_modes[constrain(fx_view_mode, 0, FX_VIEW_MODE_COUNT - 1)];
     return (FX_CARD_COUNT + perPage - 1) / perPage;
@@ -5983,7 +6508,7 @@ static void create_fx_screen(void) {
 
     fx_active_lbl = lv_label_create(scr_fx);
     lv_label_set_text(fx_active_lbl, "ALL FX OFF");
-    lv_obj_set_size(fx_active_lbl, 210, 28);
+    lv_obj_set_size(fx_active_lbl, 140, 28);
     lv_obj_set_pos(fx_active_lbl, 342, 15);
     lv_label_set_long_mode(fx_active_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_font(fx_active_lbl, &lv_font_montserrat_12, 0);
@@ -5992,13 +6517,24 @@ static void create_fx_screen(void) {
 
     fx_all_off_btn = lv_btn_create(scr_fx);
     lv_obj_set_size(fx_all_off_btn, 136, 36);
-    lv_obj_set_pos(fx_all_off_btn, 560, 8);
+    lv_obj_set_pos(fx_all_off_btn, 490, 8);
     apply_control_button_style(fx_all_off_btn, RED808_ERROR, false, 8);
     lv_obj_add_event_cb(fx_all_off_btn, fx_all_off_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* allOffLabel = lv_label_create(fx_all_off_btn);
     lv_label_set_text(allOffLabel, "OFF ALL FX");
     lv_obj_set_style_text_font(allOffLabel, &lv_font_montserrat_12, 0);
     lv_obj_center(allOffLabel);
+
+    // ── RANDOM: tasteful global filter randomizer ──
+    lv_obj_t* fx_random_btn = lv_btn_create(scr_fx);
+    lv_obj_set_size(fx_random_btn, 66, 36);
+    lv_obj_set_pos(fx_random_btn, 634, 8);
+    apply_control_button_style(fx_random_btn, RED808_ACCENT2, false, 8);
+    lv_obj_add_event_cb(fx_random_btn, fx_random_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* randomLabel = lv_label_create(fx_random_btn);
+    lv_label_set_text(randomLabel, LV_SYMBOL_SHUFFLE);
+    lv_obj_set_style_text_font(randomLabel, &lv_font_montserrat_16, 0);
+    lv_obj_center(randomLabel);
 
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         // Card container
@@ -6958,6 +7494,23 @@ static const SequencerVariationOption SEQ_VARIATION_OPTIONS[] = {
     {SEQ_VAR_UNDO,          "UNDO LAST VAR",  "Restaura el estado anterior"},
 };
 
+struct SeqRandomStyleOption {
+    uint8_t id;
+    const char* name;
+};
+
+// "PLAY RANDOM": one tap on a style chip generates a brand new pattern for
+// the current slot (Euclidean rhythms, see control_apply_random_pattern).
+// Random depends on the chosen style, as requested.
+static const SeqRandomStyleOption SEQ_RANDOM_STYLE_OPTIONS[] = {
+    {RND_STYLE_TECHNO,    "TECHNO"},
+    {RND_STYLE_HOUSE,     "HOUSE"},
+    {RND_STYLE_BREAKBEAT, "BREAK"},
+    {RND_STYLE_HIPHOP,    "HIP-HOP"},
+    {RND_STYLE_TRAP,      "TRAP"},
+    {RND_STYLE_MINIMAL,   "MINIMAL"},
+};
+
 static void seq_variation_modal_hide(lv_event_t* e = NULL) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     if (seq_variation_modal) lv_obj_del(seq_variation_modal);
@@ -7004,6 +7557,43 @@ static void seq_variation_select_cb(lv_event_t* e) {
                   selected == SEQ_VAR_UNDO ? RED808_SUCCESS : RED808_CYAN);
 }
 
+static void seq_random_style_cb(lv_event_t* e) {
+    static uint32_t lastApplyMs = 0;
+    const uint32_t now = millis();
+    if (lastApplyMs != 0 && now - lastApplyMs < 180u) return;
+    lastApplyMs = now;
+
+    const uint8_t style = static_cast<uint8_t>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    if (style < RND_STYLE_TECHNO || style > RND_STYLE_MINIMAL) return;
+
+    const bool changed = control_apply_random_pattern(style);
+    if (!changed) {
+        ui_show_toast("No se pudo generar el patron", RED808_WARNING);
+        return;
+    }
+
+    const int base = seq_page * 16;
+    for (int track = 0; track < 16; ++track)
+        for (int step = 0; step < 16; ++step)
+            if (base + step < 64)
+                seq_raw_grid[track][base + step] = p4.steps[track][step];
+    seq_force_refresh_cells = true;
+    seq_set_pattern_dirty(true);
+
+    // Never perform a multi-packet upload from the LVGL callback. The loop
+    // drains this flag and sends one coherent pattern snapshot to Daisy.
+    s_ctrl_pattern_sync_pending.store(true, std::memory_order_release);
+    char feedback[32] = "RANDOM";
+    for (const auto& option : SEQ_RANDOM_STYLE_OPTIONS)
+        if (option.id == style) {
+            snprintf(feedback, sizeof(feedback), "RANDOM: %s", option.name);
+            break;
+        }
+    seq_variation_modal_hide();
+    ui_show_toast(feedback, RED808_CYAN);
+}
+
 static void seq_variation_modal_show(lv_event_t* /*e*/) {
     if (seq_variation_modal) return;
 
@@ -7018,7 +7608,7 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
                         LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(seq_variation_modal);
-    lv_obj_set_size(card, 950, 540);
+    lv_obj_set_size(card, 950, 556);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_border_width(card, 2, 0);
@@ -7039,6 +7629,37 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(hint, 24, 50);
+
+    // ── PLAY RANDOM: style chips generate a brand new pattern on tap ──
+    lv_obj_t* randomLabel = lv_label_create(card);
+    lv_label_set_text(randomLabel, "PLAY RANDOM - elige un estilo:");
+    lv_obj_set_style_text_font(randomLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(randomLabel, RED808_ACCENT2, 0);
+    lv_obj_set_pos(randomLabel, 24, 74);
+
+    {
+        constexpr int chipW = 142;
+        constexpr int chipH = 42;
+        constexpr int chipGap = 8;
+        constexpr int chipY = 96;
+        for (size_t index = 0;
+             index < sizeof(SEQ_RANDOM_STYLE_OPTIONS) / sizeof(SEQ_RANDOM_STYLE_OPTIONS[0]);
+             ++index) {
+            const auto& style = SEQ_RANDOM_STYLE_OPTIONS[index];
+            lv_obj_t* chip = lv_btn_create(card);
+            lv_obj_set_size(chip, chipW, chipH);
+            lv_obj_set_pos(chip, 24 + static_cast<int>(index) * (chipW + chipGap), chipY);
+            apply_control_button_style(chip, RED808_ACCENT2, false, 10);
+            lv_obj_add_event_cb(chip, seq_random_style_cb, LV_EVENT_CLICKED,
+                                reinterpret_cast<void*>(
+                                    static_cast<uintptr_t>(style.id)));
+            lv_obj_t* chipLabel = lv_label_create(chip);
+            lv_label_set_text(chipLabel, style.name);
+            lv_obj_set_style_text_font(chipLabel, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(chipLabel, lv_color_white(), 0);
+            lv_obj_center(chipLabel);
+        }
+    }
 
     lv_obj_t* close = lv_btn_create(card);
     lv_obj_set_size(close, 92, 38);
@@ -7067,7 +7688,7 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
         lv_obj_t* button = lv_btn_create(card);
         lv_obj_set_size(button, buttonWidth, buttonHeight);
         lv_obj_set_pos(button, 24 + column * (buttonWidth + gapX),
-                       88 + row * (buttonHeight + gapY));
+                       156 + row * (buttonHeight + gapY));
         apply_control_button_style(button,
             option.id == SEQ_VAR_UNDO ? RED808_SUCCESS : RED808_ACCENT2,
             false, 12);
