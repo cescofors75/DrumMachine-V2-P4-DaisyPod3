@@ -1285,37 +1285,45 @@ struct BarClock
 {
     bool active = false;
     uint8_t bars = 4;
-    int elapsed = 0;
-    int lastStep = -1;
+    uint32_t windowStartMs = 0;
+    bool windowOpen = false;
 };
 BarClock songClock;
 BarClock fxClock;
 BarClock mixClock;
 uint8_t songStyle = RND_STYLE_TECHNO;
 
-// Returns true exactly once, the tick a bar boundary crosses the `bars`
-// threshold while playing. Resets cleanly whenever playback stops so a
-// later resume starts counting from zero instead of firing immediately.
+// Wall-clock bar timer (derived from the current BPM), not a step-sample
+// comparison: sampling p4.current_step once per control_process() tick is
+// only as fresh as the last USB position poll, and a single missed sample
+// (e.g. the main loop briefly busy drawing) silently drops a whole bar —
+// invisible at bars=1 (any later wrap still fires immediately) but
+// compounds badly at bars=2/4/8, which need several *consecutive* correct
+// samples in a row. Real elapsed time doesn't have that failure mode.
 bool barClockTick(BarClock& c)
 {
     if(!c.active || !p4.is_playing)
     {
-        c.lastStep = -1;
+        c.windowOpen = false;
         return false;
     }
-    const int step = p4.current_step;
-    bool fired = false;
-    if(c.lastStep >= 0 && step < c.lastStep)
+    const uint32_t now = millis();
+    if(!c.windowOpen)
     {
-        c.elapsed++;
-        if(c.elapsed >= (int)c.bars)
-        {
-            c.elapsed = 0;
-            fired = true;
-        }
+        c.windowStartMs = now;
+        c.windowOpen = true;
+        return false;
     }
-    c.lastStep = step;
-    return fired;
+    const float bpm = p4.bpm_int + p4.bpm_frac / 10.0f;
+    if(bpm < 20.0f) return false;   // guard against a garbage/unset tempo
+    const uint32_t barMs = (uint32_t)(240000.0f / bpm);   // ms per 16-step bar
+    const uint32_t targetMs = barMs * (uint32_t)(c.bars < 1 ? 1 : c.bars);
+    if(now - c.windowStartMs >= targetMs)
+    {
+        c.windowStartMs = now;
+        return true;
+    }
+    return false;
 }
 
 // Case-insensitive substring search. Avoids relying on strcasestr (a GNU
@@ -1393,8 +1401,7 @@ void triggerRandomSongJump()
 void control_random_song_set_active(bool active)
 {
     songClock.active = active;
-    songClock.elapsed = 0;
-    songClock.lastStep = -1;
+    songClock.windowOpen = false;
 }
 bool control_random_song_active() { return songClock.active; }
 void control_random_song_set_style(uint8_t style)
@@ -1411,8 +1418,7 @@ uint8_t control_random_song_bars() { return songClock.bars; }
 void control_random_fx_set_active(bool active)
 {
     fxClock.active = active;
-    fxClock.elapsed = 0;
-    fxClock.lastStep = -1;
+    fxClock.windowOpen = false;
 }
 bool control_random_fx_active() { return fxClock.active; }
 void control_random_fx_set_bars(uint8_t bars)
@@ -1424,8 +1430,7 @@ uint8_t control_random_fx_bars() { return fxClock.bars; }
 void control_random_mix_set_active(bool active)
 {
     mixClock.active = active;
-    mixClock.elapsed = 0;
-    mixClock.lastStep = -1;
+    mixClock.windowOpen = false;
 }
 bool control_random_mix_active() { return mixClock.active; }
 void control_random_mix_set_bars(uint8_t bars)
