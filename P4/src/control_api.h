@@ -105,6 +105,12 @@ void control_cancel_midi_song();
 void control_send_unload_daisy(uint8_t pad);
 void control_send_set_step(int track, int step, bool active);
 void control_send_set_step_velocity(int track, int step, int velocity);
+// EVOLVE groundwork — the probability field already exists end-to-end
+// (PatternData/Sequencer, CMD_DSQ_SET_STEP wire payload, DaisyPod3's
+// sample-accurate dice roll at trigger time); this is just the missing
+// live single-step setter/getter pair so the UI can finally reach it.
+void control_send_set_step_probability(int track, int step, int probability);
+uint8_t control_get_step_probability(int track, int step);
 void control_send_mute(int track, bool muted);
 void control_send_set_volume(int value);
 void control_send_set_seq_volume(int value);

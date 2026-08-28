@@ -7553,6 +7553,7 @@ static void create_fx_xy_screen(void) {
 // =============================================================================
 static lv_obj_t* seq_step_btns[16][16]  = {};
 static lv_obj_t* seq_step_accents[16][16] = {};  // bottom velocity strip per cell
+static lv_obj_t* seq_step_prob_dot[16][16] = {}; // top-right dot: step probability < 100%
 static lv_obj_t* seq_track_labels[16]   = {};
 static lv_obj_t* seq_mute_btns[16]      = {};
 static lv_obj_t* seq_solo_btns[16]      = {};
@@ -8504,6 +8505,120 @@ static void seq_step_cb(lv_event_t* e) {
     }
 }
 
+// ── STEP PROBABILITY popup (EVOLVE groundwork) ──────────────────────────
+// Long-press a step cell to tune how often it actually fires — the engine
+// already rolls this dice sample-accurately on DaisyPod3 at trigger time
+// (used for years to author the factory patterns); this is the first UI
+// that lets the user reach it on their own patterns.
+static lv_obj_t* seq_step_prob_modal = NULL;
+static lv_obj_t* seq_step_prob_title = NULL;
+static lv_obj_t* seq_step_prob_btns[5] = {};
+static int8_t    seq_step_prob_track = -1;
+static int8_t    seq_step_prob_step = -1;
+static const uint8_t SEQ_STEP_PROB_OPTIONS[5] = {100, 75, 50, 25, 10};
+
+static void seq_step_prob_dot_refresh(int track, int step) {
+    if (track < 0 || track >= 16 || step < 0 || step >= 16) return;
+    lv_obj_t* dot = seq_step_prob_dot[track][step];
+    if (!dot) return;
+    if (control_get_step_probability(track, step) >= 100)
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void seq_step_prob_modal_refresh(void) {
+    if (!seq_step_prob_modal || seq_step_prob_track < 0) return;
+    if (seq_step_prob_title)
+        lv_label_set_text_fmt(seq_step_prob_title, "%s - STEP %02d - PROBABILIDAD",
+                              trackNames[seq_step_prob_track], seq_step_prob_step + 1);
+    const uint8_t current = control_get_step_probability(seq_step_prob_track, seq_step_prob_step);
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t* btn = seq_step_prob_btns[i];
+        if (!btn) continue;
+        const bool sel = SEQ_STEP_PROB_OPTIONS[i] == current;
+        apply_control_button_style(btn, sel ? RED808_WARNING : RED808_BORDER, false, 8);
+    }
+}
+
+static void seq_step_prob_modal_hide(lv_event_t* e = NULL) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (seq_step_prob_modal) lv_obj_del(seq_step_prob_modal);
+    seq_step_prob_modal = NULL;
+    seq_step_prob_title = NULL;
+    for (int i = 0; i < 5; i++) seq_step_prob_btns[i] = NULL;
+    seq_step_prob_track = -1;
+    seq_step_prob_step = -1;
+}
+
+static void seq_step_prob_btn_cb(lv_event_t* e) {
+    if (seq_step_prob_track < 0 || seq_step_prob_step < 0) return;
+    const int probability = (int)(intptr_t)lv_event_get_user_data(e);
+    control_send_set_step_probability(seq_step_prob_track, seq_step_prob_step, probability);
+    seq_step_prob_dot_refresh(seq_step_prob_track, seq_step_prob_step);
+    seq_step_prob_modal_refresh();
+}
+
+static void seq_step_long_press_cb(lv_event_t* e) {
+    if (seq_step_prob_modal) return;
+    const int data = (int)(intptr_t)lv_event_get_user_data(e);
+    const int track = (data >> 8) & 0xFF;
+    const int step  = data & 0xFF;
+    if (track >= 16 || step >= 16) return;
+    seq_step_prob_track = (int8_t)track;
+    seq_step_prob_step  = (int8_t)step;
+
+    seq_step_prob_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(seq_step_prob_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(seq_step_prob_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(seq_step_prob_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(seq_step_prob_modal, 0, 0);
+    lv_obj_set_style_pad_all(seq_step_prob_modal, 0, 0);
+    lv_obj_clear_flag(seq_step_prob_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(seq_step_prob_modal, seq_step_prob_modal_hide, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(seq_step_prob_modal);
+    lv_obj_set_size(card, 420, 220);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_WARNING, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    seq_step_prob_title = lv_label_create(card);
+    lv_obj_set_style_text_font(seq_step_prob_title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(seq_step_prob_title, RED808_WARNING, 0);
+    lv_obj_set_pos(seq_step_prob_title, 0, 0);
+
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t* btn = lv_btn_create(card);
+        seq_step_prob_btns[i] = btn;
+        lv_obj_set_size(btn, 70, 52);
+        lv_obj_set_pos(btn, i * (70 + 8), 44);
+        lv_obj_add_event_cb(btn, seq_step_prob_btn_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)SEQ_STEP_PROB_OPTIONS[i]);
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_label_set_text_fmt(lbl, "%d%%", SEQ_STEP_PROB_OPTIONS[i]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_center(lbl);
+    }
+
+    lv_obj_t* closeBtn = lv_btn_create(card);
+    lv_obj_set_size(closeBtn, 388, 40);
+    lv_obj_set_pos(closeBtn, 0, 108);
+    apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
+    lv_obj_add_event_cb(closeBtn, seq_step_prob_modal_hide, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "CERRAR");
+    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(closeLbl);
+
+    seq_step_prob_modal_refresh();
+}
+
 static void seq_mute_cb(lv_event_t* e) {
     int track = (int)(intptr_t)lv_event_get_user_data(e);
     if (track < 16) {
@@ -8657,6 +8772,12 @@ void ui_sequencer_sync_from_current_pattern(void) {
     // A different pattern slot became authoritative — including the jumps
     // RANDOM SONG itself makes. Keep the VAR button's indicator in sync.
     seq_var_btn_refresh();
+    // Probability isn't part of p4.steps/prev_cell_key, so it needs its own
+    // explicit refresh here — deliberately NOT polled per-frame (see the
+    // comment at seq_step_prob_dot's creation).
+    for (int t = 0; t < 16; t++)
+        for (int s = 0; s < 16; s++)
+            seq_step_prob_dot_refresh(t, s);
 }
 
 void ui_sequencer_load_external_pattern(const bool steps[16][64], int raw_len) {
@@ -8673,6 +8794,9 @@ void ui_sequencer_load_external_pattern(const bool steps[16][64], int raw_len) {
     seq_force_refresh_cells = true;  // force full cell repaint — prev_cell_key may be stale
     seq_page_styles_dirty = true;
     seq_pattern_dirty = true;
+    for (int t = 0; t < 16; t++)
+        for (int s = 0; s < 16; s++)
+            seq_step_prob_dot_refresh(t, s);
 }
 
 static void create_sequencer_screen(void) {
@@ -8952,6 +9076,29 @@ static void create_sequencer_screen(void) {
                 lv_obj_clear_flag(accent, LV_OBJ_FLAG_CLICKABLE);
                 if (!act) lv_obj_add_flag(accent, LV_OBJ_FLAG_HIDDEN);
             }
+
+            // EVOLVE groundwork: small corner dot flags a step whose
+            // probability was tuned below 100% (long-press to edit).
+            // Refreshed here at construction and again whenever a pattern
+            // becomes authoritative (ui_sequencer_sync_from_current_pattern) —
+            // never polled per-frame, since it needs a Sequencer getter call.
+            {
+                lv_obj_t* dot = lv_obj_create(seq_step_btns[t][s]);
+                seq_step_prob_dot[t][s] = dot;
+                lv_obj_set_size(dot, 8, 8);
+                lv_obj_align(dot, LV_ALIGN_TOP_RIGHT, 1, 1);
+                lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+                lv_obj_set_style_bg_color(dot, RED808_WARNING, 0);
+                lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+                lv_obj_set_style_border_width(dot, 0, 0);
+                lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+                if (control_get_step_probability(t, s) >= 100)
+                    lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            lv_obj_add_event_cb(seq_step_btns[t][s], seq_step_long_press_cb,
+                                LV_EVENT_LONG_PRESSED, (void*)(intptr_t)((t << 8) | s));
         }
 
         // ── Instrument FX button (idea 2) — opens the per-pad filter/FX
@@ -15000,6 +15147,7 @@ static void ui_reload_themed_screens(void) {
         for (int j = 0; j < 16; j++) {
             seq_step_btns[i][j] = NULL;
             seq_step_accents[i][j] = NULL;
+            seq_step_prob_dot[i][j] = NULL;
         }
         seq_track_labels[i] = NULL; seq_mute_btns[i] = NULL;
         seq_solo_btns[i] = NULL;
@@ -15009,6 +15157,11 @@ static void ui_reload_themed_screens(void) {
         seq_ruler_labels[i] = NULL;
     }
     for (int b = 0; b < 4; b++) seq_beat_bg[b] = NULL;
+    seq_step_prob_modal = NULL;
+    seq_step_prob_title = NULL;
+    for (int i = 0; i < 5; i++) seq_step_prob_btns[i] = NULL;
+    seq_step_prob_track = -1;
+    seq_step_prob_step = -1;
     s_seq_midi_badge = NULL;
     seq_playhead_line = NULL;
     seq_status_step_lbl = NULL;

@@ -1679,6 +1679,26 @@ void control_send_set_step_velocity(int track, int step, int velocity)
                      p4.steps[track][step], static_cast<uint8_t>(velocity));
 }
 
+void control_send_set_step_probability(int track, int step, int probability)
+{
+    if(track < 0 || track >= 16 || step < 0 || step >= 16) return;
+    probability = Clamp(probability, 0, 100);
+    Sequencer& sequencer = SequencerInstance();
+    sequencer.setStepProbability(p4.current_pattern, track, step, (uint8_t)probability);
+    uint8_t velocity = sequencer.getStepVelocity(p4.current_pattern, track, step);
+    if(velocity == 0) velocity = 100;
+    uint8_t noteLenDiv = sequencer.getStepNoteLen(p4.current_pattern, track, step);
+    if(noteLenDiv == 0) noteLenDiv = 1;
+    daisyUsb.setStep(activeDaisyPattern, track, step, p4.steps[track][step],
+                     velocity, noteLenDiv, (uint8_t)probability);
+}
+
+uint8_t control_get_step_probability(int track, int step)
+{
+    if(track < 0 || track >= 16 || step < 0 || step >= 16) return 100;
+    return SequencerInstance().getStepProbability(p4.current_pattern, track, step);
+}
+
 void control_send_mute(int track, bool muted)
 {
     if(track < 0 || track >= 16) return;
