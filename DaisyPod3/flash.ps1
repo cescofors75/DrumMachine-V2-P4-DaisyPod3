@@ -35,6 +35,15 @@ if(-not (Test-Path -LiteralPath $firmware)) {
     throw "No existe el firmware: $firmware"
 }
 
+# dfu-util escribe avisos normales ('Invalid DFU suffix signature') en stderr y
+# con $ErrorActionPreference='Stop' eso aborta el script. Aislamos cada llamada.
+function Invoke-Dfu {
+    param([string]$Exe, [string[]]$Arguments)
+    $ErrorActionPreference = 'Continue'
+    $output = (& $Exe @Arguments 2>&1 | Out-String)
+    return [pscustomobject]@{ Output = $output; ExitCode = $LASTEXITCODE }
+}
+
 $dfuCandidates = @(
     'C:\Espressif\tools\dfu-util\0.11\dfu-util-0.11-win64\dfu-util.exe',
     'C:\msys64\mingw64\bin\dfu-util.exe',
@@ -43,9 +52,14 @@ $dfuCandidates = @(
 $dfuCommand = Get-Command dfu-util.exe -ErrorAction SilentlyContinue
 if($dfuCommand) { $dfuCandidates += $dfuCommand.Source }
 $dfu = $dfuCandidates | Where-Object { Test-Path -LiteralPath $_ } |
+    Where-Object {
+        # Un dfu-util con DLL rotas (p.ej. el de MSYS2 sin libwinpthread-1.dll)
+        # sale sin imprimir nada y haria fallar la deteccion con un timeout.
+        (Invoke-Dfu -Exe $_ -Arguments @('-V')).Output -match 'dfu-util'
+    } |
     Select-Object -First 1
 if(-not $dfu) {
-    throw 'No se encontro dfu-util 0.11 para flashear DaisyPod3.'
+    throw 'No se encontro un dfu-util 0.11 funcional para flashear DaisyPod3.'
 }
 
 $token = [Guid]::NewGuid().ToString('N')
@@ -66,7 +80,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $dfuDevices = ''
     while([DateTime]::UtcNow -lt $deadline) {
-        $dfuDevices = (& $dfu -l -d '0483:df11' 2>&1 | Out-String)
+        $dfuDevices = (Invoke-Dfu -Exe $dfu -Arguments @('-l', '-d', '0483:df11')).Output
         if($dfuDevices -match 'Found DFU:') { break }
         Start-Sleep -Milliseconds 200
     }
@@ -88,8 +102,10 @@ try {
             # resets immediately and Windows removes it before dfu-util can
             # read the final status, producing "Error during download
             # get_status" even though all bytes were written successfully.
-            $bootOutput = (& $dfu -a 0 -s '0x08000000' -D $bootloader -d '0483:df11' 2>&1 | Out-String)
-            $bootExitCode = $LASTEXITCODE
+            $bootResult = Invoke-Dfu -Exe $dfu -Arguments @(
+                '-a', '0', '-s', '0x08000000', '-D', $bootloader, '-d', '0483:df11')
+            $bootOutput = $bootResult.Output
+            $bootExitCode = $bootResult.ExitCode
             if($bootOutput) { Write-Host $bootOutput.Trim() }
             $bootDownloadComplete =
                 $bootOutput -match 'Download done' -and
@@ -110,7 +126,7 @@ try {
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
         do {
             Start-Sleep -Milliseconds 200
-            $dfuDevices = (& $dfu -l -d '0483:df11' 2>&1 | Out-String)
+            $dfuDevices = (Invoke-Dfu -Exe $dfu -Arguments @('-l', '-d', '0483:df11')).Output
         } while($dfuDevices -notmatch '0x900[0-9A-Fa-f]+' -and [DateTime]::UtcNow -lt $deadline)
 
         if($dfuDevices -notmatch '0x900[0-9A-Fa-f]+') {
