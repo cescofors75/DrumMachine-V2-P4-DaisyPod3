@@ -78,3 +78,10 @@ void ui_external_pad_flash(uint8_t pad, uint8_t velocity);
 // Safe to call from any task: the payload is latched and applied to the
 // LVGL widgets from the LVGL task.
 void ui_pad_sound_sync_track_engines(const int8_t engines[16]);
+
+// Applies one random FX LAB filter/cutoff/reso/drive/bits/srate pass and one
+// random MIXER rebalance, respectively — the same logic the manual RANDOM
+// buttons run on tap. Exposed so control_random_auto_tick() (control_api.cpp)
+// can call them from AUTO FX / AUTO MIX without any LVGL event to hand it.
+void fx_random_apply(void);
+void mix_random_apply(void);

@@ -5840,6 +5840,153 @@ static void update_live_screen(void) {
 }
 
 // =============================================================================
+// Generic "AUTO" popup — shared by FX LAB's RANDOM and MIXER's RANDOM MIX.
+// Lets the user pick a bar cadence, flip AUTO on/off (re-applies every N
+// bars while the sequencer plays, via control_random_auto_tick() in
+// control_api.cpp), or just APPLY NOW once without turning AUTO on.
+// =============================================================================
+struct AutoModalConfig {
+    const char* title;
+    bool (*isActive)();
+    void (*setActive)(bool);
+    uint8_t (*getBars)();
+    void (*setBars)(uint8_t);
+    void (*applyNow)();
+};
+
+static lv_obj_t*      s_auto_modal            = NULL;
+static lv_obj_t*      s_auto_modal_bars_btns[4] = {};
+static lv_obj_t*      s_auto_modal_toggle_btn  = NULL;
+static AutoModalConfig s_auto_modal_cfg = {};
+static const uint8_t  AUTO_MODAL_BAR_OPTIONS[4] = {1, 2, 4, 8};
+
+static void auto_modal_refresh(void) {
+    if (!s_auto_modal) return;
+    const uint8_t bars = s_auto_modal_cfg.getBars();
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t* btn = s_auto_modal_bars_btns[i];
+        if (!btn) continue;
+        const bool sel = AUTO_MODAL_BAR_OPTIONS[i] == bars;
+        apply_control_button_style(btn, sel ? RED808_ACCENT : RED808_BORDER, false, 8);
+    }
+    if (s_auto_modal_toggle_btn) {
+        const bool active = s_auto_modal_cfg.isActive();
+        apply_control_button_style(s_auto_modal_toggle_btn,
+            active ? RED808_SUCCESS : RED808_BORDER, false, 10);
+        lv_obj_t* lbl = lv_obj_get_child(s_auto_modal_toggle_btn, 0);
+        if (lbl) lv_label_set_text(lbl,
+            active ? LV_SYMBOL_OK "  AUTO: ON" : LV_SYMBOL_CLOSE "  AUTO: OFF");
+    }
+}
+
+static void auto_modal_close_cb(lv_event_t* e = NULL) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_auto_modal) {
+        lv_obj_del(s_auto_modal);
+        s_auto_modal = NULL;
+        for (int i = 0; i < 4; i++) s_auto_modal_bars_btns[i] = NULL;
+        s_auto_modal_toggle_btn = NULL;
+    }
+}
+
+static void auto_modal_bars_cb(lv_event_t* e) {
+    const int bars = (int)(intptr_t)lv_event_get_user_data(e);
+    s_auto_modal_cfg.setBars((uint8_t)bars);
+    auto_modal_refresh();
+}
+
+static void auto_modal_toggle_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    s_auto_modal_cfg.setActive(!s_auto_modal_cfg.isActive());
+    auto_modal_refresh();
+}
+
+static void auto_modal_apply_now_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_auto_modal_cfg.applyNow) s_auto_modal_cfg.applyNow();
+}
+
+static void auto_modal_show(const AutoModalConfig& cfg) {
+    if (s_auto_modal) return;
+    s_auto_modal_cfg = cfg;
+
+    s_auto_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_auto_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_auto_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_auto_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_auto_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_auto_modal, 0, 0);
+    lv_obj_clear_flag(s_auto_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_auto_modal, auto_modal_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_auto_modal);
+    lv_obj_set_size(card, 420, 300);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, cfg.title);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 0, 0);
+
+    lv_obj_t* barsLbl = lv_label_create(card);
+    lv_label_set_text(barsLbl, "CADA CUANTOS COMPASES:");
+    lv_obj_set_style_text_font(barsLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(barsLbl, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(barsLbl, 0, 42);
+
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t* btn = lv_btn_create(card);
+        s_auto_modal_bars_btns[i] = btn;
+        lv_obj_set_size(btn, 86, 40);
+        lv_obj_set_pos(btn, i * (86 + 8), 64);
+        lv_obj_add_event_cb(btn, auto_modal_bars_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)AUTO_MODAL_BAR_OPTIONS[i]);
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_label_set_text_fmt(lbl, "%d", AUTO_MODAL_BAR_OPTIONS[i]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_center(lbl);
+    }
+
+    s_auto_modal_toggle_btn = lv_btn_create(card);
+    lv_obj_set_size(s_auto_modal_toggle_btn, 388, 52);
+    lv_obj_set_pos(s_auto_modal_toggle_btn, 0, 120);
+    lv_obj_add_event_cb(s_auto_modal_toggle_btn, auto_modal_toggle_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* toggleLbl = lv_label_create(s_auto_modal_toggle_btn);
+    lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(toggleLbl);
+
+    lv_obj_t* applyBtn = lv_btn_create(card);
+    lv_obj_set_size(applyBtn, 388, 44);
+    lv_obj_set_pos(applyBtn, 0, 182);
+    apply_control_button_style(applyBtn, RED808_INFO, false, 10);
+    lv_obj_add_event_cb(applyBtn, auto_modal_apply_now_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* applyLbl = lv_label_create(applyBtn);
+    lv_label_set_text(applyLbl, LV_SYMBOL_SHUFFLE "  APLICAR AHORA");
+    lv_obj_set_style_text_font(applyLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(applyLbl);
+
+    lv_obj_t* closeBtn = lv_btn_create(card);
+    lv_obj_set_size(closeBtn, 388, 40);
+    lv_obj_set_pos(closeBtn, 0, 236);
+    apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
+    lv_obj_add_event_cb(closeBtn, auto_modal_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "CERRAR");
+    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(closeLbl);
+
+    auto_modal_refresh();
+}
+
+// =============================================================================
 // FX LAB SCREEN — dynamic grid with 12 available cards and view modes 3/6/9/12
 // =============================================================================
 enum FxCardKind : uint8_t {
@@ -5880,9 +6027,6 @@ static lv_obj_t* fx_pattern_lbl                = NULL;
 static lv_obj_t* fx_active_lbl                 = NULL;
 static lv_obj_t* fx_all_off_btn                = NULL;
 static lv_obj_t* s_fx_random_btn               = NULL;
-// True while the FX LAB filter/cutoff/reso/drive/bits/srate block is still
-// exactly what the last RANDOM tap produced (cleared by OFF ALL FX).
-static bool      s_fx_random_active            = false;
 static bool s_fx_ui_syncing = false;
 static uint32_t s_fx_toggle_last_ms[FX_CARD_COUNT] = {};
 static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX buttons
@@ -6236,13 +6380,14 @@ static void fx_card_turn_off(int cell) {
     }
 }
 
-// Reflects s_fx_random_active on the RANDOM button: highlighted while the
-// filter block still matches the last RANDOM tap, plain shuffle icon once
-// OFF ALL FX (or another RANDOM tap) moves past it.
+// Reflects AUTO FX (control_random_fx_active()) on the RANDOM button:
+// highlighted while AUTO keeps re-randomizing every few bars, plain
+// shuffle icon otherwise. Manual one-shot taps no longer change this —
+// see fx_random_modal_show / the AUTO popup.
 static void fx_random_btn_refresh(void) {
     if (!s_fx_random_btn) return;
     apply_control_button_style(s_fx_random_btn,
-        s_fx_random_active ? RED808_SUCCESS : RED808_ACCENT2, false, 8);
+        control_random_fx_active() ? RED808_SUCCESS : RED808_ACCENT2, false, 8);
 }
 
 static void fx_all_turn_off(void) {
@@ -6251,7 +6396,7 @@ static void fx_all_turn_off(void) {
         s_fx_arc_anim[cell] = 0.0f;
     control_mark_fx_screen_dirty();
     fx_active_header_refresh();
-    s_fx_random_active = false;
+    control_random_fx_set_active(false);
     fx_random_btn_refresh();
 }
 
@@ -6272,9 +6417,11 @@ static int fx_random_range(int mn, int mx) {
     return mn + (int)(fx_random_rand_u32() % (uint32_t)(mx - mn + 1));
 }
 
-static void fx_random_cb(lv_event_t* e) {
-    LV_UNUSED(e);
-
+// Applies one random filter/cutoff/reso/drive/bits/srate pass. Called both
+// by a manual tap on the RANDOM button and by AUTO FX's bar clock
+// (control_random_auto_tick(), control_api.cpp) — one implementation of
+// what "random" means for the FX LAB, regardless of who triggers it.
+void fx_random_apply(void) {
     // FILTER model: weighted toward musical, commonly-useful types, with a
     // real chance of landing back on OFF so RANDOM does not always engage
     // a filter.
@@ -6312,10 +6459,25 @@ static void fx_random_cb(lv_event_t* e) {
         (fx_random_range(0, 5) == 0) ? fx_random_range(15, 50) : 0);
 
     fx_active_header_refresh();
-    s_fx_random_active = true;
-    fx_random_btn_refresh();
     ui_show_toast(filterType == 0 ? "RANDOM: FILTRO OFF" : "RANDOM: FILTRO APLICADO",
                   RED808_CYAN);
+}
+
+static void fx_random_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    fx_random_apply();
+}
+
+// Tapping the RANDOM button opens the AUTO FX popup (cadence + on/off +
+// "apply now") instead of applying directly, so AUTO mode is reachable
+// without hunting for a separate control.
+static void fx_random_modal_show(lv_event_t* e) {
+    LV_UNUSED(e);
+    static const AutoModalConfig cfg = {
+        "AUTO FX", control_random_fx_active, control_random_fx_set_active,
+        control_random_fx_bars, control_random_fx_set_bars, fx_random_apply
+    };
+    auto_modal_show(cfg);
 }
 
 static int fx_page_count(void) {
@@ -6579,7 +6741,7 @@ static void create_fx_screen(void) {
     s_fx_random_btn = lv_btn_create(scr_fx);
     lv_obj_set_size(s_fx_random_btn, 66, 36);
     lv_obj_set_pos(s_fx_random_btn, 634, 8);
-    lv_obj_add_event_cb(s_fx_random_btn, fx_random_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_fx_random_btn, fx_random_modal_show, LV_EVENT_CLICKED, NULL);
     lv_obj_t* randomLabel = lv_label_create(s_fx_random_btn);
     lv_label_set_text(randomLabel, LV_SYMBOL_SHUFFLE);
     lv_obj_set_style_text_font(randomLabel, &lv_font_montserrat_16, 0);
@@ -7196,11 +7358,9 @@ static lv_obj_t*  seq_hdr_queue_btn     = NULL;
 static lv_obj_t*  seq_hdr_queue_lbl     = NULL;
 static lv_obj_t*  seq_hdr_var_btn       = NULL;
 static lv_obj_t*  seq_variation_modal   = NULL;
-// -1 = current pattern is not a PLAY RANDOM result (or was hand-edited/
-// transformed/undone since). Otherwise holds the RND_STYLE_* id that
-// generated it, so the VAR button and its modal can show it persistently
-// instead of just a toast that disappears.
-static int8_t     seq_last_random_style = -1;
+static lv_obj_t*  seq_song_style_btns[6] = {};
+static lv_obj_t*  seq_song_bars_btns[4]  = {};
+static lv_obj_t*  seq_song_toggle_btn    = NULL;
 static lv_obj_t*  seq_hdr_mix_btn       = NULL;
 static lv_obj_t*  seq_hdr_mix_lbl       = NULL;
 static lv_obj_t*  seq_hdr_save_btn      = NULL;
@@ -7556,9 +7716,9 @@ struct SeqRandomStyleOption {
     const char* name;
 };
 
-// "PLAY RANDOM": one tap on a style chip generates a brand new pattern for
-// the current slot (Euclidean rhythms, see control_apply_random_pattern).
-// Random depends on the chosen style, as requested.
+// RANDOM SONG's style names/short labels. The style only steers which
+// existing pattern gets picked (see control_random_song_*); it never
+// generates new step data.
 static const SeqRandomStyleOption SEQ_RANDOM_STYLE_OPTIONS[] = {
     {RND_STYLE_TECHNO,    "TECHNO"},
     {RND_STYLE_HOUSE,     "HOUSE"},
@@ -7568,28 +7728,30 @@ static const SeqRandomStyleOption SEQ_RANDOM_STYLE_OPTIONS[] = {
     {RND_STYLE_MINIMAL,   "MINIMAL"},
 };
 
-// Reflects seq_last_random_style on the VAR button itself: a shuffle icon
-// and accent color while the current pattern is still exactly what PLAY
-// RANDOM produced, plain "VAR" otherwise. Also usable from the modal.
-static void seq_var_btn_refresh(void) {
-    if (!seq_hdr_var_btn) return;
-    const bool active = seq_last_random_style >= RND_STYLE_TECHNO
-        && seq_last_random_style <= RND_STYLE_MINIMAL;
-    apply_control_button_style(seq_hdr_var_btn, active ? RED808_ACCENT2 : RED808_CYAN, false, 7);
-    lv_obj_t* lbl = lv_obj_get_child(seq_hdr_var_btn, 0);
-    if (lbl) lv_label_set_text(lbl, active ? LV_SYMBOL_SHUFFLE " VAR" : "VAR");
-}
-
 static const char* seq_random_style_name(int8_t style) {
     for (const auto& option : SEQ_RANDOM_STYLE_OPTIONS)
         if (option.id == style) return option.name;
     return nullptr;
 }
 
+// Reflects RANDOM SONG (control_random_song_active()) on the VAR button
+// itself: a shuffle icon and accent color while the mode keeps jumping
+// between saved patterns every few bars, plain "VAR" otherwise.
+static void seq_var_btn_refresh(void) {
+    if (!seq_hdr_var_btn) return;
+    const bool active = control_random_song_active();
+    apply_control_button_style(seq_hdr_var_btn, active ? RED808_ACCENT2 : RED808_CYAN, false, 7);
+    lv_obj_t* lbl = lv_obj_get_child(seq_hdr_var_btn, 0);
+    if (lbl) lv_label_set_text(lbl, active ? LV_SYMBOL_SHUFFLE " VAR" : "VAR");
+}
+
 static void seq_variation_modal_hide(lv_event_t* e = NULL) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     if (seq_variation_modal) lv_obj_del(seq_variation_modal);
     seq_variation_modal = NULL;
+    for (int i = 0; i < 6; i++) seq_song_style_btns[i] = NULL;
+    for (int i = 0; i < 4; i++) seq_song_bars_btns[i] = NULL;
+    seq_song_toggle_btn = NULL;
 }
 
 static void seq_variation_select_cb(lv_event_t* e) {
@@ -7627,49 +7789,59 @@ static void seq_variation_select_cb(lv_event_t* e) {
     const char* feedback = "VAR APLICADA";
     for (const auto& option : SEQ_VARIATION_OPTIONS)
         if (option.id == selected) { feedback = option.name; break; }
-    // A hand-picked transform (or undoing one) means the pattern is no
-    // longer "exactly what PLAY RANDOM produced" — drop the indicator.
-    seq_last_random_style = -1;
-    seq_var_btn_refresh();
     seq_variation_modal_hide();
     ui_show_toast(feedback,
                   selected == SEQ_VAR_UNDO ? RED808_SUCCESS : RED808_CYAN);
 }
 
-static void seq_random_style_cb(lv_event_t* e) {
-    static uint32_t lastApplyMs = 0;
-    const uint32_t now = millis();
-    if (lastApplyMs != 0 && now - lastApplyMs < 180u) return;
-    lastApplyMs = now;
+// ── RANDOM SONG controls: style select + bar cadence + on/off toggle ──────
+static void seq_song_controls_refresh(void) {
+    const uint8_t style = control_random_song_style();
+    const uint8_t bars = control_random_song_bars();
+    const bool active = control_random_song_active();
+    for (size_t i = 0; i < sizeof(SEQ_RANDOM_STYLE_OPTIONS) / sizeof(SEQ_RANDOM_STYLE_OPTIONS[0]); ++i) {
+        lv_obj_t* chip = seq_song_style_btns[i];
+        if (!chip) continue;
+        const bool sel = SEQ_RANDOM_STYLE_OPTIONS[i].id == style;
+        apply_control_button_style(chip, sel ? RED808_ACCENT2 : RED808_BORDER, false, 10);
+    }
+    static const uint8_t barOptions[4] = {1, 2, 4, 8};
+    for (int i = 0; i < 4; ++i) {
+        lv_obj_t* chip = seq_song_bars_btns[i];
+        if (!chip) continue;
+        apply_control_button_style(chip, barOptions[i] == bars ? RED808_ACCENT2 : RED808_BORDER, false, 8);
+    }
+    if (seq_song_toggle_btn) {
+        apply_control_button_style(seq_song_toggle_btn,
+            active ? RED808_SUCCESS : RED808_BORDER, false, 10);
+        lv_obj_t* lbl = lv_obj_get_child(seq_song_toggle_btn, 0);
+        if (lbl) lv_label_set_text(lbl,
+            active ? LV_SYMBOL_OK "  RANDOM SONG: ON" : LV_SYMBOL_CLOSE "  RANDOM SONG: OFF");
+    }
+    seq_var_btn_refresh();
+}
 
+static void seq_song_style_cb(lv_event_t* e) {
     const uint8_t style = static_cast<uint8_t>(
         reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
-    if (style < RND_STYLE_TECHNO || style > RND_STYLE_MINIMAL) return;
+    control_random_song_set_style(style);
+    seq_song_controls_refresh();
+}
 
-    const bool changed = control_apply_random_pattern(style);
-    if (!changed) {
-        ui_show_toast("No se pudo generar el patron", RED808_WARNING);
-        return;
-    }
+static void seq_song_bars_cb(lv_event_t* e) {
+    const uint8_t bars = static_cast<uint8_t>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    control_random_song_set_bars(bars);
+    seq_song_controls_refresh();
+}
 
-    const int base = seq_page * 16;
-    for (int track = 0; track < 16; ++track)
-        for (int step = 0; step < 16; ++step)
-            if (base + step < 64)
-                seq_raw_grid[track][base + step] = p4.steps[track][step];
-    seq_force_refresh_cells = true;
-    seq_set_pattern_dirty(true);
-
-    // Never perform a multi-packet upload from the LVGL callback. The loop
-    // drains this flag and sends one coherent pattern snapshot to Daisy.
-    s_ctrl_pattern_sync_pending.store(true, std::memory_order_release);
-    seq_last_random_style = (int8_t)style;
-    seq_var_btn_refresh();
-    char feedback[32] = "RANDOM";
-    const char* name = seq_random_style_name((int8_t)style);
-    if (name) snprintf(feedback, sizeof(feedback), "RANDOM: %s", name);
-    seq_variation_modal_hide();
-    ui_show_toast(feedback, RED808_CYAN);
+static void seq_song_toggle_cb(lv_event_t* /*e*/) {
+    const bool nowActive = !control_random_song_active();
+    if (nowActive && !p4.is_playing)
+        ui_show_toast("RANDOM SONG activado: empieza a saltar en cuanto le des a PLAY",
+                      RED808_CYAN);
+    control_random_song_set_active(nowActive);
+    seq_song_controls_refresh();
 }
 
 static void seq_variation_modal_show(lv_event_t* /*e*/) {
@@ -7703,44 +7875,35 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
     lv_obj_set_pos(title, 24, 18);
 
     lv_obj_t* hint = lv_label_create(card);
-    {
-        const char* lastStyle = seq_random_style_name(seq_last_random_style);
-        if (lastStyle) {
-            char hintText[96];
-            snprintf(hintText, sizeof(hintText),
-                    "Aplica sobre el patron actual. Este patron es RANDOM: %s.",
-                    lastStyle);
-            lv_label_set_text(hint, hintText);
-        } else {
-            lv_label_set_text(hint,
-                "Aplica sobre el patron actual. UNDO recupera la ultima version.");
-        }
-    }
+    lv_label_set_text(hint,
+        "Los botones de abajo transforman el patron actual. UNDO recupera la ultima version.");
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(hint, 24, 50);
 
-    // ── PLAY RANDOM: style chips generate a brand new pattern on tap ──
-    lv_obj_t* randomLabel = lv_label_create(card);
-    lv_label_set_text(randomLabel, "PLAY RANDOM - elige un estilo:");
-    lv_obj_set_style_text_font(randomLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(randomLabel, RED808_ACCENT2, 0);
-    lv_obj_set_pos(randomLabel, 24, 74);
+    // ── RANDOM SONG: while playing, jumps between EXISTING saved patterns
+    // every N bars (filtered by style when possible). This is a mode you
+    // switch on, not a one-shot generator. ──
+    lv_obj_t* songLabel = lv_label_create(card);
+    lv_label_set_text(songLabel, "RANDOM SONG - estilo:");
+    lv_obj_set_style_text_font(songLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(songLabel, RED808_ACCENT2, 0);
+    lv_obj_set_pos(songLabel, 24, 74);
 
     {
         constexpr int chipW = 142;
-        constexpr int chipH = 42;
+        constexpr int chipH = 34;
         constexpr int chipGap = 8;
-        constexpr int chipY = 96;
+        constexpr int chipY = 92;
         for (size_t index = 0;
              index < sizeof(SEQ_RANDOM_STYLE_OPTIONS) / sizeof(SEQ_RANDOM_STYLE_OPTIONS[0]);
              ++index) {
             const auto& style = SEQ_RANDOM_STYLE_OPTIONS[index];
             lv_obj_t* chip = lv_btn_create(card);
+            seq_song_style_btns[index] = chip;
             lv_obj_set_size(chip, chipW, chipH);
             lv_obj_set_pos(chip, 24 + static_cast<int>(index) * (chipW + chipGap), chipY);
-            apply_control_button_style(chip, RED808_ACCENT2, false, 10);
-            lv_obj_add_event_cb(chip, seq_random_style_cb, LV_EVENT_CLICKED,
+            lv_obj_add_event_cb(chip, seq_song_style_cb, LV_EVENT_CLICKED,
                                 reinterpret_cast<void*>(
                                     static_cast<uintptr_t>(style.id)));
             lv_obj_t* chipLabel = lv_label_create(chip);
@@ -7749,6 +7912,40 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
             lv_obj_set_style_text_color(chipLabel, lv_color_white(), 0);
             lv_obj_center(chipLabel);
         }
+    }
+
+    {
+        constexpr int barsY = 132;
+        lv_obj_t* barsLabel = lv_label_create(card);
+        lv_label_set_text(barsLabel, "COMPASES:");
+        lv_obj_set_style_text_font(barsLabel, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(barsLabel, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(barsLabel, 24, barsY + 10);
+
+        static const uint8_t barOptions[4] = {1, 2, 4, 8};
+        constexpr int barsChipX0 = 110;
+        constexpr int barsChipW = 48;
+        constexpr int barsChipGap = 6;
+        for (int i = 0; i < 4; ++i) {
+            lv_obj_t* chip = lv_btn_create(card);
+            seq_song_bars_btns[i] = chip;
+            lv_obj_set_size(chip, barsChipW, 32);
+            lv_obj_set_pos(chip, barsChipX0 + i * (barsChipW + barsChipGap), barsY);
+            lv_obj_add_event_cb(chip, seq_song_bars_cb, LV_EVENT_CLICKED,
+                                (void*)(intptr_t)barOptions[i]);
+            lv_obj_t* lbl = lv_label_create(chip);
+            lv_label_set_text_fmt(lbl, "%d", barOptions[i]);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_center(lbl);
+        }
+
+        seq_song_toggle_btn = lv_btn_create(card);
+        lv_obj_set_size(seq_song_toggle_btn, 560, 32);
+        lv_obj_set_pos(seq_song_toggle_btn, 342, barsY);
+        lv_obj_add_event_cb(seq_song_toggle_btn, seq_song_toggle_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t* toggleLbl = lv_label_create(seq_song_toggle_btn);
+        lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_14, 0);
+        lv_obj_center(toggleLbl);
     }
 
     lv_obj_t* close = lv_btn_create(card);
@@ -7764,9 +7961,10 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
 
     constexpr int columns = 4;
     constexpr int buttonWidth = 216;
-    constexpr int buttonHeight = 116;
+    constexpr int buttonHeight = 94;
     constexpr int gapX = 10;
-    constexpr int gapY = 12;
+    constexpr int gapY = 8;
+    constexpr int gridY0 = 180;
     const bool canUndo = control_variation_can_undo();
     for (size_t index = 0;
          index < sizeof(SEQ_VARIATION_OPTIONS) / sizeof(SEQ_VARIATION_OPTIONS[0]);
@@ -7778,7 +7976,7 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
         lv_obj_t* button = lv_btn_create(card);
         lv_obj_set_size(button, buttonWidth, buttonHeight);
         lv_obj_set_pos(button, 24 + column * (buttonWidth + gapX),
-                       156 + row * (buttonHeight + gapY));
+                       gridY0 + row * (buttonHeight + gapY));
         apply_control_button_style(button,
             option.id == SEQ_VAR_UNDO ? RED808_SUCCESS : RED808_ACCENT2,
             false, 12);
@@ -7790,7 +7988,7 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
         lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(name, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(name, RED808_TEXT, 0);
-        lv_obj_align(name, LV_ALIGN_CENTER, 0, -15);
+        lv_obj_align(name, LV_ALIGN_CENTER, 0, -12);
 
         lv_obj_t* detail = lv_label_create(button);
         lv_label_set_text(detail, undoDisabled ? "Nada que restaurar" : option.detail);
@@ -7798,7 +7996,7 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
         lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(detail, &lv_font_montserrat_10, 0);
         lv_obj_set_style_text_color(detail, RED808_TEXT_DIM, 0);
-        lv_obj_align(detail, LV_ALIGN_CENTER, 0, 17);
+        lv_obj_align(detail, LV_ALIGN_CENTER, 0, 13);
 
         if (undoDisabled) {
             lv_obj_add_state(button, LV_STATE_DISABLED);
@@ -7812,6 +8010,8 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
                                     static_cast<uintptr_t>(option.id)));
         }
     }
+
+    seq_song_controls_refresh();
 }
 
 static void seq_build4_cb(lv_event_t* /*e*/) {
@@ -8113,9 +8313,8 @@ void ui_sequencer_sync_from_current_pattern(void) {
     seq_force_refresh_cells = true;
     seq_page_styles_dirty = true;
     seq_pattern_dirty = false;
-    // A different pattern slot became authoritative — whatever PLAY RANDOM
-    // state applied to the previous one no longer describes this one.
-    seq_last_random_style = -1;
+    // A different pattern slot became authoritative — including the jumps
+    // RANDOM SONG itself makes. Keep the VAR button's indicator in sync.
     seq_var_btn_refresh();
 }
 
@@ -9157,7 +9356,25 @@ static const MixStyleProfile MIX_STYLE_PROFILES[6] = {
                 {120, 75, 85, 75, 60, 65, 65, 55, 55, 55, 55, 65, 65, 60, 60, 60}},
 };
 
-static void mix_random_style_cb(lv_event_t* e) {
+static lv_obj_t* s_mix_random_btn = NULL;
+static uint8_t   s_mix_last_style = 0xFF;   // 0xFF = none applied yet this session
+
+static void mix_random_btn_refresh(void) {
+    if (!s_mix_random_btn) return;
+    apply_control_button_style(s_mix_random_btn,
+        control_random_mix_active() ? RED808_SUCCESS : RED808_INFO, false, 10);
+    lv_obj_t* lbl = lv_obj_get_child(s_mix_random_btn, 0);
+    if (!lbl) return;
+    if (s_mix_last_style < 6)
+        lv_label_set_text_fmt(lbl, LV_SYMBOL_SHUFFLE "  %s", MIX_STYLE_PROFILES[s_mix_last_style].name);
+    else
+        lv_label_set_text(lbl, LV_SYMBOL_SHUFFLE "  RANDOM MIX");
+}
+
+// Applies one random per-style volume rebalance across all 16 faders.
+// Called both by a manual tap and by AUTO MIX's bar clock
+// (control_random_auto_tick(), control_api.cpp).
+void mix_random_apply(void) {
     if (!control_available() && !control_engine_connected()) {
         ui_show_toast("Master no conectado", RED808_WARNING);
         return;
@@ -9173,7 +9390,8 @@ static void mix_random_style_cb(lv_event_t* e) {
         return mn + (int)(nextRand() % (uint32_t)(mx - mn + 1));
     };
 
-    const MixStyleProfile& style = MIX_STYLE_PROFILES[randRange(0, 5)];
+    const int styleIdx = randRange(0, 5);
+    const MixStyleProfile& style = MIX_STYLE_PROFILES[styleIdx];
     for (int t = 0; t < 16; t++) {
         int vol = randRange(style.volMin[t], style.volMax[t]);
         control_send_set_track_volume(t, vol);
@@ -9181,12 +9399,27 @@ static void mix_random_style_cb(lv_event_t* e) {
         if (vol_sliders[t]) lv_slider_set_value(vol_sliders[t], p4.track_volume[t], LV_ANIM_OFF);
     }
 
-    lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
-    lv_obj_t* lbl = lv_obj_get_child(btn, 0);
-    if (lbl) lv_label_set_text_fmt(lbl, LV_SYMBOL_SHUFFLE "  %s", style.name);
+    s_mix_last_style = (uint8_t)styleIdx;
+    mix_random_btn_refresh();
     char msg[48];
     snprintf(msg, sizeof(msg), "RANDOM MIX: %s", style.name);
     ui_show_toast(msg, RED808_INFO);
+}
+
+static void mix_random_style_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    mix_random_apply();
+}
+
+// Tapping RANDOM MIX opens the AUTO MIX popup (cadence + on/off + "apply
+// now") instead of applying directly, matching AUTO FX's entry point.
+static void mix_random_modal_show(lv_event_t* e) {
+    LV_UNUSED(e);
+    static const AutoModalConfig cfg = {
+        "AUTO MIX", control_random_mix_active, control_random_mix_set_active,
+        control_random_mix_bars, control_random_mix_set_bars, mix_random_apply
+    };
+    auto_modal_show(cfg);
 }
 
 static void create_volumes_screen(void) {
@@ -9259,19 +9492,18 @@ static void create_volumes_screen(void) {
         lv_obj_add_event_cb(*globals[i].slider, mix_global_slider_cb, LV_EVENT_PRESS_LOST, (void*)(intptr_t)which);
     }
 
-    // RANDOM MIX: rebalances all 16 channel faders to a randomly chosen
-    // style. The button label keeps showing the last applied style.
+    // RANDOM MIX: opens the AUTO MIX popup (cadence + on/off + apply now).
+    // The button label keeps showing the last applied style.
     {
         int rx = global_x + 2 * block_w + 2 * slider_gap;
-        lv_obj_t* random_btn = lv_btn_create(scr_volumes);
-        lv_obj_set_size(random_btn, random_w, random_h);
-        lv_obj_set_pos(random_btn, rx, global_y + 8);
-        apply_control_button_style(random_btn, RED808_INFO, false, 10);
-        lv_obj_add_event_cb(random_btn, mix_random_style_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_t* random_lbl = lv_label_create(random_btn);
-        lv_label_set_text(random_lbl, LV_SYMBOL_SHUFFLE "  RANDOM MIX");
+        s_mix_random_btn = lv_btn_create(scr_volumes);
+        lv_obj_set_size(s_mix_random_btn, random_w, random_h);
+        lv_obj_set_pos(s_mix_random_btn, rx, global_y + 8);
+        lv_obj_add_event_cb(s_mix_random_btn, mix_random_modal_show, LV_EVENT_CLICKED, NULL);
+        lv_obj_t* random_lbl = lv_label_create(s_mix_random_btn);
         lv_obj_set_style_text_font(random_lbl, &lv_font_montserrat_14, 0);
         lv_obj_center(random_lbl);
+        mix_random_btn_refresh();
     }
 
     // Single row of 16 strips filling the full display width
@@ -14404,6 +14636,7 @@ static void ui_reload_themed_screens(void) {
     mix_live_slider = NULL; mix_bpm_slider = NULL;
     mix_master_lbl = NULL; mix_seq_lbl = NULL;
     mix_live_lbl = NULL; mix_bpm_lbl = NULL;
+    s_mix_random_btn = NULL;
 
     // Clear SD screen widgets
     sd_left_panel = NULL; sd_right_panel = NULL; sd_status_lbl = NULL;

@@ -14,6 +14,7 @@
 #include "../include/ui_events.h"
 #include <Arduino.h>
 #include <atomic>
+#include <ctype.h>
 #include <math.h>
 #include <string.h>
 
@@ -489,6 +490,10 @@ void control_init()
     daisyUsb.begin();
 }
 
+// Forward decl: defined further down, next to the RANDOM SONG/AUTO FX/AUTO
+// MIX state it drives; called once per tick from control_process() below.
+void control_random_auto_tick();
+
 void control_process()
 {
     daisyUsb.process();
@@ -624,6 +629,7 @@ void control_process()
         midiLearnTimeoutRevision.fetch_add(1, std::memory_order_release);
     }
     SequencerInstance().update();
+    control_random_auto_tick();
 }
 
 // ── User MIDI map / LEARN API ────────────────────────────────────────
@@ -1270,6 +1276,173 @@ bool control_apply_random_pattern(uint8_t style)
 
     if(!changed) variationBackup.valid = false;
     return changed;
+}
+
+// ── RANDOM SONG / AUTO FX / AUTO MIX: bar-synced auto modes ────────────────
+namespace
+{
+struct BarClock
+{
+    bool active = false;
+    uint8_t bars = 4;
+    int elapsed = 0;
+    int lastStep = -1;
+};
+BarClock songClock;
+BarClock fxClock;
+BarClock mixClock;
+uint8_t songStyle = RND_STYLE_TECHNO;
+
+// Returns true exactly once, the tick a bar boundary crosses the `bars`
+// threshold while playing. Resets cleanly whenever playback stops so a
+// later resume starts counting from zero instead of firing immediately.
+bool barClockTick(BarClock& c)
+{
+    if(!c.active || !p4.is_playing)
+    {
+        c.lastStep = -1;
+        return false;
+    }
+    const int step = p4.current_step;
+    bool fired = false;
+    if(c.lastStep >= 0 && step < c.lastStep)
+    {
+        c.elapsed++;
+        if(c.elapsed >= (int)c.bars)
+        {
+            c.elapsed = 0;
+            fired = true;
+        }
+    }
+    c.lastStep = step;
+    return fired;
+}
+
+// Case-insensitive substring search. Avoids relying on strcasestr (a GNU
+// extension not guaranteed on the ESP32 toolchain).
+bool containsIgnoreCase(const char* haystack, const char* needle)
+{
+    if(!haystack || !needle || !*needle) return false;
+    const size_t needleLen = strlen(needle);
+    for(const char* p = haystack; *p; ++p)
+    {
+        size_t i = 0;
+        while(i < needleLen && p[i]
+              && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+            ++i;
+        if(i == needleLen) return true;
+    }
+    return false;
+}
+
+const char* songStyleKeyword(uint8_t style)
+{
+    switch(style)
+    {
+        case RND_STYLE_TECHNO:    return "techno";
+        case RND_STYLE_HOUSE:     return "house";
+        case RND_STYLE_BREAKBEAT: return "break";
+        case RND_STYLE_HIPHOP:    return "hip";
+        case RND_STYLE_TRAP:      return "trap";
+        case RND_STYLE_MINIMAL:   return "minimal";
+        default:                  return "";
+    }
+}
+
+// Picks a different existing pattern (factory or saved user slot) and
+// queues it for the next bar via the same quantized-queue path the manual
+// "Q 1 BAR" control already uses. Prefers patterns whose name/genre
+// mentions the chosen style's keyword; when none match (the factory bank
+// is one cohesive suite, not a genre library) falls back to any other
+// available pattern rather than silently doing nothing.
+void triggerRandomSongJump()
+{
+    Sequencer& sequencer = SequencerInstance();
+    const int current = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+    const char* keyword = songStyleKeyword(songStyle);
+
+    int candidates[MAX_PATTERNS];
+    int candidateCount = 0;
+    int fallback[MAX_PATTERNS];
+    int fallbackCount = 0;
+
+    auto consider = [&](int p)
+    {
+        if(p == current) return;
+        PatternMetadata meta{};
+        if(!sequencer.getPatternMetadata(p, meta)) return;
+        fallback[fallbackCount++] = p;
+        if(containsIgnoreCase(meta.genre, keyword) || containsIgnoreCase(meta.name, keyword))
+            candidates[candidateCount++] = p;
+    };
+    for(int p = 0; p < BUILTIN_PATTERN_COUNT; ++p)
+        consider(p);
+    for(int p = USER_PATTERN_FIRST; p < MAX_PATTERNS; ++p)
+        if(pattern_store_is_saved(p))
+            consider(p);
+
+    const int* pool = candidateCount > 0 ? candidates : fallback;
+    const int poolCount = candidateCount > 0 ? candidateCount : fallbackCount;
+    if(poolCount == 0) return;   // nothing else saved to jump to
+
+    const int pick = pool[randomRange(0, poolCount - 1)];
+    control_send_queue_pattern(pick);
+}
+} // namespace
+
+void control_random_song_set_active(bool active)
+{
+    songClock.active = active;
+    songClock.elapsed = 0;
+    songClock.lastStep = -1;
+}
+bool control_random_song_active() { return songClock.active; }
+void control_random_song_set_style(uint8_t style)
+{
+    if(style >= RND_STYLE_TECHNO && style <= RND_STYLE_MINIMAL) songStyle = style;
+}
+uint8_t control_random_song_style() { return songStyle; }
+void control_random_song_set_bars(uint8_t bars)
+{
+    songClock.bars = bars < 1 ? 1 : (bars > 8 ? 8 : bars);
+}
+uint8_t control_random_song_bars() { return songClock.bars; }
+
+void control_random_fx_set_active(bool active)
+{
+    fxClock.active = active;
+    fxClock.elapsed = 0;
+    fxClock.lastStep = -1;
+}
+bool control_random_fx_active() { return fxClock.active; }
+void control_random_fx_set_bars(uint8_t bars)
+{
+    fxClock.bars = bars < 1 ? 1 : (bars > 8 ? 8 : bars);
+}
+uint8_t control_random_fx_bars() { return fxClock.bars; }
+
+void control_random_mix_set_active(bool active)
+{
+    mixClock.active = active;
+    mixClock.elapsed = 0;
+    mixClock.lastStep = -1;
+}
+bool control_random_mix_active() { return mixClock.active; }
+void control_random_mix_set_bars(uint8_t bars)
+{
+    mixClock.bars = bars < 1 ? 1 : (bars > 8 ? 8 : bars);
+}
+uint8_t control_random_mix_bars() { return mixClock.bars; }
+
+// Called once per control_process() tick — the auto-mode "conductor". Pure
+// control-layer logic for the song jump; FX/mix re-randomization delegates
+// to the same LVGL-side apply functions the manual RANDOM buttons use, so
+// there is exactly one implementation of what "random" means for each.
+void control_random_auto_tick()
+{
+    if(barClockTick(songClock)) triggerRandomSongJump();
+    if(barClockTick(fxClock)) fx_random_apply();
+    if(barClockTick(mixClock)) mix_random_apply();
 }
 
 bool control_variation_can_undo()

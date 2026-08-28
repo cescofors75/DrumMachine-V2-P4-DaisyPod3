@@ -46,11 +46,11 @@ enum SequencerVariation : uint8_t {
 bool control_apply_sequencer_variation(uint8_t variation);
 bool control_variation_can_undo();
 
-// "PLAY RANDOM" — generates a brand new pattern from scratch using
-// Euclidean-rhythm placement, with per-style hit-count/velocity/probability
-// tables (kick/snare/hats/perc). Shares the VARIATIONS undo backup, so
-// SEQ_VAR_UNDO also restores the pattern that was active before a random
-// generation.
+// Euclidean-rhythm pattern generator (kept as a standalone utility — not
+// currently wired to any UI control; the sequencer's "random" surface is
+// RANDOM SONG below instead). Still useful on its own for filling a pattern
+// slot from scratch. Shares the VARIATIONS undo backup, so SEQ_VAR_UNDO
+// also restores the pattern that was active before a generation.
 enum RandomPatternStyle : uint8_t {
     RND_STYLE_TECHNO = 1,
     RND_STYLE_HOUSE,
@@ -60,6 +60,32 @@ enum RandomPatternStyle : uint8_t {
     RND_STYLE_MINIMAL,
 };
 bool control_apply_random_pattern(uint8_t style);
+
+// RANDOM SONG: while active and the transport is playing, jumps to a
+// different EXISTING saved pattern (factory or user) every N bars, instead
+// of generating new step data. Prefers patterns whose name/genre metadata
+// matches the chosen style's keyword; falls back to any other saved
+// pattern when none match, so the mode never goes silent for an
+// unrepresented style.
+void control_random_song_set_active(bool active);
+bool control_random_song_active();
+void control_random_song_set_style(uint8_t style);   // RND_STYLE_*
+uint8_t control_random_song_style();
+void control_random_song_set_bars(uint8_t bars);      // 1/2/4/8
+uint8_t control_random_song_bars();
+
+// AUTO FX / AUTO MIX: same "every N bars while playing" idea applied to
+// the FX LAB randomizer and the MIXER's RANDOM MIX, instead of a manual
+// one-shot APPLY. Off by default; the manual apply stays available too.
+void control_random_fx_set_active(bool active);
+bool control_random_fx_active();
+void control_random_fx_set_bars(uint8_t bars);
+uint8_t control_random_fx_bars();
+
+void control_random_mix_set_active(bool active);
+bool control_random_mix_active();
+void control_random_mix_set_bars(uint8_t bars);
+uint8_t control_random_mix_bars();
 bool control_sync_current_pattern();
 bool control_patterns_ready();
 uint8_t control_factory_patterns_found();
