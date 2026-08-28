@@ -243,6 +243,8 @@ static lv_obj_t* scr_screensaver = NULL; /* local status screensaver */
 
 // Header widgets
 static lv_obj_t* header_bar = NULL;
+static lv_obj_t* s_live_midi_badge = NULL;
+static lv_obj_t* s_seq_midi_badge = NULL;
 static lv_obj_t* hdr_bpm_label = NULL;
 static lv_obj_t* hdr_pattern_label = NULL;
 static lv_obj_t* hdr_play_btn = NULL;
@@ -471,7 +473,7 @@ static void header_pattern_cb(lv_event_t* e) {
 // =============================================================================
 // BACK BUTTON — replaces the old header bar (floating top-left corner)
 // =============================================================================
-void ui_create_header(lv_obj_t* parent) {
+lv_obj_t* ui_create_header(lv_obj_t* parent) {
     // Nullify all header widget pointers — not used anymore
     header_bar = NULL;
     hdr_bpm_label = NULL; hdr_pattern_label = NULL;
@@ -493,6 +495,48 @@ void ui_create_header(lv_obj_t* parent) {
     lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(back_lbl, RED808_TEXT, 0);
     lv_obj_center(back_lbl);
+    return back_btn;
+}
+
+// MIDI (MPD218) activity badge — a small notification-style dot. MIDI DIN
+// has no plug-detect line, so "connected" isn't knowable; this reflects
+// recent traffic instead: bright green while a note/CC arrived in the last
+// few seconds, dim amber if one has arrived this session but gone quiet,
+// hidden if none has ever been seen. Placed individually on LIVE and the
+// sequencer (not inside the shared ui_create_header(), which is re-run per
+// screen and would leave every screen but the last-created one tracking a
+// stale pointer).
+static lv_obj_t* ui_create_midi_badge(lv_obj_t* parent, int x, int y) {
+    lv_obj_t* badge = lv_obj_create(parent);
+    lv_obj_set_size(badge, 14, 14);
+    lv_obj_set_pos(badge, x, y);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(badge, RED808_TEXT_DIM, 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(badge, 2, 0);
+    lv_obj_set_style_border_color(badge, RED808_PANEL, 0);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+    return badge;
+}
+
+static void ui_midi_badge_refresh(lv_obj_t* badge) {
+    if (!badge) return;
+    static uint32_t prevMidiRev = 0;
+    static uint32_t midiLastSeenMs = 0;
+    const uint32_t midiRev = control_midi_activity_revision();
+    if (midiRev != prevMidiRev) {
+        prevMidiRev = midiRev;
+        midiLastSeenMs = millis();
+    }
+    if (midiLastSeenMs == 0) {
+        lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_HIDDEN);
+    const bool recent = (millis() - midiLastSeenMs) < 3000;
+    lv_obj_set_style_bg_color(badge, recent ? RED808_SUCCESS : RED808_WARNING, 0);
 }
 
 void ui_update_header(void) {
@@ -519,6 +563,8 @@ void ui_update_header(void) {
         }
     }
 
+    ui_midi_badge_refresh(s_live_midi_badge);
+    ui_midi_badge_refresh(s_seq_midi_badge);
 }
 
 // =============================================================================
@@ -676,6 +722,7 @@ static lv_obj_t* live_pad_num_labels[16] = {};
 static lv_obj_t* live_pad_state_labels[16] = {};
 static lv_obj_t* live_pad_inst_labels[16] = {};
 static lv_obj_t* live_pad_accent_strips[16] = {};
+static lv_obj_t* live_pad_midi_badges[16] = {};
 static lv_obj_t* live_spectrum_bars[16] = {};  // spectrum bar per pad (bottom of pad)
 static lv_obj_t* live_home_panels[24] = {};
 static int       live_home_panel_count = 0;
@@ -3448,6 +3495,21 @@ static void mpd_pad_action_text(uint8_t type, uint8_t arg0, uint8_t arg1,
     }
 }
 
+// True if any learned MIDI note maps to triggering this P4 pad (0..15).
+static bool pad_has_midi_mapping(uint8_t pad) {
+    using namespace red808_mpd218;
+    const uint8_t count = control_midi_map_count();
+    for (uint8_t i = 0; i < count; i++) {
+        MidiMapEntry entry;
+        if (!control_midi_map_get(i, entry)) continue;
+        if (entry.kind != MIDI_MAP_KIND_NOTE) continue;
+        if ((entry.action == PAD_TRIGGER_SAMPLE || entry.action == PAD_TRIGGER_MELODIC)
+            && entry.arg0 == pad)
+            return true;
+    }
+    return false;
+}
+
 // Selected MIDI channel, zero-based (DEV1 → CH 1/2/3, DEV2 → CH 4/5/6).
 static uint8_t mpd_map_channel(void) {
     return (uint8_t)(red808_mpd218::kFirstMidiChannel
@@ -5023,6 +5085,16 @@ static void create_live_screen(void) {
         lv_obj_clear_flag(live_pad_accent_strips[i], LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(live_pad_accent_strips[i], LV_OBJ_FLAG_CLICKABLE);
 
+        // "MIDI" badge — bottom-left corner, the one free spot on this pad.
+        // Shown only while a learned MPD218 note triggers this pad.
+        // Visibility refreshed alongside the rest of the pad in update_live_screen().
+        live_pad_midi_badges[i] = lv_label_create(live_pad_btns[i]);
+        lv_label_set_text(live_pad_midi_badges[i], "MIDI");
+        lv_obj_set_style_text_font(live_pad_midi_badges[i], &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(live_pad_midi_badges[i], RED808_SUCCESS, 0);
+        lv_obj_align(live_pad_midi_badges[i], LV_ALIGN_BOTTOM_LEFT, 8, -7);
+        lv_obj_add_flag(live_pad_midi_badges[i], LV_OBJ_FLAG_HIDDEN);
+
         live_pad_num_labels[i] = lv_label_create(live_pad_btns[i]);
         lv_label_set_text_fmt(live_pad_num_labels[i], "%02d", i + 1);
         lv_obj_set_style_text_font(live_pad_num_labels[i], &lv_font_montserrat_14, 0);
@@ -5396,6 +5468,10 @@ static void create_live_screen(void) {
     lv_obj_add_flag(s_pad_back_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_pad_back_btn, [](lv_event_t*){ apply_pad_layout(0); }, LV_EVENT_CLICKED, NULL);
     pod_register_owner_badge(s_pad_back_btn, POD_FUNC_BACK);
+
+    // MIDI (MPD218) activity badge, top-right corner. Created last (and thus
+    // on top) so it survives whatever else fills the control deck's corner.
+    s_live_midi_badge = ui_create_midi_badge(scr_live, LCD_H_RES - 24, 10);
 
     #undef COL_X
     #undef ROW_Y
@@ -5837,6 +5913,19 @@ static void update_live_screen(void) {
         }
     }
 
+    // "MIDI" pad badges: mapping only changes via MIDI LEARN, so this is
+    // throttled well below frame rate rather than re-scanned every tick.
+    static uint32_t lastMidiBadgeCheckMs = 0;
+    if (now - lastMidiBadgeCheckMs >= 500) {
+        lastMidiBadgeCheckMs = now;
+        for (int i = 0; i < 16; i++) {
+            if (!live_pad_midi_badges[i]) continue;
+            if (pad_has_midi_mapping((uint8_t)i))
+                lv_obj_clear_flag(live_pad_midi_badges[i], LV_OBJ_FLAG_HIDDEN);
+            else
+                lv_obj_add_flag(live_pad_midi_badges[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 // =============================================================================
@@ -6027,7 +6116,32 @@ static lv_obj_t* fx_pattern_lbl                = NULL;
 static lv_obj_t* fx_active_lbl                 = NULL;
 static lv_obj_t* fx_all_off_btn                = NULL;
 static lv_obj_t* s_fx_random_btn               = NULL;
+static lv_obj_t* fx_midi_badges[FX_CARD_COUNT] = {};
 static bool s_fx_ui_syncing = false;
+
+// True if any learned MIDI CC maps to this FX LAB knob action. Only the
+// filter-related cards have a matching KnobActionType today.
+static bool fx_card_has_midi_mapping(int cell) {
+    using namespace red808_mpd218;
+    uint8_t knobAction;
+    switch (cell) {
+        case FX_CARD_CUTOFF: knobAction = KNOB_FILTER_CUTOFF;     break;
+        case FX_CARD_RESO:   knobAction = KNOB_FILTER_RESONANCE;  break;
+        case FX_CARD_DRIVE:  knobAction = KNOB_DISTORTION;        break;
+        case FX_CARD_BITS:   knobAction = KNOB_BIT_DEPTH;         break;
+        case FX_CARD_SRATE:  knobAction = KNOB_SAMPLE_RATE;       break;
+        case FX_CARD_FILTER: knobAction = KNOB_FILTER_TYPE;       break;
+        default: return false;
+    }
+    const uint8_t count = control_midi_map_count();
+    for (uint8_t i = 0; i < count; i++) {
+        MidiMapEntry entry;
+        if (!control_midi_map_get(i, entry)) continue;
+        if (entry.kind == MIDI_MAP_KIND_CC && entry.action == knobAction)
+            return true;
+    }
+    return false;
+}
 static uint32_t s_fx_toggle_last_ms[FX_CARD_COUNT] = {};
 static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX buttons
 static float    s_fx_arc_anim[FX_CARD_COUNT] = {};    // file-scope for snap access
@@ -6352,6 +6466,14 @@ static void fx_active_header_refresh(void) {
             lv_obj_set_style_shadow_opa(fx_all_off_btn,
                 anyActive ? LV_OPA_40 : LV_OPA_0, 0);
         }
+    }
+
+    for (int cell = 0; cell < FX_CARD_COUNT; ++cell) {
+        if (!fx_midi_badges[cell]) continue;
+        if (fx_card_has_midi_mapping(cell))
+            lv_obj_clear_flag(fx_midi_badges[cell], LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(fx_midi_badges[cell], LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -6778,6 +6900,15 @@ static void create_fx_screen(void) {
         // click and silently muted the FX.
         lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
         pod_register_owner_badge(card, fx_card_owner_function(cell));
+
+        // "MIDI" badge — top-left corner, shown only while a learned CC maps
+        // to this control. Visibility refreshed in fx_active_header_refresh().
+        fx_midi_badges[cell] = lv_label_create(card);
+        lv_label_set_text(fx_midi_badges[cell], "MIDI");
+        lv_obj_set_style_text_font(fx_midi_badges[cell], &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(fx_midi_badges[cell], RED808_SUCCESS, 0);
+        lv_obj_align(fx_midi_badges[cell], LV_ALIGN_TOP_LEFT, 8, 8);
+        lv_obj_add_flag(fx_midi_badges[cell], LV_OBJ_FLAG_HIDDEN);
 
         // FX Name — top center, neon style
         fx_name_labels[cell] = lv_label_create(card);
@@ -8338,7 +8469,12 @@ static void create_sequencer_screen(void) {
     scr_sequencer = lv_obj_create(NULL);
     apply_screen_theme_bg(scr_sequencer);
     lv_obj_clear_flag(scr_sequencer, LV_OBJ_FLAG_SCROLLABLE);
-    ui_create_header(scr_sequencer);
+    {
+        lv_obj_t* backBtn = ui_create_header(scr_sequencer);
+        // MIDI (MPD218) activity badge, poking out of the back button's
+        // corner — no dedicated space free on this screen's packed header row.
+        s_seq_midi_badge = ui_create_midi_badge(backBtn, 38, -4);
+    }
 
     // ── Live header: transport, bar queue, performance actions and mix ──
     {
@@ -14526,9 +14662,11 @@ static void ui_reload_themed_screens(void) {
         live_pad_num_labels[i] = NULL; live_pad_state_labels[i] = NULL;
         live_pad_inst_labels[i] = NULL;
         live_pad_accent_strips[i] = NULL;
+        live_pad_midi_badges[i] = NULL;
         live_spectrum_bars[i] = NULL;
         grid_step_dots[i] = NULL;
     }
+    s_live_midi_badge = NULL;
     memset(live_home_panels, 0, sizeof(live_home_panels));
     grid_fx_btn = NULL;
     grid_fx_active_badge = NULL;
@@ -14572,6 +14710,7 @@ static void ui_reload_themed_screens(void) {
         fx_cards[i] = NULL; fx_arcs[i] = NULL; fx_value_labels[i] = NULL;
         fx_name_labels[i] = NULL; fx_src_labels[i] = NULL; fx_toggle_btns[i] = NULL;
         fx_pct_labels[i] = NULL;
+        fx_midi_badges[i] = NULL;
     }
     for (int i = 0; i < FX_PAGE_DOT_COUNT; i++) fx_page_dot[i] = NULL;
     fx_page_lbl = NULL;
@@ -14596,6 +14735,7 @@ static void ui_reload_themed_screens(void) {
         seq_ruler_labels[i] = NULL;
     }
     for (int b = 0; b < 4; b++) seq_beat_bg[b] = NULL;
+    s_seq_midi_badge = NULL;
     seq_playhead_line = NULL;
     seq_status_step_lbl = NULL;
     seq_status_pat_lbl = NULL;

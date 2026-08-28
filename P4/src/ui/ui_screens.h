@@ -52,7 +52,9 @@ void ui_navigate_to(int screen_id);
 lv_obj_t* create_section_shell(lv_obj_t* parent, int x, int y, int w, int h);
 
 // Header bar (shared across screens)
-void ui_create_header(lv_obj_t* parent);
+// Returns the floating back button, in case a caller wants to attach
+// something to it (e.g. a small corner badge) without new layout space.
+lv_obj_t* ui_create_header(lv_obj_t* parent);
 void ui_update_header(void);
 
 // Reset the sequencer's temporary multi-bar import state so the current
