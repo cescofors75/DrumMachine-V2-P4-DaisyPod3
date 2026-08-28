@@ -2427,10 +2427,23 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
         }
     }
 
-    lv_obj_t* original_btn = lv_btn_create(card);
-    lv_obj_set_size(original_btn, 200, 48);
-    lv_obj_align(original_btn, LV_ALIGN_BOTTOM_LEFT, 18, -14);
-    apply_control_button_style(original_btn, RED808_ACCENT2, false, 10);
+    // Bottom action row — a single running cursor (all anchored BOTTOM_LEFT)
+    // instead of the previous mix of LEFT/MID/RIGHT anchors, which left
+    // some gaps as tight as 8px and made the six buttons look like they
+    // were touching on real hardware. 20px gaps here guarantee separation
+    // regardless of card width, and there's still ~30px of margin on
+    // both sides at the card's 984px width.
+    int bottomBtnX = 48;
+    auto makeBottomBtn = [&](int width, lv_color_t color) -> lv_obj_t* {
+        lv_obj_t* btn = lv_btn_create(card);
+        lv_obj_set_size(btn, width, 48);
+        lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, bottomBtnX, -14);
+        apply_control_button_style(btn, color, false, 10);
+        bottomBtnX += width + 20;
+        return btn;
+    };
+
+    lv_obj_t* original_btn = makeBottomBtn(170, RED808_ACCENT2);
     lv_obj_t* original_lbl = lv_label_create(original_btn);
     lv_label_set_text(original_lbl, "SAMPLER ORIG.");
     lv_obj_set_style_text_font(original_lbl, &lv_font_montserrat_14, 0);
@@ -2439,20 +2452,14 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
 
     // Per-instrument FX page (idea 2): filter + drive/crush + sends, scoped
     // to just the focused pad, with its own RANDOM.
-    lv_obj_t* inst_fx_btn = lv_btn_create(card);
-    lv_obj_set_size(inst_fx_btn, 68, 48);
-    lv_obj_align(inst_fx_btn, LV_ALIGN_BOTTOM_LEFT, 226, -14);
-    apply_control_button_style(inst_fx_btn, RED808_CYAN, false, 10);
+    lv_obj_t* inst_fx_btn = makeBottomBtn(64, RED808_CYAN);
     lv_obj_t* inst_fx_lbl = lv_label_create(inst_fx_btn);
     lv_label_set_text(inst_fx_lbl, "FX");
     lv_obj_set_style_text_font(inst_fx_lbl, &lv_font_montserrat_16, 0);
     lv_obj_center(inst_fx_lbl);
     lv_obj_add_event_cb(inst_fx_btn, pad_fx_modal_show, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* preview_btn = lv_btn_create(card);
-    lv_obj_set_size(preview_btn, 180, 48);
-    lv_obj_align(preview_btn, LV_ALIGN_BOTTOM_MID, -100, -14);
-    apply_control_button_style(preview_btn, RED808_SURFACE, false, 10);
+    lv_obj_t* preview_btn = makeBottomBtn(160, RED808_SURFACE);
     lv_obj_set_style_border_color(preview_btn, RED808_CYAN, 0);
     lv_obj_set_style_border_width(preview_btn, 2, 0);
     lv_obj_t* preview_lbl = lv_label_create(preview_btn);
@@ -2462,10 +2469,7 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_center(preview_lbl);
     lv_obj_add_event_cb(preview_btn, pad_inst_modal_preview_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* assign_btn = lv_btn_create(card);
-    lv_obj_set_size(assign_btn, 180, 48);
-    lv_obj_align(assign_btn, LV_ALIGN_BOTTOM_MID, 100, -14);
-    apply_control_button_style(assign_btn, RED808_SUCCESS, false, 10);
+    lv_obj_t* assign_btn = makeBottomBtn(170, RED808_SUCCESS);
     lv_obj_set_style_border_color(assign_btn, RED808_CYAN, 0);
     lv_obj_set_style_border_width(assign_btn, 2, 0);
     lv_obj_t* assign_lbl = lv_label_create(assign_btn);
@@ -2476,10 +2480,7 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_add_event_cb(assign_btn, pad_inst_modal_assign_cb, LV_EVENT_CLICKED, NULL);
 
     // RANDOM: re-roll pad engines across the 16-pad kit (Sampler/808/909/505).
-    lv_obj_t* random_btn = lv_btn_create(card);
-    lv_obj_set_size(random_btn, 130, 48);
-    lv_obj_align(random_btn, LV_ALIGN_BOTTOM_RIGHT, -158, -14);
-    apply_control_button_style(random_btn, RED808_INFO, false, 10);
+    lv_obj_t* random_btn = makeBottomBtn(130, RED808_INFO);
     lv_obj_t* random_lbl = lv_label_create(random_btn);
     lv_label_set_text(random_lbl, LV_SYMBOL_SHUFFLE "  RANDOM");
     lv_obj_set_style_text_font(random_lbl, &lv_font_montserrat_14, 0);
@@ -2487,10 +2488,7 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_center(random_lbl);
     lv_obj_add_event_cb(random_btn, pad_random_all_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* close_btn = lv_btn_create(card);
-    lv_obj_set_size(close_btn, 130, 48);
-    lv_obj_align(close_btn, LV_ALIGN_BOTTOM_RIGHT, -18, -14);
-    apply_control_button_style(close_btn, RED808_BORDER, false, 10);
+    lv_obj_t* close_btn = makeBottomBtn(110, RED808_BORDER);
     lv_obj_t* close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, "CERRAR");
     lv_obj_center(close_lbl);
