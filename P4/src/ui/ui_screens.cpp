@@ -7618,6 +7618,8 @@ static lv_obj_t*  seq_song_bars_btns[4]  = {};
 static lv_obj_t*  seq_song_toggle_btn    = NULL;
 static lv_obj_t*  seq_hdr_save_btn      = NULL;
 static lv_obj_t*  seq_hdr_save_lbl      = NULL;
+static lv_obj_t*  seq_hdr_kanban_btn    = NULL;
+static lv_obj_t*  seq_kanban_modal      = NULL;
 static lv_obj_t*  seq_hdr_group_btns[4] = {};
 static uint8_t    seq_hdr_group_state[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 static lv_obj_t*  seq_pattern_list_modal = NULL;
@@ -8524,6 +8526,268 @@ static void seq_song_modal_show(lv_event_t* /*e*/) {
     seq_song_controls_refresh();
 }
 
+// ── AUTO panel — Kanban-style command center for the four bar-clock AUTO
+// modes (SONG/AUTO FX/AUTO MIX/EVOLVE). Each already has its own header
+// button + popup; this just puts all four ON/OFF + cadence controls
+// side by side so you don't have to hop between four popups to see or
+// change what's currently running. All state lives in control_api.cpp
+// already (control_random_song/fx/mix/evolve_*) — this panel is pure UI.
+enum { KANBAN_SONG = 0, KANBAN_FX, KANBAN_MIX, KANBAN_EVOLVE, KANBAN_COUNT };
+static const char* const KANBAN_NAMES[KANBAN_COUNT] = {"SONG", "AUTO FX", "AUTO MIX", "EVOLVE"};
+static const uint8_t KANBAN_BAR_OPTIONS[4] = {1, 2, 4, 8};
+
+// fwd decl: defined later, in the MIXER section — used here to keep the
+// Mixer's own RANDOM MIX button in sync the instant this panel toggles it.
+static void mix_random_btn_refresh(void);
+
+static lv_obj_t* seq_kanban_toggle_btns[KANBAN_COUNT]  = {};
+static lv_obj_t* seq_kanban_bars_btns[KANBAN_COUNT][4] = {};
+static lv_obj_t* seq_kanban_style_btn    = NULL;   // SONG only
+static lv_obj_t* seq_kanban_evolve_slider = NULL;  // EVOLVE only
+static lv_obj_t* seq_kanban_evolve_lbl    = NULL;  // EVOLVE only
+
+static bool kanban_active(int mode) {
+    switch (mode) {
+        case KANBAN_SONG:   return control_random_song_active();
+        case KANBAN_FX:     return control_random_fx_active();
+        case KANBAN_MIX:    return control_random_mix_active();
+        case KANBAN_EVOLVE: return control_random_evolve_active();
+        default: return false;
+    }
+}
+static void kanban_set_active(int mode, bool v) {
+    switch (mode) {
+        case KANBAN_SONG:   control_random_song_set_active(v); break;
+        case KANBAN_FX:     control_random_fx_set_active(v); break;
+        case KANBAN_MIX:    control_random_mix_set_active(v); break;
+        case KANBAN_EVOLVE: control_random_evolve_set_active(v); break;
+    }
+}
+static uint8_t kanban_bars(int mode) {
+    switch (mode) {
+        case KANBAN_SONG:   return control_random_song_bars();
+        case KANBAN_FX:     return control_random_fx_bars();
+        case KANBAN_MIX:    return control_random_mix_bars();
+        case KANBAN_EVOLVE: return control_random_evolve_bars();
+        default: return 1;
+    }
+}
+static void kanban_set_bars(int mode, uint8_t bars) {
+    switch (mode) {
+        case KANBAN_SONG:   control_random_song_set_bars(bars); break;
+        case KANBAN_FX:     control_random_fx_set_bars(bars); break;
+        case KANBAN_MIX:    control_random_mix_set_bars(bars); break;
+        case KANBAN_EVOLVE: control_random_evolve_set_bars(bars); break;
+    }
+}
+// Keeps each mode's own dedicated header button (SONG/EVOLVE) or screen
+// button (AUTO FX/AUTO MIX) visually in sync the instant this panel
+// changes it, so nothing here can go stale next time you see it elsewhere.
+static void kanban_refresh_owner_btn(int mode) {
+    switch (mode) {
+        case KANBAN_SONG:   seq_song_btn_refresh(); break;
+        case KANBAN_FX:     fx_random_btn_refresh(); break;
+        case KANBAN_MIX:    mix_random_btn_refresh(); break;
+        case KANBAN_EVOLVE: seq_evolve_btn_refresh(); break;
+    }
+}
+
+static void seq_kanban_refresh(void) {
+    if (!seq_kanban_modal) return;
+    for (int m = 0; m < KANBAN_COUNT; ++m) {
+        const bool active = kanban_active(m);
+        lv_obj_t* toggle = seq_kanban_toggle_btns[m];
+        if (toggle) {
+            apply_control_button_style(toggle, active ? RED808_SUCCESS : RED808_BORDER, false, 8);
+            lv_obj_t* lbl = lv_obj_get_child(toggle, 0);
+            if (lbl) lv_label_set_text_fmt(lbl, "%s\n%s", KANBAN_NAMES[m], active ? "ON" : "OFF");
+        }
+        const uint8_t bars = kanban_bars(m);
+        for (int i = 0; i < 4; ++i) {
+            lv_obj_t* chip = seq_kanban_bars_btns[m][i];
+            if (!chip) continue;
+            apply_control_button_style(chip,
+                KANBAN_BAR_OPTIONS[i] == bars ? RED808_ACCENT2 : RED808_BORDER, false, 6);
+        }
+    }
+    if (seq_kanban_style_btn) {
+        lv_obj_t* lbl = lv_obj_get_child(seq_kanban_style_btn, 0);
+        const char* name = seq_random_style_name(control_random_song_style());
+        if (lbl) lv_label_set_text_fmt(lbl, "ESTILO\n%s", name ? name : "?");
+    }
+    if (seq_kanban_evolve_slider)
+        lv_slider_set_value(seq_kanban_evolve_slider, control_random_evolve_amount(), LV_ANIM_OFF);
+    if (seq_kanban_evolve_lbl)
+        lv_label_set_text_fmt(seq_kanban_evolve_lbl, "%d%%", control_random_evolve_amount());
+}
+
+static void seq_kanban_toggle_cb(lv_event_t* e) {
+    const int mode = (int)(intptr_t)lv_event_get_user_data(e);
+    kanban_set_active(mode, !kanban_active(mode));
+    seq_kanban_refresh();
+    kanban_refresh_owner_btn(mode);
+}
+
+static void seq_kanban_bars_cb(lv_event_t* e) {
+    const int packed = (int)(intptr_t)lv_event_get_user_data(e);
+    const int mode = (packed >> 8) & 0xFF;
+    const uint8_t bars = (uint8_t)(packed & 0xFF);
+    kanban_set_bars(mode, bars);
+    seq_kanban_refresh();
+}
+
+static void seq_kanban_style_cb(lv_event_t* /*e*/) {
+    const uint8_t next = (control_random_song_style() + 1) % 6;
+    control_random_song_set_style(next);
+    seq_kanban_refresh();
+    seq_song_btn_refresh();
+}
+
+static void seq_kanban_evolve_amount_cb(lv_event_t* e) {
+    lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
+    control_random_evolve_set_amount((uint8_t)lv_slider_get_value(slider));
+    seq_kanban_refresh();
+}
+
+static void seq_kanban_modal_hide(lv_event_t* e = NULL) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (seq_kanban_modal) lv_obj_del(seq_kanban_modal);
+    seq_kanban_modal = NULL;
+    for (int m = 0; m < KANBAN_COUNT; ++m) {
+        seq_kanban_toggle_btns[m] = NULL;
+        for (int i = 0; i < 4; ++i) seq_kanban_bars_btns[m][i] = NULL;
+    }
+    seq_kanban_style_btn = NULL;
+    seq_kanban_evolve_slider = NULL;
+    seq_kanban_evolve_lbl = NULL;
+}
+
+static void seq_kanban_modal_show(lv_event_t* /*e*/) {
+    if (seq_kanban_modal) return;
+
+    seq_kanban_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(seq_kanban_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(seq_kanban_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(seq_kanban_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(seq_kanban_modal, 0, 0);
+    lv_obj_set_style_pad_all(seq_kanban_modal, 0, 0);
+    lv_obj_clear_flag(seq_kanban_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(seq_kanban_modal, seq_kanban_modal_hide, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(seq_kanban_modal);
+    lv_obj_set_size(card, 984, 280);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "AUTO");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 0, 0);
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "Los 4 modos ligados a reproduccion, de un vistazo");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(hint, 0, 26);
+
+    constexpr int colW = 230;
+    constexpr int colGap = 10;
+
+    for (int m = 0; m < KANBAN_COUNT; ++m) {
+        const int colX = m * (colW + colGap);
+
+        lv_obj_t* toggle = lv_btn_create(card);
+        seq_kanban_toggle_btns[m] = toggle;
+        lv_obj_set_size(toggle, colW, 36);
+        lv_obj_set_pos(toggle, colX, 48);
+        lv_obj_add_event_cb(toggle, seq_kanban_toggle_cb, LV_EVENT_CLICKED, (void*)(intptr_t)m);
+        lv_obj_t* toggleLbl = lv_label_create(toggle);
+        lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(toggleLbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(toggleLbl);
+
+        lv_obj_t* barsLbl = lv_label_create(card);
+        lv_label_set_text(barsLbl, "COMPASES:");
+        lv_obj_set_style_text_font(barsLbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(barsLbl, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(barsLbl, colX, 92);
+
+        constexpr int chipW = 51;
+        constexpr int chipGap = 6;
+        for (int i = 0; i < 4; ++i) {
+            lv_obj_t* chip = lv_btn_create(card);
+            seq_kanban_bars_btns[m][i] = chip;
+            lv_obj_set_size(chip, chipW, 28);
+            lv_obj_set_pos(chip, colX + i * (chipW + chipGap), 106);
+            lv_obj_add_event_cb(chip, seq_kanban_bars_cb, LV_EVENT_CLICKED,
+                                (void*)(intptr_t)((m << 8) | KANBAN_BAR_OPTIONS[i]));
+            lv_obj_t* lbl = lv_label_create(chip);
+            lv_label_set_text_fmt(lbl, "%d", KANBAN_BAR_OPTIONS[i]);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(lbl);
+        }
+
+        if (m == KANBAN_SONG) {
+            seq_kanban_style_btn = lv_btn_create(card);
+            lv_obj_set_size(seq_kanban_style_btn, colW, 34);
+            lv_obj_set_pos(seq_kanban_style_btn, colX, 140);
+            apply_control_button_style(seq_kanban_style_btn, RED808_ACCENT2, false, 8);
+            lv_obj_add_event_cb(seq_kanban_style_btn, seq_kanban_style_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_t* lbl = lv_label_create(seq_kanban_style_btn);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_center(lbl);
+        } else if (m == KANBAN_EVOLVE) {
+            lv_obj_t* amountLbl = lv_label_create(card);
+            lv_label_set_text(amountLbl, "CANTIDAD:");
+            lv_obj_set_style_text_font(amountLbl, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(amountLbl, RED808_TEXT_DIM, 0);
+            lv_obj_set_pos(amountLbl, colX, 140);
+
+            seq_kanban_evolve_lbl = lv_label_create(card);
+            lv_obj_set_style_text_font(seq_kanban_evolve_lbl, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(seq_kanban_evolve_lbl, RED808_SUCCESS, 0);
+            lv_obj_set_pos(seq_kanban_evolve_lbl, colX + colW - 30, 140);
+
+            seq_kanban_evolve_slider = lv_slider_create(card);
+            lv_obj_set_size(seq_kanban_evolve_slider, colW, 14);
+            lv_obj_set_pos(seq_kanban_evolve_slider, colX, 158);
+            lv_slider_set_range(seq_kanban_evolve_slider, 0, 100);
+            lv_obj_set_style_bg_color(seq_kanban_evolve_slider, RED808_SURFACE, LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(seq_kanban_evolve_slider, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(seq_kanban_evolve_slider, RED808_SUCCESS, LV_PART_INDICATOR);
+            lv_obj_set_style_bg_opa(seq_kanban_evolve_slider, LV_OPA_COVER, LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(seq_kanban_evolve_slider, lv_color_white(), LV_PART_KNOB);
+            lv_obj_set_style_bg_opa(seq_kanban_evolve_slider, LV_OPA_COVER, LV_PART_KNOB);
+            lv_obj_set_style_pad_all(seq_kanban_evolve_slider, 6, LV_PART_KNOB);
+            lv_obj_set_style_radius(seq_kanban_evolve_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+            lv_obj_add_event_cb(seq_kanban_evolve_slider, seq_kanban_evolve_amount_cb,
+                                LV_EVENT_VALUE_CHANGED, NULL);
+            lv_obj_add_event_cb(seq_kanban_evolve_slider, seq_kanban_evolve_amount_cb,
+                                LV_EVENT_RELEASED, NULL);
+        }
+    }
+
+    lv_obj_t* closeBtn = lv_btn_create(card);
+    lv_obj_set_size(closeBtn, 984 - 32, 32);
+    lv_obj_set_pos(closeBtn, 0, 196);
+    apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
+    lv_obj_add_event_cb(closeBtn, seq_kanban_modal_hide, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "CERRAR");
+    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(closeLbl);
+
+    seq_kanban_refresh();
+}
+
 static void seq_variation_modal_show(lv_event_t* /*e*/) {
     if (seq_variation_modal) return;
 
@@ -9281,6 +9545,8 @@ static void create_sequencer_screen(void) {
             [](lv_event_t*) { seq_pattern_list_show_mode(true); });
         seq_hdr_save_lbl = lv_obj_get_child(seq_hdr_save_btn, 0);
         seq_set_pattern_dirty(seq_pattern_dirty);
+
+        seq_hdr_kanban_btn = makeHeaderButton(64, "AUTO", RED808_CYAN, seq_kanban_modal_show);
     }
 
     // ── Precompute step X positions ──
@@ -15553,6 +15819,15 @@ static void ui_reload_themed_screens(void) {
     seq_variation_modal = NULL;
     seq_hdr_save_btn = NULL;
     seq_hdr_save_lbl = NULL;
+    seq_hdr_kanban_btn = NULL;
+    seq_kanban_modal = NULL;
+    for (int m = 0; m < KANBAN_COUNT; ++m) {
+        seq_kanban_toggle_btns[m] = NULL;
+        for (int i = 0; i < 4; ++i) seq_kanban_bars_btns[m][i] = NULL;
+    }
+    seq_kanban_style_btn = NULL;
+    seq_kanban_evolve_slider = NULL;
+    seq_kanban_evolve_lbl = NULL;
     seq_pattern_list_modal = NULL;
     seq_save_confirm_modal = NULL;
     seq_save_confirm_slot = -1;
