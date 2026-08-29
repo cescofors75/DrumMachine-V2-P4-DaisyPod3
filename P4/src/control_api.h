@@ -73,6 +73,20 @@ void control_random_song_set_style(uint8_t style);   // RND_STYLE_*
 uint8_t control_random_song_style();
 void control_random_song_set_bars(uint8_t bars);      // 1/2/4/8
 uint8_t control_random_song_bars();
+// Curated flow: when on, RANDOM SONG stops picking a musically-weighted
+// random jump and instead walks the expansion bank's WRITTEN scene order
+// — this song's next scene, then the next song's intro — the sequence it
+// was actually composed as. "Known to sound good back to back" instead of
+// "probably sounds good back to back". Off by default (weighted random).
+void control_random_song_set_curated(bool curated);
+bool control_random_song_curated();
+
+// One switch for the informational toasts RANDOM SONG (jump + reason),
+// AUTO VARIATIONS and AUTO FX/MIX show while running unattended during a
+// live set. On by default, matching existing behavior; off for a quieter
+// AUTO session without changing anything the modes actually do.
+void control_auto_toast_set_enabled(bool enabled);
+bool control_auto_toast_enabled();
 
 // AUTO FX / AUTO MIX: same "every N bars while playing" idea applied to
 // the FX LAB randomizer and the MIXER's RANDOM MIX, instead of a manual

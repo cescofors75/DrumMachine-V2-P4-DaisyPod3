@@ -1375,6 +1375,8 @@ BarClock mixClock;
 BarClock evolveClock;
 BarClock variationClock;
 uint8_t songStyle = RND_STYLE_TECHNO;
+bool songCurated = false;      // RANDOM SONG: written scene order vs weighted random
+bool autoToastEnabled = true;  // SONG/VARIATIONS/FX/MIX auto-tick toasts, one switch
 uint8_t evolveAmount = 40;   // 0-100, dial default
 
 // Per-track base "freedom" (0-100): how much a track's step probabilities
@@ -1473,6 +1475,49 @@ void triggerRandomSongJump()
 {
     Sequencer& sequencer = SequencerInstance();
     const int current = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+
+    // The expansion bank (slots 20..99) is ten consecutive 8-scene "songs".
+    // Both the curated and weighted-random paths below key off which song/
+    // scene a pattern falls into, so these are shared.
+    auto expScene = [](int p) -> int {
+        return (p >= LEGACY_FACTORY_PATTERN_COUNT && p < FACTORY_PATTERN_COUNT)
+             ? (p - LEGACY_FACTORY_PATTERN_COUNT) % 8 : -1;
+    };
+    auto expGroup = [](int p) -> int {
+        return (p >= LEGACY_FACTORY_PATTERN_COUNT && p < FACTORY_PATTERN_COUNT)
+             ? (p - LEGACY_FACTORY_PATTERN_COUNT) / 8 : -1;
+    };
+    auto announce = [&](int pick, const char* reason)
+    {
+        if(!autoToastEnabled) return;
+        PatternMetadata pickMeta{};
+        char toastMsg[64];
+        if(sequencer.getPatternMetadata(pick, pickMeta))
+            snprintf(toastMsg, sizeof(toastMsg), "SONG -> P%03d %s (%s)",
+                     pick + 1, pickMeta.name, reason);
+        else
+            snprintf(toastMsg, sizeof(toastMsg), "SONG -> P%03d (%s)", pick + 1, reason);
+        ui_request_random_song_toast(toastMsg);
+    };
+
+    // Curated flow: skip the weighted random pick below entirely and walk
+    // the expansion bank's WRITTEN scene order instead — the ten songs the
+    // pattern bank was actually composed as, front to back. "Known to
+    // sound good back to back" instead of "probably sounds good back to
+    // back". Falls through to the weighted picker once the chain leaves
+    // the expansion bank (legacy/user patterns have no scene order).
+    if(songCurated)
+    {
+        const int group = expGroup(current);
+        const int pick = (group >= 0)
+            ? ((expScene(current) < 7) ? current + 1
+                                        : 20 + ((group + 1) % 10) * 8)
+            : 20;   // starts the curated chain from song I
+        control_send_queue_pattern(pick);
+        announce(pick, "modo curado");
+        return;
+    }
+
     const char* keyword = songStyleKeyword(songStyle);
 
     int candidates[MAX_PATTERNS];
@@ -1504,10 +1549,8 @@ void triggerRandomSongJump()
     if(poolCount == 0) return;   // nothing else saved to jump to
 
     // ── Musical flow instead of a uniform dice ──────────────────────────
-    // The expansion bank (slots 20..99) is ten consecutive 8-scene "songs",
-    // each an energy arc (skeleton -> groove -> hook -> build -> peak ->
-    // break -> outro). A uniform pick teleports between unrelated scenes;
-    // this weighted pick reads like a DJ set instead:
+    // A uniform pick teleports between unrelated scenes; this weighted pick
+    // reads like a DJ set instead:
     //  - inside the current song, strongly prefer the NEXT scene (the
     //    written arc), then a small skip ahead, then one step back (a
     //    breakdown feel) — but never deterministically;
@@ -1517,15 +1560,6 @@ void triggerRandomSongJump()
     //    (unison, fourth/fifth, relative) via getFactoryPatternKey().
     // Legacy (0..19) and user slots still participate through the BPM and
     // key terms plus the base weight, so nothing becomes unreachable.
-    auto expScene = [](int p) -> int {
-        return (p >= LEGACY_FACTORY_PATTERN_COUNT && p < FACTORY_PATTERN_COUNT)
-             ? (p - LEGACY_FACTORY_PATTERN_COUNT) % 8 : -1;
-    };
-    auto expGroup = [](int p) -> int {
-        return (p >= LEGACY_FACTORY_PATTERN_COUNT && p < FACTORY_PATTERN_COUNT)
-             ? (p - LEGACY_FACTORY_PATTERN_COUNT) / 8 : -1;
-    };
-
     PatternMetadata curMeta{};
     const int curBpm = sequencer.getPatternMetadata(current, curMeta)
                      ? (int)curMeta.recommendedBpm : 0;
@@ -1597,15 +1631,7 @@ void triggerRandomSongJump()
         if(roll < 0) { pick = pool[i]; pickReason = reasons[i]; break; }
     }
     control_send_queue_pattern(pick);
-
-    PatternMetadata pickMeta{};
-    char toastMsg[64];
-    if(sequencer.getPatternMetadata(pick, pickMeta))
-        snprintf(toastMsg, sizeof(toastMsg), "SONG -> P%03d %s (%s)",
-                 pick + 1, pickMeta.name, pickReason);
-    else
-        snprintf(toastMsg, sizeof(toastMsg), "SONG -> P%03d (%s)", pick + 1, pickReason);
-    ui_request_random_song_toast(toastMsg);
+    announce(pick, pickReason);
 }
 
 // One AUTO VARIATIONS pass: applies a random named structural variation
@@ -1641,10 +1667,18 @@ bool VariationApply()
     uint8_t pick = set[randomRange(0, 4)];
     if(pick == lastAutoVariation) pick = set[randomRange(0, 4)];
     if(!control_apply_sequencer_variation(pick)) return false;
+    const bool wasTension = autoVariationTension;
     lastAutoVariation = pick;
     autoVariationTension = !autoVariationTension;
     control_sync_current_pattern();
     ui_request_sequencer_resync();
+    if(autoToastEnabled)
+    {
+        char toastMsg[64];
+        snprintf(toastMsg, sizeof(toastMsg), "VAR -> %s (%s)",
+                 ui_variation_name(pick), wasTension ? "tension" : "relajacion");
+        ui_request_variation_toast(toastMsg);
+    }
     return true;
 }
 
@@ -1745,6 +1779,11 @@ void control_random_song_set_bars(uint8_t bars)
     songClock.bars = bars < 1 ? 1 : (bars > 8 ? 8 : bars);
 }
 uint8_t control_random_song_bars() { return songClock.bars; }
+void control_random_song_set_curated(bool curated) { songCurated = curated; }
+bool control_random_song_curated() { return songCurated; }
+
+void control_auto_toast_set_enabled(bool enabled) { autoToastEnabled = enabled; }
+bool control_auto_toast_enabled() { return autoToastEnabled; }
 
 void control_random_fx_set_active(bool active)
 {

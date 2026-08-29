@@ -101,6 +101,17 @@ void ui_request_random_song_toast(const char* msg) {
     s_ui_random_song_toast_pending.store(true, std::memory_order_release);
 }
 
+// Same single-producer pattern as the RANDOM SONG toast above, for AUTO
+// VARIATIONS' own toast.
+static char s_ui_variation_toast_msg[64];
+static std::atomic<bool> s_ui_variation_toast_pending{false};
+
+void ui_request_variation_toast(const char* msg) {
+    strncpy(s_ui_variation_toast_msg, msg, sizeof(s_ui_variation_toast_msg) - 1);
+    s_ui_variation_toast_msg[sizeof(s_ui_variation_toast_msg) - 1] = '\0';
+    s_ui_variation_toast_pending.store(true, std::memory_order_release);
+}
+
 // Touch debounce tuned for GT911 + multi-indev setup.
 static const uint32_t MUTE_DEBOUNCE_TRACK_MS = 180;
 static const uint32_t MUTE_DEBOUNCE_GLOBAL_MS = 60;
@@ -8122,6 +8133,12 @@ static const SequencerVariationOption SEQ_VARIATION_OPTIONS[] = {
     {SEQ_VAR_UNDO,          "UNDO LAST VAR",  "Restaura el estado anterior"},
 };
 
+const char* ui_variation_name(uint8_t id) {
+    for (const auto& option : SEQ_VARIATION_OPTIONS)
+        if (option.id == id) return option.name;
+    return "VARIACION";
+}
+
 struct SeqRandomStyleOption {
     uint8_t id;
     const char* name;
@@ -8616,6 +8633,8 @@ static lv_obj_t* seq_kanban_style_btn    = NULL;   // SONG only
 static lv_obj_t* seq_kanban_evolve_slider = NULL;  // EVOLVE only
 static lv_obj_t* seq_kanban_evolve_lbl    = NULL;  // EVOLVE only
 static lv_obj_t* seq_kanban_variation_btn = NULL;  // VARIATIONS only — manual "fire one now"
+static lv_obj_t* seq_kanban_toast_btn = NULL;        // global — mute/unmute AUTO toasts
+static lv_obj_t* seq_kanban_song_curated_btn = NULL; // SONG only — curated vs weighted flow
 
 // Each column's ON/OFF toggle doubles as its bypass switch: turning a mode
 // OFF never clears its bars/style/amount — those stay exactly as set, so
@@ -8700,6 +8719,18 @@ static void seq_kanban_refresh(void) {
         lv_slider_set_value(seq_kanban_evolve_slider, control_random_evolve_amount(), LV_ANIM_OFF);
     if (seq_kanban_evolve_lbl)
         lv_label_set_text_fmt(seq_kanban_evolve_lbl, "%d%%", control_random_evolve_amount());
+    if (seq_kanban_toast_btn) {
+        const bool on = control_auto_toast_enabled();
+        apply_control_button_style(seq_kanban_toast_btn, on ? RED808_SUCCESS : RED808_BORDER, false, 8);
+        lv_obj_t* lbl = lv_obj_get_child(seq_kanban_toast_btn, 0);
+        if (lbl) lv_label_set_text_fmt(lbl, "TOASTS %s", on ? "ON" : "OFF");
+    }
+    if (seq_kanban_song_curated_btn) {
+        const bool on = control_random_song_curated();
+        apply_control_button_style(seq_kanban_song_curated_btn, on ? RED808_SUCCESS : RED808_BORDER, false, 8);
+        lv_obj_t* lbl = lv_obj_get_child(seq_kanban_song_curated_btn, 0);
+        if (lbl) lv_label_set_text_fmt(lbl, "CURADO\n%s", on ? "ON" : "OFF");
+    }
 }
 
 static void seq_kanban_toggle_cb(lv_event_t* e) {
@@ -8727,6 +8758,16 @@ static void seq_kanban_style_cb(lv_event_t* /*e*/) {
 static void seq_kanban_evolve_amount_cb(lv_event_t* e) {
     lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
     control_random_evolve_set_amount((uint8_t)lv_slider_get_value(slider));
+    seq_kanban_refresh();
+}
+
+static void seq_kanban_toast_toggle_cb(lv_event_t* /*e*/) {
+    control_auto_toast_set_enabled(!control_auto_toast_enabled());
+    seq_kanban_refresh();
+}
+
+static void seq_kanban_song_curated_cb(lv_event_t* /*e*/) {
+    control_random_song_set_curated(!control_random_song_curated());
     seq_kanban_refresh();
 }
 
@@ -8761,6 +8802,8 @@ static void seq_kanban_modal_hide(lv_event_t* e = NULL) {
     seq_kanban_evolve_slider = NULL;
     seq_kanban_evolve_lbl = NULL;
     seq_kanban_variation_btn = NULL;
+    seq_kanban_toast_btn = NULL;
+    seq_kanban_song_curated_btn = NULL;
 }
 
 static void seq_kanban_modal_show(lv_event_t* /*e*/) {
@@ -8776,7 +8819,7 @@ static void seq_kanban_modal_show(lv_event_t* /*e*/) {
     lv_obj_add_event_cb(seq_kanban_modal, seq_kanban_modal_hide, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(seq_kanban_modal);
-    lv_obj_set_size(card, 1000, 280);
+    lv_obj_set_size(card, 1000, 320);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_border_width(card, 2, 0);
@@ -8797,6 +8840,17 @@ static void seq_kanban_modal_show(lv_event_t* /*e*/) {
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(hint, 0, 26);
+
+    // Global — mutes the informational toasts SONG/VARIATIONS/FX/MIX show
+    // while running unattended (never affects what the modes actually do).
+    seq_kanban_toast_btn = lv_btn_create(card);
+    lv_obj_set_size(seq_kanban_toast_btn, 140, 26);
+    lv_obj_set_pos(seq_kanban_toast_btn, 1000 - 32 - 140 - 8, 2);
+    lv_obj_add_event_cb(seq_kanban_toast_btn, seq_kanban_toast_toggle_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* toastLbl = lv_label_create(seq_kanban_toast_btn);
+    lv_obj_set_style_text_font(toastLbl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(toastLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(toastLbl);
 
     constexpr int colW = 185;
     constexpr int colGap = 8;
@@ -8845,6 +8899,18 @@ static void seq_kanban_modal_show(lv_event_t* /*e*/) {
             lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, 0);
             lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_center(lbl);
+
+            // Curated: walks the expansion bank's written scene order
+            // (known-good sequence) instead of the weighted-random jump.
+            seq_kanban_song_curated_btn = lv_btn_create(card);
+            lv_obj_set_size(seq_kanban_song_curated_btn, colW, 32);
+            lv_obj_set_pos(seq_kanban_song_curated_btn, colX, 180);
+            lv_obj_add_event_cb(seq_kanban_song_curated_btn, seq_kanban_song_curated_cb,
+                                LV_EVENT_CLICKED, NULL);
+            lv_obj_t* curLbl = lv_label_create(seq_kanban_song_curated_btn);
+            lv_obj_set_style_text_font(curLbl, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_align(curLbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_center(curLbl);
         } else if (m == KANBAN_EVOLVE) {
             lv_obj_t* amountLbl = lv_label_create(card);
             lv_label_set_text(amountLbl, "CANTIDAD:");
@@ -8890,7 +8956,7 @@ static void seq_kanban_modal_show(lv_event_t* /*e*/) {
 
     lv_obj_t* closeBtn = lv_btn_create(card);
     lv_obj_set_size(closeBtn, 1000 - 32, 32);
-    lv_obj_set_pos(closeBtn, 0, 196);
+    lv_obj_set_pos(closeBtn, 0, 236);
     apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
     lv_obj_add_event_cb(closeBtn, seq_kanban_modal_hide, LV_EVENT_CLICKED, NULL);
     lv_obj_t* closeLbl = lv_label_create(closeBtn);
@@ -15942,6 +16008,8 @@ static void ui_reload_themed_screens(void) {
     seq_kanban_evolve_slider = NULL;
     seq_kanban_evolve_lbl = NULL;
     seq_kanban_variation_btn = NULL;
+    seq_kanban_toast_btn = NULL;
+    seq_kanban_song_curated_btn = NULL;
     seq_pattern_list_modal = NULL;
     seq_save_confirm_modal = NULL;
     seq_save_confirm_slot = -1;
@@ -16780,11 +16848,13 @@ void ui_update_current_screen(void) {
     if (s_ui_step_dots_pending.exchange(false, std::memory_order_acquire))
         ui_sequencer_refresh_all_step_dots();
     if (s_ui_fx_random_tick_pending.exchange(false, std::memory_order_acquire))
-        fx_random_apply(false);
+        fx_random_apply(control_auto_toast_enabled());
     if (s_ui_mix_random_tick_pending.exchange(false, std::memory_order_acquire))
-        mix_random_apply(false);
+        mix_random_apply(control_auto_toast_enabled());
     if (s_ui_random_song_toast_pending.exchange(false, std::memory_order_acquire))
         ui_show_toast(s_ui_random_song_toast_msg, RED808_CYAN);
+    if (s_ui_variation_toast_pending.exchange(false, std::memory_order_acquire))
+        ui_show_toast(s_ui_variation_toast_msg, RED808_CYAN);
 
     // Melody state published by the local controller. Snapshot
     // before clearing pending so a concurrent re-latch is never half-read.

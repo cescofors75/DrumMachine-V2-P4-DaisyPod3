@@ -111,3 +111,13 @@ void ui_request_mix_random_tick(void);    // -> mix_random_apply(false)
 // Techno III. Acid (siguiente escena)". msg is copied into a fixed-size
 // buffer; safe from any task.
 void ui_request_random_song_toast(const char* msg);
+
+// Same idea for AUTO VARIATIONS: shows which named variation the last
+// automatic pass applied. msg copied into a fixed-size buffer; safe from
+// any task.
+void ui_request_variation_toast(const char* msg);
+
+// Display name for a SEQ_VAR_* id (e.g. "GHOST GROOVE"), or "VARIACION"
+// if unknown. Backs both the manual VAR popup and the AUTO VARIATIONS
+// toast so the two paths never drift apart.
+const char* ui_variation_name(uint8_t id);
