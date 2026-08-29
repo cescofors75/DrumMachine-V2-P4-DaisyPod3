@@ -3,7 +3,13 @@
 #include "Sequencer.h"
 
 static constexpr uint8_t BUILTIN_PATTERN_COUNT = 16;
-static constexpr uint8_t FACTORY_PATTERN_COUNT = 20;
+// Slots 0..19: the original S3 JSON bank (untouched, still what "20
+// patrones" refers to). Slots 20..99: the new genre expansion bank added
+// on top of it. FACTORY_PATTERN_COUNT is the TOTAL now live on the device;
+// LEGACY_FACTORY_PATTERN_COUNT is only the size of the old pad-8 refinement
+// tables, which apply to the original 20 alone.
+static constexpr uint8_t LEGACY_FACTORY_PATTERN_COUNT = 20;
+static constexpr uint8_t FACTORY_PATTERN_COUNT = 100;
 static constexpr uint8_t BUILTIN_ENGINE_COUNT = 9;
 
 struct BuiltinPatternSoundProfile {
@@ -16,6 +22,11 @@ void initializeProfessionalPatternBank(Sequencer& sequencer);
 // /patterns/20_patrones_factory_daisy.json, including its historical pad-8
 // refinement. Embedded here so a normal P4 firmware flash is sufficient.
 void initializeEsp32S3FactoryPatternBank(Sequencer& sequencer);
+// Adds 80 new professional patterns in slots 20..99, ten genres x eight
+// scenes each (one genre = one consecutive 8-pattern "song"). Leaves the
+// original 20-pattern bank above completely untouched; call right after
+// initializeEsp32S3FactoryPatternBank at boot.
+void initializeFactoryExpansionBank(Sequencer& sequencer);
 bool getBuiltinPatternSoundProfile(int pattern, BuiltinPatternSoundProfile& out);
 void resetPatternSoundProfiles(void);
 void setPatternSoundProfile(int pattern, const BuiltinPatternSoundProfile& profile);

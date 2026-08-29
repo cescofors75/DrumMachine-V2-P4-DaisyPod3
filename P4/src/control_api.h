@@ -105,6 +105,19 @@ void control_random_evolve_set_amount(uint8_t amount);  // 0-100
 uint8_t control_random_evolve_amount();
 void control_random_evolve_apply_now();                 // one manual pass
 
+// AUTO VARIATIONS: a fifth bar-clock auto mode alongside SONG/FX/MIX/EVOLVE
+// above. Every N bars while active and playing, applies one random named
+// structural variation from the same list the manual VAR button offers
+// (NEON_BREAK, RATCHET_STORM, GHOST_GROOVE, POLYRHYTHM, HALF_TIME, MIRROR,
+// TOM_CASCADE, ACID_SWITCH, HAT_LIFT, SPARSE_SPACE — never UNDO). apply_now
+// lets the AUTO panel's own "RANDOM NOW" button fire one immediately
+// without waiting for the clock.
+void control_random_variation_set_active(bool active);
+bool control_random_variation_active();
+void control_random_variation_set_bars(uint8_t bars);      // 1/2/4/8
+uint8_t control_random_variation_bars();
+bool control_random_variation_apply_now();   // true if the pattern actually changed
+
 bool control_sync_current_pattern();
 bool control_patterns_ready();
 uint8_t control_factory_patterns_found();

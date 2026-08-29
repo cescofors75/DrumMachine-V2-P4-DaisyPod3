@@ -461,6 +461,7 @@ void control_init()
 {
     Sequencer& sequencer = SequencerInstance();
     initializeEsp32S3FactoryPatternBank(sequencer);
+    initializeFactoryExpansionBank(sequencer);
     pattern_store_load_user_bank(sequencer);
     sequencer.setTempo(124.0f);
     sequencer.selectPattern(0);
@@ -1314,6 +1315,7 @@ BarClock songClock;
 BarClock fxClock;
 BarClock mixClock;
 BarClock evolveClock;
+BarClock variationClock;
 uint8_t songStyle = RND_STYLE_TECHNO;
 uint8_t evolveAmount = 40;   // 0-100, dial default
 
@@ -1429,7 +1431,11 @@ void triggerRandomSongJump()
         if(containsIgnoreCase(meta.genre, keyword) || containsIgnoreCase(meta.name, keyword))
             candidates[candidateCount++] = p;
     };
-    for(int p = 0; p < BUILTIN_PATTERN_COUNT; ++p)
+    // FACTORY_PATTERN_COUNT is the full 100-pattern factory bank (the
+    // original 20 plus the genre expansion added in slots 20..99) — was
+    // BUILTIN_PATTERN_COUNT (16) here, which meant RANDOM SONG never even
+    // saw patterns 16..99.
+    for(int p = 0; p < FACTORY_PATTERN_COUNT; ++p)
         consider(p);
     for(int p = USER_PATTERN_FIRST; p < MAX_PATTERNS; ++p)
         if(pattern_store_is_saved(p))
@@ -1441,6 +1447,15 @@ void triggerRandomSongJump()
 
     const int pick = pool[randomRange(0, poolCount - 1)];
     control_send_queue_pattern(pick);
+}
+
+// One AUTO VARIATIONS pass: picks a random named structural variation
+// (never UNDO — that stays a manual, deliberate action) and applies it to
+// the current pattern via the exact same path the VAR popup's buttons use.
+bool VariationApply()
+{
+    const uint8_t pick = (uint8_t)randomRange(SEQ_VAR_NEON_BREAK, SEQ_VAR_SPARSE_SPACE);
+    return control_apply_sequencer_variation(pick);
 }
 
 // One EVOLVE pass. Kick/snare's structure never changes no matter the
@@ -1583,17 +1598,31 @@ void control_random_evolve_set_amount(uint8_t amount)
 uint8_t control_random_evolve_amount() { return evolveAmount; }
 void control_random_evolve_apply_now() { EvolveApply(); }
 
+void control_random_variation_set_active(bool active)
+{
+    variationClock.active = active;
+    variationClock.windowOpen = false;
+}
+bool control_random_variation_active() { return variationClock.active; }
+void control_random_variation_set_bars(uint8_t bars)
+{
+    variationClock.bars = bars < 1 ? 1 : (bars > 8 ? 8 : bars);
+}
+uint8_t control_random_variation_bars() { return variationClock.bars; }
+bool control_random_variation_apply_now() { return VariationApply(); }
+
 // Called once per control_process() tick — the auto-mode "conductor". Pure
-// control-layer logic for the song jump and EVOLVE; FX/mix re-randomization
-// delegates to the same LVGL-side apply functions the manual RANDOM
-// buttons use, so there is exactly one implementation of what "random"
-// means for each.
+// control-layer logic for the song jump, EVOLVE and VARIATIONS; FX/mix
+// re-randomization delegates to the same LVGL-side apply functions the
+// manual RANDOM buttons use, so there is exactly one implementation of
+// what "random" means for each.
 void control_random_auto_tick()
 {
     if(barClockTick(songClock)) triggerRandomSongJump();
     if(barClockTick(fxClock)) fx_random_apply(false);
     if(barClockTick(mixClock)) mix_random_apply(false);
     if(barClockTick(evolveClock)) EvolveApply();
+    if(barClockTick(variationClock)) VariationApply();
 }
 
 bool control_variation_can_undo()

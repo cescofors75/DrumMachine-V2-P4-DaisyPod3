@@ -7837,7 +7837,7 @@ static void seq_pattern_list_show_mode(bool saveMode) {
     lv_obj_t* title = lv_label_create(seq_pattern_list_modal);
     lv_label_set_text(title, saveMode
         ? "GUARDAR COPIA · P101-P128"
-        : "P1-P20 FACTORY · P101-P128 USER");
+        : "P1-P100 FACTORY · P101-P128 USER");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, RED808_ACCENT, 0);
     lv_obj_set_pos(title, 16, 10);
@@ -8532,8 +8532,8 @@ static void seq_song_modal_show(lv_event_t* /*e*/) {
 // side by side so you don't have to hop between four popups to see or
 // change what's currently running. All state lives in control_api.cpp
 // already (control_random_song/fx/mix/evolve_*) — this panel is pure UI.
-enum { KANBAN_SONG = 0, KANBAN_FX, KANBAN_MIX, KANBAN_EVOLVE, KANBAN_COUNT };
-static const char* const KANBAN_NAMES[KANBAN_COUNT] = {"SONG", "AUTO FX", "AUTO MIX", "EVOLVE"};
+enum { KANBAN_SONG = 0, KANBAN_FX, KANBAN_MIX, KANBAN_EVOLVE, KANBAN_VARIATION, KANBAN_COUNT };
+static const char* const KANBAN_NAMES[KANBAN_COUNT] = {"SONG", "AUTO FX", "AUTO MIX", "EVOLVE", "VAR"};
 static const uint8_t KANBAN_BAR_OPTIONS[4] = {1, 2, 4, 8};
 
 // fwd decl: defined later, in the MIXER section — used here to keep the
@@ -8545,44 +8545,55 @@ static lv_obj_t* seq_kanban_bars_btns[KANBAN_COUNT][4] = {};
 static lv_obj_t* seq_kanban_style_btn    = NULL;   // SONG only
 static lv_obj_t* seq_kanban_evolve_slider = NULL;  // EVOLVE only
 static lv_obj_t* seq_kanban_evolve_lbl    = NULL;  // EVOLVE only
+static lv_obj_t* seq_kanban_variation_btn = NULL;  // VARIATIONS only — manual "fire one now"
 
+// Each column's ON/OFF toggle doubles as its bypass switch: turning a mode
+// OFF never clears its bars/style/amount — those stay exactly as set, so
+// flipping it back ON resumes with the same configuration. That's true for
+// all five columns, VARIATIONS included, with no extra state needed.
 static bool kanban_active(int mode) {
     switch (mode) {
-        case KANBAN_SONG:   return control_random_song_active();
-        case KANBAN_FX:     return control_random_fx_active();
-        case KANBAN_MIX:    return control_random_mix_active();
-        case KANBAN_EVOLVE: return control_random_evolve_active();
+        case KANBAN_SONG:      return control_random_song_active();
+        case KANBAN_FX:        return control_random_fx_active();
+        case KANBAN_MIX:       return control_random_mix_active();
+        case KANBAN_EVOLVE:    return control_random_evolve_active();
+        case KANBAN_VARIATION: return control_random_variation_active();
         default: return false;
     }
 }
 static void kanban_set_active(int mode, bool v) {
     switch (mode) {
-        case KANBAN_SONG:   control_random_song_set_active(v); break;
-        case KANBAN_FX:     control_random_fx_set_active(v); break;
-        case KANBAN_MIX:    control_random_mix_set_active(v); break;
-        case KANBAN_EVOLVE: control_random_evolve_set_active(v); break;
+        case KANBAN_SONG:      control_random_song_set_active(v); break;
+        case KANBAN_FX:        control_random_fx_set_active(v); break;
+        case KANBAN_MIX:       control_random_mix_set_active(v); break;
+        case KANBAN_EVOLVE:    control_random_evolve_set_active(v); break;
+        case KANBAN_VARIATION: control_random_variation_set_active(v); break;
     }
 }
 static uint8_t kanban_bars(int mode) {
     switch (mode) {
-        case KANBAN_SONG:   return control_random_song_bars();
-        case KANBAN_FX:     return control_random_fx_bars();
-        case KANBAN_MIX:    return control_random_mix_bars();
-        case KANBAN_EVOLVE: return control_random_evolve_bars();
+        case KANBAN_SONG:      return control_random_song_bars();
+        case KANBAN_FX:        return control_random_fx_bars();
+        case KANBAN_MIX:       return control_random_mix_bars();
+        case KANBAN_EVOLVE:    return control_random_evolve_bars();
+        case KANBAN_VARIATION: return control_random_variation_bars();
         default: return 1;
     }
 }
 static void kanban_set_bars(int mode, uint8_t bars) {
     switch (mode) {
-        case KANBAN_SONG:   control_random_song_set_bars(bars); break;
-        case KANBAN_FX:     control_random_fx_set_bars(bars); break;
-        case KANBAN_MIX:    control_random_mix_set_bars(bars); break;
-        case KANBAN_EVOLVE: control_random_evolve_set_bars(bars); break;
+        case KANBAN_SONG:      control_random_song_set_bars(bars); break;
+        case KANBAN_FX:        control_random_fx_set_bars(bars); break;
+        case KANBAN_MIX:       control_random_mix_set_bars(bars); break;
+        case KANBAN_EVOLVE:    control_random_evolve_set_bars(bars); break;
+        case KANBAN_VARIATION: control_random_variation_set_bars(bars); break;
     }
 }
 // Keeps each mode's own dedicated header button (SONG/EVOLVE) or screen
 // button (AUTO FX/AUTO MIX) visually in sync the instant this panel
 // changes it, so nothing here can go stale next time you see it elsewhere.
+// VARIATIONS has no such dedicated button anywhere else — this panel is
+// its only home — so there is nothing to sync for it.
 static void kanban_refresh_owner_btn(int mode) {
     switch (mode) {
         case KANBAN_SONG:   seq_song_btn_refresh(); break;
@@ -8649,6 +8660,25 @@ static void seq_kanban_evolve_amount_cb(lv_event_t* e) {
     seq_kanban_refresh();
 }
 
+static void seq_kanban_variation_random_cb(lv_event_t* /*e*/) {
+    if (!control_random_variation_apply_now()) {
+        ui_show_toast("La variacion no cambia este patron", RED808_WARNING);
+        return;
+    }
+    const int base = seq_page * 16;
+    for (int track = 0; track < 16; ++track)
+        for (int step = 0; step < 16; ++step)
+            if (base + step < 64)
+                seq_raw_grid[track][base + step] = p4.steps[track][step];
+    seq_force_refresh_cells = true;
+    seq_set_pattern_dirty(true);
+    // Never perform a multi-packet upload from the LVGL callback — same
+    // rule the manual VAR popup follows. The loop drains this flag and
+    // sends one coherent pattern snapshot to Daisy.
+    s_ctrl_pattern_sync_pending.store(true, std::memory_order_release);
+    ui_show_toast("Variacion aleatoria aplicada", RED808_CYAN);
+}
+
 static void seq_kanban_modal_hide(lv_event_t* e = NULL) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     if (seq_kanban_modal) lv_obj_del(seq_kanban_modal);
@@ -8660,6 +8690,7 @@ static void seq_kanban_modal_hide(lv_event_t* e = NULL) {
     seq_kanban_style_btn = NULL;
     seq_kanban_evolve_slider = NULL;
     seq_kanban_evolve_lbl = NULL;
+    seq_kanban_variation_btn = NULL;
 }
 
 static void seq_kanban_modal_show(lv_event_t* /*e*/) {
@@ -8675,7 +8706,7 @@ static void seq_kanban_modal_show(lv_event_t* /*e*/) {
     lv_obj_add_event_cb(seq_kanban_modal, seq_kanban_modal_hide, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(seq_kanban_modal);
-    lv_obj_set_size(card, 984, 280);
+    lv_obj_set_size(card, 1000, 280);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_border_width(card, 2, 0);
@@ -8692,13 +8723,13 @@ static void seq_kanban_modal_show(lv_event_t* /*e*/) {
     lv_obj_set_pos(title, 0, 0);
 
     lv_obj_t* hint = lv_label_create(card);
-    lv_label_set_text(hint, "Los 4 modos ligados a reproduccion, de un vistazo");
+    lv_label_set_text(hint, "Los 5 modos ligados a reproduccion, de un vistazo. ON/OFF = bypass: no borra el ajuste");
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(hint, 0, 26);
 
-    constexpr int colW = 230;
-    constexpr int colGap = 10;
+    constexpr int colW = 185;
+    constexpr int colGap = 8;
 
     for (int m = 0; m < KANBAN_COUNT; ++m) {
         const int colX = m * (colW + colGap);
@@ -8719,8 +8750,8 @@ static void seq_kanban_modal_show(lv_event_t* /*e*/) {
         lv_obj_set_style_text_color(barsLbl, RED808_TEXT_DIM, 0);
         lv_obj_set_pos(barsLbl, colX, 92);
 
-        constexpr int chipW = 51;
-        constexpr int chipGap = 6;
+        constexpr int chipW = 41;
+        constexpr int chipGap = 5;
         for (int i = 0; i < 4; ++i) {
             lv_obj_t* chip = lv_btn_create(card);
             seq_kanban_bars_btns[m][i] = chip;
@@ -8772,11 +8803,23 @@ static void seq_kanban_modal_show(lv_event_t* /*e*/) {
                                 LV_EVENT_VALUE_CHANGED, NULL);
             lv_obj_add_event_cb(seq_kanban_evolve_slider, seq_kanban_evolve_amount_cb,
                                 LV_EVENT_RELEASED, NULL);
+        } else if (m == KANBAN_VARIATION) {
+            seq_kanban_variation_btn = lv_btn_create(card);
+            lv_obj_set_size(seq_kanban_variation_btn, colW, 34);
+            lv_obj_set_pos(seq_kanban_variation_btn, colX, 140);
+            apply_control_button_style(seq_kanban_variation_btn, RED808_ACCENT2, false, 8);
+            lv_obj_add_event_cb(seq_kanban_variation_btn, seq_kanban_variation_random_cb,
+                                LV_EVENT_CLICKED, NULL);
+            lv_obj_t* lbl = lv_label_create(seq_kanban_variation_btn);
+            lv_label_set_text(lbl, "ALEATORIA\nAHORA");
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_center(lbl);
         }
     }
 
     lv_obj_t* closeBtn = lv_btn_create(card);
-    lv_obj_set_size(closeBtn, 984 - 32, 32);
+    lv_obj_set_size(closeBtn, 1000 - 32, 32);
     lv_obj_set_pos(closeBtn, 0, 196);
     apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
     lv_obj_add_event_cb(closeBtn, seq_kanban_modal_hide, LV_EVENT_CLICKED, NULL);
@@ -15828,6 +15871,7 @@ static void ui_reload_themed_screens(void) {
     seq_kanban_style_btn = NULL;
     seq_kanban_evolve_slider = NULL;
     seq_kanban_evolve_lbl = NULL;
+    seq_kanban_variation_btn = NULL;
     seq_pattern_list_modal = NULL;
     seq_save_confirm_modal = NULL;
     seq_save_confirm_slot = -1;
