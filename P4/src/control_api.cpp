@@ -1503,21 +1503,125 @@ void triggerRandomSongJump()
     const int poolCount = candidateCount > 0 ? candidateCount : fallbackCount;
     if(poolCount == 0) return;   // nothing else saved to jump to
 
-    const int pick = pool[randomRange(0, poolCount - 1)];
+    // ── Musical flow instead of a uniform dice ──────────────────────────
+    // The expansion bank (slots 20..99) is ten consecutive 8-scene "songs",
+    // each an energy arc (skeleton -> groove -> hook -> build -> peak ->
+    // break -> outro). A uniform pick teleports between unrelated scenes;
+    // this weighted pick reads like a DJ set instead:
+    //  - inside the current song, strongly prefer the NEXT scene (the
+    //    written arc), then a small skip ahead, then one step back (a
+    //    breakdown feel) — but never deterministically;
+    //  - when leaving the song, prefer tempo-compatible material (|dBPM|
+    //    < 36), land near a new song's intro/groove rather than mid-peak,
+    //    keep a similar energy level, and favor harmonically related keys
+    //    (unison, fourth/fifth, relative) via getFactoryPatternKey().
+    // Legacy (0..19) and user slots still participate through the BPM and
+    // key terms plus the base weight, so nothing becomes unreachable.
+    auto expScene = [](int p) -> int {
+        return (p >= LEGACY_FACTORY_PATTERN_COUNT && p < FACTORY_PATTERN_COUNT)
+             ? (p - LEGACY_FACTORY_PATTERN_COUNT) % 8 : -1;
+    };
+    auto expGroup = [](int p) -> int {
+        return (p >= LEGACY_FACTORY_PATTERN_COUNT && p < FACTORY_PATTERN_COUNT)
+             ? (p - LEGACY_FACTORY_PATTERN_COUNT) / 8 : -1;
+    };
+
+    PatternMetadata curMeta{};
+    const int curBpm = sequencer.getPatternMetadata(current, curMeta)
+                     ? (int)curMeta.recommendedBpm : 0;
+    const int curGroup = expGroup(current);
+    const int curScene = expScene(current);
+    const uint8_t curKey = getFactoryPatternKey(current);
+
+    int weights[MAX_PATTERNS];
+    int totalWeight = 0;
+    for(int i = 0; i < poolCount; ++i)
+    {
+        const int p = pool[i];
+        int w = 8;   // base: anything CAN happen, just rarely
+        const int group = expGroup(p);
+        const int scene = expScene(p);
+        if(curGroup >= 0 && group == curGroup)
+        {
+            const int ahead = ((scene - curScene) + 8) % 8;
+            if(ahead == 1)      w += 90;   // the written arc: next scene
+            else if(ahead == 2) w += 45;   // small skip forward
+            else if(ahead == 7) w += 30;   // one step back (breakdown)
+            else if(ahead == 4) w += 12;   // jump to the opposite section
+            else                w += 6;
+        }
+        else
+        {
+            PatternMetadata m{};
+            if(curBpm > 0 && sequencer.getPatternMetadata(p, m)
+               && m.recommendedBpm > 0)
+            {
+                int delta = (int)m.recommendedBpm - curBpm;
+                if(delta < 0) delta = -delta;
+                if(delta < 36) w += 36 - delta;   // tempo family
+            }
+            if(scene >= 0 && scene <= 1) w += 18;  // enter songs at the top
+            if(scene >= 0 && curScene >= 0 && scene == curScene)
+                w += 8;                            // matched energy level
+            const uint8_t key = getFactoryPatternKey(p);
+            if(curKey != 255 && key != 255)
+            {
+                const int interval = ((int)key - (int)curKey + 12) % 12;
+                if(interval == 0)                        w += 14; // same key
+                else if(interval == 5 || interval == 7)  w += 12; // 4th/5th
+                else if(interval == 3 || interval == 9)  w += 8;  // relative
+                else if(interval == 2 || interval == 10) w += 4;  // step
+            }
+        }
+        weights[i] = w;
+        totalWeight += w;
+    }
+
+    int roll = (int)randomRange(0, totalWeight - 1);
+    int pick = pool[poolCount - 1];
+    for(int i = 0; i < poolCount; ++i)
+    {
+        roll -= weights[i];
+        if(roll < 0) { pick = pool[i]; break; }
+    }
     control_send_queue_pattern(pick);
 }
 
-// One AUTO VARIATIONS pass: picks a random named structural variation
-// (never UNDO — that stays a manual, deliberate action) and applies it to
-// the current pattern via the exact same path the VAR popup's buttons use.
+// One AUTO VARIATIONS pass: applies a random named structural variation
+// (never UNDO — that stays a manual, deliberate action) to the current
+// pattern via the exact same path the VAR popup's buttons use.
+//
+// Musical flow instead of a uniform dice: the ten variations split into a
+// TENSION set (adds density/energy: fills, ratchets, extra layers) and a
+// RELEASE set (opens space: ghosts, half-time, sparser texture), and each
+// successful pass alternates direction. That breathing — build, relax,
+// build — is how a human performer uses fills and drops; ten equally
+// likely mutations back to back just piles chaos on chaos. Within the
+// chosen set the pick is still random (one re-roll avoids echoing the
+// exact same variation two rounds apart).
+//
 // Unlike the popup (whose LVGL callback repaints the grid and stages the
 // Daisy sync itself), this runs on the control task with no UI event — so
 // it must stage both explicitly, or Daisy keeps playing the old pattern
 // while the on-screen grid silently drifts out of date.
+uint8_t lastAutoVariation = 0;
+bool autoVariationTension = true;
 bool VariationApply()
 {
-    const uint8_t pick = (uint8_t)randomRange(SEQ_VAR_NEON_BREAK, SEQ_VAR_SPARSE_SPACE);
+    static const uint8_t kTension[5] = {
+        SEQ_VAR_NEON_BREAK, SEQ_VAR_RATCHET_STORM, SEQ_VAR_POLYRHYTHM,
+        SEQ_VAR_TOM_CASCADE, SEQ_VAR_HAT_LIFT,
+    };
+    static const uint8_t kRelease[5] = {
+        SEQ_VAR_GHOST_GROOVE, SEQ_VAR_HALF_TIME, SEQ_VAR_MIRROR,
+        SEQ_VAR_ACID_SWITCH, SEQ_VAR_SPARSE_SPACE,
+    };
+    const uint8_t* set = autoVariationTension ? kTension : kRelease;
+    uint8_t pick = set[randomRange(0, 4)];
+    if(pick == lastAutoVariation) pick = set[randomRange(0, 4)];
     if(!control_apply_sequencer_variation(pick)) return false;
+    lastAutoVariation = pick;
+    autoVariationTension = !autoVariationTension;
     control_sync_current_pattern();
     ui_request_sequencer_resync();
     return true;

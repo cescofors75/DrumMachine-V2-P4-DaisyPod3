@@ -1387,3 +1387,12 @@ void initializeFactoryExpansionBank(Sequencer& sequencer) {
   }
   sequencer.selectPattern(0);
 }
+
+uint8_t getFactoryPatternKey(int pattern) {
+  if (pattern >= 0 && pattern < LEGACY_FACTORY_PATTERN_COUNT)
+    return (uint8_t)(FACTORY_PAD8_ROOT[pattern] % 12u);
+  if (pattern >= LEGACY_FACTORY_PATTERN_COUNT && pattern < FACTORY_PATTERN_COUNT)
+    return (uint8_t)(EXP_SONG[(pattern - LEGACY_FACTORY_PATTERN_COUNT)
+                              / EXP_SCENES].bassRoot % 12u);
+  return 255;
+}

@@ -36,3 +36,10 @@ uint8_t getConfiguredPatternCount(void);
 // the generated 303 voice there; these lines replace the old 13/16-step gate
 // wall with deliberate, velocity-shaped phrases.
 void refineFactoryTwentyPatternBank(Sequencer& sequencer);
+
+// Pitch class (0..11, C=0) of a factory pattern's bass line root — slots
+// 0..19 from the legacy pad-8 root table, 20..99 from the expansion song
+// definitions. Returns 255 for user slots and anything without a known
+// key. Lets RANDOM SONG weight harmonically related jumps (same key,
+// fourth/fifth, relative major/minor) above tonally distant ones.
+uint8_t getFactoryPatternKey(int pattern);
