@@ -7611,6 +7611,8 @@ static lv_obj_t*  seq_hdr_queue_btn     = NULL;
 static lv_obj_t*  seq_hdr_queue_lbl     = NULL;
 static lv_obj_t*  seq_hdr_var_btn       = NULL;
 static lv_obj_t*  seq_variation_modal   = NULL;
+static lv_obj_t*  seq_hdr_song_btn      = NULL;
+static lv_obj_t*  seq_song_modal        = NULL;
 static lv_obj_t*  seq_song_style_btns[6] = {};
 static lv_obj_t*  seq_song_bars_btns[4]  = {};
 static lv_obj_t*  seq_song_toggle_btn    = NULL;
@@ -8073,16 +8075,18 @@ static const char* seq_random_style_name(int8_t style) {
 
 static lv_obj_t* seq_song_stop_badge = NULL;
 
-// Reflects RANDOM SONG (control_random_song_active()) on the VAR button
-// itself: a shuffle icon and accent color while the mode keeps jumping
-// between saved patterns every few bars, plain "VAR" otherwise. The corner
-// badge lets RANDOM SONG be killed with one tap, without opening VAR's modal.
-static void seq_var_btn_refresh(void) {
-    if (!seq_hdr_var_btn) return;
+// Reflects RANDOM SONG (control_random_song_active()) on its own SONG
+// button: a shuffle icon and accent color while the mode keeps jumping
+// between saved patterns every few bars, plain "SONG" otherwise. The
+// corner badge lets RANDOM SONG be killed with one tap, without opening
+// its modal. Pulled out of the VAR button/modal — RANDOM SONG is an AUTO
+// mode like EVOLVE/AUTO FX/AUTO MIX, not a one-shot pattern transform.
+static void seq_song_btn_refresh(void) {
+    if (!seq_hdr_song_btn) return;
     const bool active = control_random_song_active();
-    apply_control_button_style(seq_hdr_var_btn, active ? RED808_ACCENT2 : RED808_CYAN, false, 7);
-    lv_obj_t* lbl = lv_obj_get_child(seq_hdr_var_btn, 0);
-    if (lbl) lv_label_set_text(lbl, active ? LV_SYMBOL_SHUFFLE " VAR" : "VAR");
+    apply_control_button_style(seq_hdr_song_btn, active ? RED808_ACCENT2 : RED808_CYAN, false, 7);
+    lv_obj_t* lbl = lv_obj_get_child(seq_hdr_song_btn, 0);
+    if (lbl) lv_label_set_text(lbl, active ? LV_SYMBOL_SHUFFLE " SONG" : "SONG");
     if (seq_song_stop_badge) {
         if (active) lv_obj_clear_flag(seq_song_stop_badge, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(seq_song_stop_badge, LV_OBJ_FLAG_HIDDEN);
@@ -8092,7 +8096,7 @@ static void seq_var_btn_refresh(void) {
 static void seq_song_stop_badge_cb(lv_event_t* e) {
     LV_UNUSED(e);
     control_random_song_set_active(false);
-    seq_var_btn_refresh();
+    seq_song_btn_refresh();
 }
 
 // ── EVOLVE — third piece of PATTERN -> MUTATE -> EVOLVE ─────────────────
@@ -8303,9 +8307,6 @@ static void seq_variation_modal_hide(lv_event_t* e = NULL) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     if (seq_variation_modal) lv_obj_del(seq_variation_modal);
     seq_variation_modal = NULL;
-    for (int i = 0; i < 6; i++) seq_song_style_btns[i] = NULL;
-    for (int i = 0; i < 4; i++) seq_song_bars_btns[i] = NULL;
-    seq_song_toggle_btn = NULL;
 }
 
 static void seq_variation_select_cb(lv_event_t* e) {
@@ -8372,7 +8373,7 @@ static void seq_song_controls_refresh(void) {
         if (lbl) lv_label_set_text(lbl,
             active ? LV_SYMBOL_OK "  RANDOM SONG: ON" : LV_SYMBOL_CLOSE "  RANDOM SONG: OFF");
     }
-    seq_var_btn_refresh();
+    seq_song_btn_refresh();
 }
 
 static void seq_song_style_cb(lv_event_t* e) {
@@ -8398,6 +8399,131 @@ static void seq_song_toggle_cb(lv_event_t* /*e*/) {
     seq_song_controls_refresh();
 }
 
+// ── RANDOM SONG modal — pulled out of VAR's popup. It's an AUTO mode tied
+// to playback like EVOLVE/AUTO FX/AUTO MIX (jump to a different saved
+// pattern every N bars), not a one-shot pattern transform, so it gets the
+// same standalone treatment: its own header button + popup + stop badge.
+static void seq_song_modal_hide(lv_event_t* e = NULL) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (seq_song_modal) lv_obj_del(seq_song_modal);
+    seq_song_modal = NULL;
+    for (int i = 0; i < 6; i++) seq_song_style_btns[i] = NULL;
+    for (int i = 0; i < 4; i++) seq_song_bars_btns[i] = NULL;
+    seq_song_toggle_btn = NULL;
+}
+
+static void seq_song_modal_show(lv_event_t* /*e*/) {
+    if (seq_song_modal) return;
+
+    seq_song_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(seq_song_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(seq_song_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(seq_song_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(seq_song_modal, 0, 0);
+    lv_obj_set_style_pad_all(seq_song_modal, 0, 0);
+    lv_obj_clear_flag(seq_song_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(seq_song_modal, seq_song_modal_hide, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(seq_song_modal);
+    lv_obj_set_size(card, 640, 264);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "RANDOM SONG");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 0, 0);
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "Salta a otro patron guardado cada N compases");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(hint, 0, 26);
+
+    lv_obj_t* songLabel = lv_label_create(card);
+    lv_label_set_text(songLabel, "ESTILO:");
+    lv_obj_set_style_text_font(songLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(songLabel, RED808_ACCENT2, 0);
+    lv_obj_set_pos(songLabel, 0, 48);
+
+    {
+        constexpr int chipW = 92;
+        constexpr int chipH = 34;
+        constexpr int chipGap = 6;
+        constexpr int chipY = 64;
+        for (size_t index = 0;
+             index < sizeof(SEQ_RANDOM_STYLE_OPTIONS) / sizeof(SEQ_RANDOM_STYLE_OPTIONS[0]);
+             ++index) {
+            const auto& style = SEQ_RANDOM_STYLE_OPTIONS[index];
+            lv_obj_t* chip = lv_btn_create(card);
+            seq_song_style_btns[index] = chip;
+            lv_obj_set_size(chip, chipW, chipH);
+            lv_obj_set_pos(chip, static_cast<int>(index) * (chipW + chipGap), chipY);
+            lv_obj_add_event_cb(chip, seq_song_style_cb, LV_EVENT_CLICKED,
+                                reinterpret_cast<void*>(
+                                    static_cast<uintptr_t>(style.id)));
+            lv_obj_t* chipLabel = lv_label_create(chip);
+            lv_label_set_text(chipLabel, style.name);
+            lv_obj_set_style_text_font(chipLabel, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(chipLabel, lv_color_white(), 0);
+            lv_obj_center(chipLabel);
+        }
+    }
+
+    {
+        constexpr int barsY = 106;
+        lv_obj_t* barsLabel = lv_label_create(card);
+        lv_label_set_text(barsLabel, "COMPASES:");
+        lv_obj_set_style_text_font(barsLabel, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(barsLabel, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(barsLabel, 0, barsY + 10);
+
+        static const uint8_t barOptions[4] = {1, 2, 4, 8};
+        constexpr int barsChipX0 = 86;
+        constexpr int barsChipW = 48;
+        constexpr int barsChipGap = 6;
+        for (int i = 0; i < 4; ++i) {
+            lv_obj_t* chip = lv_btn_create(card);
+            seq_song_bars_btns[i] = chip;
+            lv_obj_set_size(chip, barsChipW, 32);
+            lv_obj_set_pos(chip, barsChipX0 + i * (barsChipW + barsChipGap), barsY);
+            lv_obj_add_event_cb(chip, seq_song_bars_cb, LV_EVENT_CLICKED,
+                                (void*)(intptr_t)barOptions[i]);
+            lv_obj_t* lbl = lv_label_create(chip);
+            lv_label_set_text_fmt(lbl, "%d", barOptions[i]);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_center(lbl);
+        }
+    }
+
+    seq_song_toggle_btn = lv_btn_create(card);
+    lv_obj_set_size(seq_song_toggle_btn, 608, 40);
+    lv_obj_set_pos(seq_song_toggle_btn, 0, 146);
+    lv_obj_add_event_cb(seq_song_toggle_btn, seq_song_toggle_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* toggleLbl = lv_label_create(seq_song_toggle_btn);
+    lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(toggleLbl);
+
+    lv_obj_t* closeBtn = lv_btn_create(card);
+    lv_obj_set_size(closeBtn, 608, 32);
+    lv_obj_set_pos(closeBtn, 0, 194);
+    apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
+    lv_obj_add_event_cb(closeBtn, seq_song_modal_hide, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "CERRAR");
+    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(closeLbl);
+
+    seq_song_controls_refresh();
+}
+
 static void seq_variation_modal_show(lv_event_t* /*e*/) {
     if (seq_variation_modal) return;
 
@@ -8412,7 +8538,7 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
                         LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(seq_variation_modal);
-    lv_obj_set_size(card, 950, 556);
+    lv_obj_set_size(card, 950, 456);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_border_width(card, 2, 0);
@@ -8435,73 +8561,6 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
     lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(hint, 24, 50);
 
-    // ── RANDOM SONG: while playing, jumps between EXISTING saved patterns
-    // every N bars (filtered by style when possible). This is a mode you
-    // switch on, not a one-shot generator. ──
-    lv_obj_t* songLabel = lv_label_create(card);
-    lv_label_set_text(songLabel, "RANDOM SONG - estilo:");
-    lv_obj_set_style_text_font(songLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(songLabel, RED808_ACCENT2, 0);
-    lv_obj_set_pos(songLabel, 24, 74);
-
-    {
-        constexpr int chipW = 142;
-        constexpr int chipH = 34;
-        constexpr int chipGap = 8;
-        constexpr int chipY = 92;
-        for (size_t index = 0;
-             index < sizeof(SEQ_RANDOM_STYLE_OPTIONS) / sizeof(SEQ_RANDOM_STYLE_OPTIONS[0]);
-             ++index) {
-            const auto& style = SEQ_RANDOM_STYLE_OPTIONS[index];
-            lv_obj_t* chip = lv_btn_create(card);
-            seq_song_style_btns[index] = chip;
-            lv_obj_set_size(chip, chipW, chipH);
-            lv_obj_set_pos(chip, 24 + static_cast<int>(index) * (chipW + chipGap), chipY);
-            lv_obj_add_event_cb(chip, seq_song_style_cb, LV_EVENT_CLICKED,
-                                reinterpret_cast<void*>(
-                                    static_cast<uintptr_t>(style.id)));
-            lv_obj_t* chipLabel = lv_label_create(chip);
-            lv_label_set_text(chipLabel, style.name);
-            lv_obj_set_style_text_font(chipLabel, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(chipLabel, lv_color_white(), 0);
-            lv_obj_center(chipLabel);
-        }
-    }
-
-    {
-        constexpr int barsY = 132;
-        lv_obj_t* barsLabel = lv_label_create(card);
-        lv_label_set_text(barsLabel, "COMPASES:");
-        lv_obj_set_style_text_font(barsLabel, &lv_font_montserrat_10, 0);
-        lv_obj_set_style_text_color(barsLabel, RED808_TEXT_DIM, 0);
-        lv_obj_set_pos(barsLabel, 24, barsY + 10);
-
-        static const uint8_t barOptions[4] = {1, 2, 4, 8};
-        constexpr int barsChipX0 = 110;
-        constexpr int barsChipW = 48;
-        constexpr int barsChipGap = 6;
-        for (int i = 0; i < 4; ++i) {
-            lv_obj_t* chip = lv_btn_create(card);
-            seq_song_bars_btns[i] = chip;
-            lv_obj_set_size(chip, barsChipW, 32);
-            lv_obj_set_pos(chip, barsChipX0 + i * (barsChipW + barsChipGap), barsY);
-            lv_obj_add_event_cb(chip, seq_song_bars_cb, LV_EVENT_CLICKED,
-                                (void*)(intptr_t)barOptions[i]);
-            lv_obj_t* lbl = lv_label_create(chip);
-            lv_label_set_text_fmt(lbl, "%d", barOptions[i]);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-            lv_obj_center(lbl);
-        }
-
-        seq_song_toggle_btn = lv_btn_create(card);
-        lv_obj_set_size(seq_song_toggle_btn, 560, 32);
-        lv_obj_set_pos(seq_song_toggle_btn, 342, barsY);
-        lv_obj_add_event_cb(seq_song_toggle_btn, seq_song_toggle_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_t* toggleLbl = lv_label_create(seq_song_toggle_btn);
-        lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_14, 0);
-        lv_obj_center(toggleLbl);
-    }
-
     lv_obj_t* close = lv_btn_create(card);
     lv_obj_set_size(close, 92, 38);
     lv_obj_set_pos(close, 834, 16);
@@ -8518,7 +8577,7 @@ static void seq_variation_modal_show(lv_event_t* /*e*/) {
     constexpr int buttonHeight = 94;
     constexpr int gapX = 10;
     constexpr int gapY = 8;
-    constexpr int gridY0 = 180;
+    constexpr int gridY0 = 80;
     const bool canUndo = control_variation_can_undo();
     for (size_t index = 0;
          index < sizeof(SEQ_VARIATION_OPTIONS) / sizeof(SEQ_VARIATION_OPTIONS[0]);
@@ -9067,8 +9126,8 @@ void ui_sequencer_sync_from_current_pattern(void) {
     seq_page_styles_dirty = true;
     seq_pattern_dirty = false;
     // A different pattern slot became authoritative — including the jumps
-    // RANDOM SONG itself makes. Keep the VAR button's indicator in sync.
-    seq_var_btn_refresh();
+    // RANDOM SONG itself makes. Keep the SONG button's indicator in sync.
+    seq_song_btn_refresh();
     ui_sequencer_refresh_all_step_dots();
 }
 
@@ -9200,8 +9259,11 @@ static void create_sequencer_screen(void) {
         }
         seq_hdr_var_btn = makeHeaderButton(64, "VAR", RED808_CYAN,
                                            seq_variation_modal_show);
-        seq_song_stop_badge = ui_create_auto_stop_badge(seq_hdr_var_btn, seq_song_stop_badge_cb);
-        seq_var_btn_refresh();
+
+        seq_hdr_song_btn = makeHeaderButton(64, "SONG", RED808_CYAN,
+                                            seq_song_modal_show);
+        seq_song_stop_badge = ui_create_auto_stop_badge(seq_hdr_song_btn, seq_song_stop_badge_cb);
+        seq_song_btn_refresh();
 
         seq_hdr_evolve_btn = makeHeaderButton(72, "EVOLVE", RED808_ACCENT2,
                                               seq_evolve_modal_show);
@@ -15475,7 +15537,12 @@ static void ui_reload_themed_screens(void) {
     seq_hdr_queue_btn = NULL;
     seq_hdr_queue_lbl = NULL;
     seq_hdr_var_btn = NULL;
+    seq_hdr_song_btn = NULL;
     seq_song_stop_badge = NULL;
+    seq_song_modal = NULL;
+    for (int i = 0; i < 6; i++) seq_song_style_btns[i] = NULL;
+    for (int i = 0; i < 4; i++) seq_song_bars_btns[i] = NULL;
+    seq_song_toggle_btn = NULL;
     seq_hdr_evolve_btn = NULL;
     seq_evolve_stop_badge = NULL;
     seq_evolve_modal = NULL;
