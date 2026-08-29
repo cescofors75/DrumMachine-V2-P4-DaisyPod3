@@ -843,6 +843,7 @@ static uint8_t    s_pad_fx_focus_pad = 0;
 
 static lv_obj_t* s_pod_status_modal = NULL;
 static lv_obj_t* s_pod_status_label = NULL;
+static lv_obj_t* s_pod_screensaver_btn = NULL;   // STATUS > preferencia SALVAPANTALLAS
 // ── AKAI MPD218 MIDI MAP + LEARN ─────────────────────────────────────
 static lv_obj_t* s_mpd_map_modal = NULL;
 static lv_obj_t* s_mpd_map_summary_label = NULL;
@@ -4602,9 +4603,25 @@ static void pod_status_modal_close_cb(lv_event_t* e) {
     if (s_pod_status_modal) lv_obj_del(s_pod_status_modal);
     s_pod_status_modal = NULL;
     s_pod_status_label = NULL;
+    s_pod_screensaver_btn = NULL;
     memset(s_pod_control_value_labels, 0, sizeof(s_pod_control_value_labels));
     memset(s_pod_led_function_labels, 0, sizeof(s_pod_led_function_labels));
     memset(s_pod_led_color_labels, 0, sizeof(s_pod_led_color_labels));
+}
+
+// Preferencia persistida (settings_store.cpp) — no toca nada del hardware,
+// solo si la propia P4 muestra su salvapantallas local tras 1 min sin touch.
+static void pod_screensaver_refresh(void) {
+    if (!s_pod_screensaver_btn) return;
+    const bool on = p4.screensaver_enabled;
+    apply_control_button_style(s_pod_screensaver_btn, on ? RED808_SUCCESS : RED808_BORDER, false, 8);
+    lv_obj_t* lbl = lv_obj_get_child(s_pod_screensaver_btn, 0);
+    if (lbl) lv_label_set_text_fmt(lbl, "SALVAPANTALLAS\n%s", on ? "ON" : "OFF");
+}
+
+static void pod_screensaver_toggle_cb(lv_event_t* /*e*/) {
+    p4.screensaver_enabled = !p4.screensaver_enabled;
+    pod_screensaver_refresh();
 }
 
 static void pod_status_popup_cb(lv_event_t* e) {
@@ -4740,8 +4757,20 @@ static void pod_status_popup_cb(lv_event_t* e) {
     lv_obj_add_event_cb(close, [](lv_event_t*) { pod_status_modal_close_cb(NULL); },
                         LV_EVENT_CLICKED, NULL);
 
+    // Preferencias — hueco libre bajo el status y a la izquierda de MIDI MAP/CLOSE.
+    s_pod_screensaver_btn = lv_btn_create(card);
+    lv_obj_set_size(s_pod_screensaver_btn, 220, 34);
+    lv_obj_set_pos(s_pod_screensaver_btn, 18, 494);
+    lv_obj_add_event_cb(s_pod_screensaver_btn, pod_screensaver_toggle_cb,
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_t* screensaverLbl = lv_label_create(s_pod_screensaver_btn);
+    lv_obj_set_style_text_font(screensaverLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(screensaverLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(screensaverLbl);
+
     pod_status_modal_refresh();
     pod_status_modal_update();
+    pod_screensaver_refresh();
 }
 
 // =============================================================================
@@ -16644,6 +16673,16 @@ static void create_screensaver_screen(void) {
 static void screensaver_tick(void) {
     // Nunca sobre el boot: tiene su propio flujo de arranque.
     if (active_screen == 0) return;
+
+    // Preferencia del usuario (STATUS > SALVAPANTALLAS). Si lo desactiva
+    // mientras esta activo, se restaura la pantalla anterior al instante.
+    if (!p4.screensaver_enabled) {
+        if (s_screensaver_active) {
+            s_screensaver_active = false;
+            ui_navigate_to(s_screensaver_return);
+        }
+        return;
+    }
 
     const uint32_t now = millis();
     uint32_t inact = millis() - lvgl_port_last_touch_ms();

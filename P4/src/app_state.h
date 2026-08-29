@@ -21,6 +21,7 @@ struct P4State
     int master_volume;
     int seq_volume;
     int live_volume;
+    bool screensaver_enabled;   // preference, persisted — see settings_store.cpp
 
     uint8_t enc_value[3];
     bool enc_muted[3];

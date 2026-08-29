@@ -1,6 +1,7 @@
 #include "app_state.h"
 
 P4State p4 = {
+    .screensaver_enabled = true,
     .enc_muted = {true, true, true},
     .pot_muted = {true, true, true},
     .filter_type = 0,
