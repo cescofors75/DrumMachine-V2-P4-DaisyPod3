@@ -105,3 +105,9 @@ void ui_request_sequencer_resync(void);   // -> ui_sequencer_sync_from_current_p
 void ui_request_step_dots_refresh(void);  // -> ui_sequencer_refresh_all_step_dots()
 void ui_request_fx_random_tick(void);     // -> fx_random_apply(false)
 void ui_request_mix_random_tick(void);    // -> mix_random_apply(false)
+
+// Shows a toast with the reason RANDOM SONG picked its last jump target
+// (see triggerRandomSongJump in control_api.cpp) — e.g. "SONG -> P034
+// Techno III. Acid (siguiente escena)". msg is copied into a fixed-size
+// buffer; safe from any task.
+void ui_request_random_song_toast(const char* msg);

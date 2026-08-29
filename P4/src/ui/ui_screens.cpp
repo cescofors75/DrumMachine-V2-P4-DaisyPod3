@@ -87,6 +87,20 @@ void ui_request_mix_random_tick(void) {
     s_ui_mix_random_tick_pending.store(true, std::memory_order_release);
 }
 
+// RANDOM SONG's musical-jump reason (see triggerRandomSongJump in
+// control_api.cpp) — single producer (the control task), so a plain
+// buffer guarded by release/acquire on the pending flag is enough: the
+// buffer write happens-before the flag's release store, and the LVGL
+// task's acquire load on exchange() happens-before its read of the buffer.
+static char s_ui_random_song_toast_msg[64];
+static std::atomic<bool> s_ui_random_song_toast_pending{false};
+
+void ui_request_random_song_toast(const char* msg) {
+    strncpy(s_ui_random_song_toast_msg, msg, sizeof(s_ui_random_song_toast_msg) - 1);
+    s_ui_random_song_toast_msg[sizeof(s_ui_random_song_toast_msg) - 1] = '\0';
+    s_ui_random_song_toast_pending.store(true, std::memory_order_release);
+}
+
 // Touch debounce tuned for GT911 + multi-indev setup.
 static const uint32_t MUTE_DEBOUNCE_TRACK_MS = 180;
 static const uint32_t MUTE_DEBOUNCE_GLOBAL_MS = 60;
@@ -16769,6 +16783,8 @@ void ui_update_current_screen(void) {
         fx_random_apply(false);
     if (s_ui_mix_random_tick_pending.exchange(false, std::memory_order_acquire))
         mix_random_apply(false);
+    if (s_ui_random_song_toast_pending.exchange(false, std::memory_order_acquire))
+        ui_show_toast(s_ui_random_song_toast_msg, RED808_CYAN);
 
     // Melody state published by the local controller. Snapshot
     // before clearing pending so a concurrent re-latch is never half-read.

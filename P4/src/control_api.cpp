@@ -1534,21 +1534,31 @@ void triggerRandomSongJump()
     const uint8_t curKey = getFactoryPatternKey(current);
 
     int weights[MAX_PATTERNS];
+    // Tracks which single criterion contributed the picked pattern's
+    // LARGEST weight bonus — shown in the toast so the jump's musical
+    // logic is visible instead of silent. Purely cosmetic: never affects
+    // the actual weight or the pick itself.
+    const char* reasons[MAX_PATTERNS];
     int totalWeight = 0;
     for(int i = 0; i < poolCount; ++i)
     {
         const int p = pool[i];
         int w = 8;   // base: anything CAN happen, just rarely
+        const char* reason = "salto libre";
+        int bestBonus = 0;
+        auto note = [&](int bonus, const char* label) {
+            if(bonus > bestBonus) { bestBonus = bonus; reason = label; }
+        };
         const int group = expGroup(p);
         const int scene = expScene(p);
         if(curGroup >= 0 && group == curGroup)
         {
             const int ahead = ((scene - curScene) + 8) % 8;
-            if(ahead == 1)      w += 90;   // the written arc: next scene
-            else if(ahead == 2) w += 45;   // small skip forward
-            else if(ahead == 7) w += 30;   // one step back (breakdown)
-            else if(ahead == 4) w += 12;   // jump to the opposite section
-            else                w += 6;
+            if(ahead == 1)      { w += 90; note(90, "siguiente escena"); }
+            else if(ahead == 2) { w += 45; note(45, "salto adelante"); }
+            else if(ahead == 7) { w += 30; note(30, "vuelta atras"); }
+            else if(ahead == 4) { w += 12; note(12, "seccion opuesta"); }
+            else                { w += 6; }
         }
         else
         {
@@ -1558,33 +1568,44 @@ void triggerRandomSongJump()
             {
                 int delta = (int)m.recommendedBpm - curBpm;
                 if(delta < 0) delta = -delta;
-                if(delta < 36) w += 36 - delta;   // tempo family
+                if(delta < 36) { const int b = 36 - delta; w += b; note(b, "tempo compatible"); }
             }
-            if(scene >= 0 && scene <= 1) w += 18;  // enter songs at the top
+            if(scene >= 0 && scene <= 1) { w += 18; note(18, "entra por groove"); }
             if(scene >= 0 && curScene >= 0 && scene == curScene)
-                w += 8;                            // matched energy level
+                { w += 8; note(8, "misma energia"); }
             const uint8_t key = getFactoryPatternKey(p);
             if(curKey != 255 && key != 255)
             {
                 const int interval = ((int)key - (int)curKey + 12) % 12;
-                if(interval == 0)                        w += 14; // same key
-                else if(interval == 5 || interval == 7)  w += 12; // 4th/5th
-                else if(interval == 3 || interval == 9)  w += 8;  // relative
-                else if(interval == 2 || interval == 10) w += 4;  // step
+                if(interval == 0)                        { w += 14; note(14, "misma tonalidad"); }
+                else if(interval == 5 || interval == 7)  { w += 12; note(12, "cuarta/quinta"); }
+                else if(interval == 3 || interval == 9)  { w += 8;  note(8, "relativo"); }
+                else if(interval == 2 || interval == 10) { w += 4;  note(4, "tonalidad cercana"); }
             }
         }
         weights[i] = w;
+        reasons[i] = reason;
         totalWeight += w;
     }
 
     int roll = (int)randomRange(0, totalWeight - 1);
     int pick = pool[poolCount - 1];
+    const char* pickReason = reasons[poolCount - 1];
     for(int i = 0; i < poolCount; ++i)
     {
         roll -= weights[i];
-        if(roll < 0) { pick = pool[i]; break; }
+        if(roll < 0) { pick = pool[i]; pickReason = reasons[i]; break; }
     }
     control_send_queue_pattern(pick);
+
+    PatternMetadata pickMeta{};
+    char toastMsg[64];
+    if(sequencer.getPatternMetadata(pick, pickMeta))
+        snprintf(toastMsg, sizeof(toastMsg), "SONG -> P%03d %s (%s)",
+                 pick + 1, pickMeta.name, pickReason);
+    else
+        snprintf(toastMsg, sizeof(toastMsg), "SONG -> P%03d (%s)", pick + 1, pickReason);
+    ui_request_random_song_toast(toastMsg);
 }
 
 // One AUTO VARIATIONS pass: applies a random named structural variation
