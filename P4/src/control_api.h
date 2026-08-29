@@ -87,13 +87,16 @@ bool control_random_mix_active();
 void control_random_mix_set_bars(uint8_t bars);
 uint8_t control_random_mix_bars();
 
-// EVOLVE: unlike RANDOM SONG/AUTO FX/MIX, this never swaps the pattern or
-// its hit layout — it keeps the current pattern's identity and, every N
-// bars while active, nudges step probabilities (only on already-active
-// steps, floored so a track never goes fully silent by itself) and the
-// pattern's global humanize amount, both scaled by a 0-100 amount dial and
-// a fixed per-track "freedom" weight (kick stays close to fixed, hats and
-// percs wander more) — the musician's PATTERN -> MUTATE -> EVOLVE framing.
+// EVOLVE: unlike RANDOM SONG/AUTO FX/MIX, this never swaps the pattern —
+// kick/snare's structure stays untouched no matter the amount. Every N
+// bars while active it nudges the probability of already-active steps
+// (floored so a track never goes fully silent by itself), occasionally
+// wakes a soft ghost hit on an inactive step of a high-freedom track
+// (hats/cymbals/toms/percs only) and fades it back out on a later pass,
+// and refreshes the pattern's global humanize amount — all scaled by a
+// 0-100 amount dial and a fixed per-track "freedom" weight (kick stays
+// close to fixed, hats and percs wander more) — the musician's PATTERN ->
+// MUTATE -> EVOLVE framing.
 void control_random_evolve_set_active(bool active);
 bool control_random_evolve_active();
 void control_random_evolve_set_bars(uint8_t bars);      // 1/2/4/8

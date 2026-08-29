@@ -8218,7 +8218,7 @@ static void seq_evolve_modal_show(lv_event_t* e) {
     lv_obj_set_pos(title, 0, 0);
 
     lv_obj_t* hint = lv_label_create(card);
-    lv_label_set_text(hint, "Muta el patron actual sin cambiar su identidad");
+    lv_label_set_text(hint, "Prob + ghost hits en hats/percs; kick/snare fijos");
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(hint, 0, 26);

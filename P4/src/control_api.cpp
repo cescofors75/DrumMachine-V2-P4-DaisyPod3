@@ -1326,6 +1326,18 @@ const uint8_t kEvolveTrackWeight[16] = {
     8, 20, 55, 50, 45, 40, 45, 40,
     65, 65, 65, 70, 70, 70, 70, 70,
 };
+// Only tracks at/above this freedom weight are eligible for EVOLVE to wake
+// up a ghost hit on a currently-inactive step — kick/snare's structure
+// never changes no matter the amount, only hats/cymbals/toms/percs do.
+const uint8_t kEvolveGhostThreshold = 55;
+
+// Bit s set = EVOLVE itself turned track/step s on (not the user) — so a
+// later pass knows to fade it back out rather than treat it as a
+// permanent, user-programmed hit. Keyed to whichever pattern is current;
+// reset whenever the pattern changes so a stale flag from a different
+// pattern never mislabels a step there.
+uint16_t evolveGhostMask[16] = {};
+int evolveGhostPattern = -1;
 
 // Wall-clock bar timer (derived from the current BPM), not a step-sample
 // comparison: sampling p4.current_step once per control_process() tick is
@@ -1431,18 +1443,24 @@ void triggerRandomSongJump()
     control_send_queue_pattern(pick);
 }
 
-// One EVOLVE pass. Deliberately narrow: it only nudges the probability of
-// steps that are ALREADY active (never turns a step on/off — the pattern's
-// hit layout, its identity, never changes) and refreshes the pattern's
-// global humanize amount from the dial. Both are scaled by evolveAmount x
-// each track's fixed freedom weight, so kick/snare drift rarely while
-// hats/percs drift often. A 40-100 floor keeps EVOLVE from ever silencing
-// a track entirely on its own — that stays a manual, deliberate act.
+// One EVOLVE pass. Kick/snare's structure never changes no matter the
+// amount; for the rest, this nudges the probability of steps that are
+// ALREADY active, occasionally wakes a soft "ghost" hit on an inactive
+// step of a high-freedom track (hats/cymbals/toms/percs — never kick/
+// snare) and lets that ghost fade back out on a later pass, and refreshes
+// the pattern's global humanize amount. All scaled by evolveAmount x each
+// track's fixed freedom weight. A 40-100 floor on probability keeps EVOLVE
+// from ever silencing a track entirely on its own — that stays manual.
 void EvolveApply()
 {
     if(evolveAmount == 0) return;
     Sequencer& sequencer = SequencerInstance();
     const int pattern = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+    if(pattern != evolveGhostPattern)
+    {
+        memset(evolveGhostMask, 0, sizeof(evolveGhostMask));
+        evolveGhostPattern = pattern;
+    }
 
     // Global microtiming/velocity fluctuation — continuous per-hit, not
     // bar-gated, once set. DaisyPod3 already anchors kick/snare timing
@@ -1461,13 +1479,45 @@ void EvolveApply()
         if(weight <= 0) continue;
         for(int step = 0; step < 16; ++step)
         {
-            if(!p4.steps[track][step]) continue;
-            if(randomRange(0, 99) >= weight) continue;
-            const uint8_t current = sequencer.getStepProbability(pattern, track, step);
-            const int next = Clamp((int)current + (int)randomRange(-25, 25), 40, 100);
-            if(next == (int)current) continue;
-            control_send_set_step_probability(track, step, next);
-            anyChanged = true;
+            const bool active = p4.steps[track][step];
+            const bool isGhost = (evolveGhostMask[track] >> step) & 1u;
+            if(active)
+            {
+                if(isGhost)
+                {
+                    // Ghost hits are temporary — let them fade back out at
+                    // roughly half the rate they appeared, so they come
+                    // and go instead of piling up permanently.
+                    if(randomRange(0, 99) < weight / 2)
+                    {
+                        control_send_set_step(track, step, false);
+                        control_send_set_step_probability(track, step, 100);
+                        evolveGhostMask[track] &= (uint16_t)~(1u << step);
+                        anyChanged = true;
+                    }
+                    continue;
+                }
+                // Existing, user-programmed hit: nudge its probability.
+                if(randomRange(0, 99) >= weight) continue;
+                const uint8_t current = sequencer.getStepProbability(pattern, track, step);
+                const int next = Clamp((int)current + (int)randomRange(-25, 25), 40, 100);
+                if(next == (int)current) continue;
+                control_send_set_step_probability(track, step, next);
+                anyChanged = true;
+            }
+            else if(kEvolveTrackWeight[track] >= kEvolveGhostThreshold)
+            {
+                // Ghost note: wake a soft, syncopated hit on an inactive
+                // step — rarer than a probability nudge, and only ever on
+                // the freest tracks.
+                const int ghostChance = weight / 4;
+                if(ghostChance <= 0 || randomRange(0, 99) >= ghostChance) continue;
+                control_send_set_step(track, step, true);
+                control_send_set_step_velocity(track, step, (int)randomRange(45, 85));
+                control_send_set_step_probability(track, step, (int)randomRange(50, 80));
+                evolveGhostMask[track] |= (uint16_t)(1u << step);
+                anyChanged = true;
+            }
         }
     }
     if(anyChanged) ui_sequencer_refresh_all_step_dots();
