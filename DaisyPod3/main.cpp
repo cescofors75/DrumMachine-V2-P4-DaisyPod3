@@ -2493,6 +2493,27 @@ static inline float WaveFoldSample(float input, float gain)
     return phase <= 2.0f ? phase - 1.0f : 3.0f - phase;
 }
 
+/* FTYPE_RESONANT cascades two identical RBJ-cookbook lowpass biquads at the
+ * same cutoff/Q for a 24 dB/oct slope. Each stage's own resonant peak grows
+ * roughly linearly with Q (that parameterization's well-known property:
+ * peak gain ~= Q above the Butterworth point Q=0.707, flat/no-peak below
+ * it) — so the CASCADE of two such stages peaks roughly with Q^2. At Q=20
+ * (the FX Lab RESONANCE knob's max) that is on the order of +20 dB more
+ * boost than the old fixed SoftLimit(s*1.4f)*0.714f makeup gain ever
+ * accounted for, which is what was driving the resonant filter into
+ * constant hard limiting ("satura") instead of just coloring the peak.
+ *
+ * This brings the cascade's growth back down to linear-in-Q — still
+ * audibly louder/more aggressive as resonance rises (that's the point of
+ * a resonant filter), just no longer runaway-quadratic. Applied as an
+ * extra multiplier AFTER the existing saturation stage, which is left
+ * untouched (it stays transparent at low signal levels by design). */
+static inline float ResonantMakeupGain(float q)
+{
+    const float qRef = 0.707f; /* Butterworth Q: no resonant peak below this */
+    return q > qRef ? (qRef / q) : 1.0f;
+}
+
 static void ResetMasterProcessingState()
 {
     delayActive = false;
@@ -5608,6 +5629,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 if(trkFilterType[p] == FTYPE_RESONANT){
                     s = sanitizeF(trkFilter2[p].Process(s));
                     s = SoftLimit(s * 1.4f) * 0.714f;
+                    s *= ResonantMakeupGain(trkFilterQ[p]);
                 }
             }
 
@@ -5746,6 +5768,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 if(trkFilterType[t] == FTYPE_RESONANT){
                     s = sanitizeF(trkFilter2[t].Process(s));
                     s = SoftLimit(s * 1.4f) * 0.714f;
+                    s *= ResonantMakeupGain(trkFilterQ[t]);
                 }
             }
             /* dist + bitcrush */
@@ -5955,6 +5978,9 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                     R = sanitizeF(gFilter2R.Process(R));
                     L = SoftLimit(L * 1.4f) * 0.714f;
                     R = SoftLimit(R * 1.4f) * 0.714f;
+                    const float mk = ResonantMakeupGain(gFilterQ);
+                    L *= mk;
+                    R *= mk;
                 }
             }
         }
@@ -6833,7 +6859,7 @@ static void ProcessCommand()
         break;
     case CMD_DELAY_FEEDBACK:
         if(len >= 4){ float v; memcpy(&v, p, 4); delayFeedback = clampF(v, 0.f, 0.95f); }
-        else if(len >= 1) delayFeedback = p[0] / 100.0f;
+        else if(len >= 1) delayFeedback = clampF(p[0] / 100.0f, 0.f, 0.95f);
         break;
     case CMD_DELAY_MIX:
         if(podApplyingCommand || !PodOwnsFunction(POD_FUNC_DELAY_MIX)){
@@ -6959,7 +6985,7 @@ static void ProcessCommand()
             reverbFeedback = clampF(v, 0.f, 0.95f);
             masterReverb.SetFeedback(reverbFeedback);
         } else if(len >= 1){
-            reverbFeedback = p[0] / 100.0f;
+            reverbFeedback = clampF(p[0] / 100.0f, 0.f, 0.95f);
             masterReverb.SetFeedback(reverbFeedback);
         }
         break;
