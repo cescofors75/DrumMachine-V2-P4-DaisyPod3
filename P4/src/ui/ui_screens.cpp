@@ -60,6 +60,33 @@ static std::atomic<uint16_t> s_ctrl_solo_mask{0};
 static std::atomic<bool>     s_ctrl_pattern_sync_pending{false};
 static std::atomic<int8_t>   s_ctrl_pattern_step_pending{0};
 
+// ── UI work requested FROM the control task (Core 1) ──
+// LVGL is not thread-safe and only the LVGL task (Core 0) may touch
+// widgets. control_api.cpp used to call ui_sequencer_sync_from_current_
+// pattern() / fx_random_apply() / mix_random_apply() / ui_sequencer_
+// refresh_all_step_dots() directly from control_process() — racing
+// lv_timer_handler() on the other core, which corrupts LVGL's internal
+// state (escalating visual glitches until the UI task dies while audio
+// keeps playing). Control code now only flips these flags; the actual
+// widget work runs in ui_update_current_screen() on the LVGL task.
+static std::atomic<bool> s_ui_seq_resync_pending{false};
+static std::atomic<bool> s_ui_step_dots_pending{false};
+static std::atomic<bool> s_ui_fx_random_tick_pending{false};
+static std::atomic<bool> s_ui_mix_random_tick_pending{false};
+
+void ui_request_sequencer_resync(void) {
+    s_ui_seq_resync_pending.store(true, std::memory_order_release);
+}
+void ui_request_step_dots_refresh(void) {
+    s_ui_step_dots_pending.store(true, std::memory_order_release);
+}
+void ui_request_fx_random_tick(void) {
+    s_ui_fx_random_tick_pending.store(true, std::memory_order_release);
+}
+void ui_request_mix_random_tick(void) {
+    s_ui_mix_random_tick_pending.store(true, std::memory_order_release);
+}
+
 // Touch debounce tuned for GT911 + multi-indev setup.
 static const uint32_t MUTE_DEBOUNCE_TRACK_MS = 180;
 static const uint32_t MUTE_DEBOUNCE_GLOBAL_MS = 60;
@@ -16100,7 +16127,9 @@ void ui_process_control_queue(void) {
         if (nextPattern < 0) nextPattern += Config::MAX_PATTERNS;
         seq_queued_pattern = -1;
         control_send_select_pattern(nextPattern);
-        ui_sequencer_sync_from_current_pattern();
+        // This runs on Core 1 (loop): the grid repaint must happen on the
+        // LVGL task — request it instead of calling the widget code here.
+        ui_request_sequencer_resync();
     }
 
     if (s_ctrl_pattern_sync_pending.exchange(false, std::memory_order_acquire)) {
@@ -16725,6 +16754,21 @@ void ui_update_current_screen(void) {
     pad_inst_consume_engine_sync();
     pod_process_physical_actions();
     pod_owner_badges_update();
+
+    // Widget refreshes requested by the control task (Core 1) — see the
+    // ui_request_* setters near the top of this file. Resync first: it
+    // already includes the step-dot pass, so a redundant dots flag from
+    // the same control tick collapses into one walk.
+    if (s_ui_seq_resync_pending.exchange(false, std::memory_order_acquire)) {
+        s_ui_step_dots_pending.store(false, std::memory_order_release);
+        ui_sequencer_sync_from_current_pattern();
+    }
+    if (s_ui_step_dots_pending.exchange(false, std::memory_order_acquire))
+        ui_sequencer_refresh_all_step_dots();
+    if (s_ui_fx_random_tick_pending.exchange(false, std::memory_order_acquire))
+        fx_random_apply(false);
+    if (s_ui_mix_random_tick_pending.exchange(false, std::memory_order_acquire))
+        mix_random_apply(false);
 
     // Melody state published by the local controller. Snapshot
     // before clearing pending so a concurrent re-latch is never half-read.

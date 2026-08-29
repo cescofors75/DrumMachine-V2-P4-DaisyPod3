@@ -53,6 +53,24 @@ constexpr uint32_t kPatternUploadDebounceMs = 200;
 int pendingUploadLogicalPattern = -1;
 uint8_t pendingUploadDaisySlot = 0xFF;
 uint32_t pendingUploadSinceMs = 0;
+// Deferred pattern-upload requests. control_send_select_pattern(),
+// control_send_queue_pattern() and control_sync_current_pattern() are
+// called from the LVGL task (touch callbacks and the deferred-command
+// drain in ui_update_current_screen). The multi-packet, retried USB
+// upload they used to run inline blocked that task while it held the
+// LVGL mutex — a guaranteed dropped frame per pattern change (16x
+// vTaskDelay(1) inside UploadPattern) and a multi-second UI freeze
+// whenever the link was congested (SendWithRetry waits up to 200 ms per
+// packet). They now mutate only the cheap local state and stage the slow
+// USB work here; ProcessPendingPatternWork() runs it from loop() (Core
+// 1), where blocking on USB is harmless to rendering.
+// queuedLogicalPattern/queuedDaisyPattern/activeDaisyPattern above stay
+// OWNED by the control task: the LVGL-side entry points below only touch
+// these atomics, and ProcessPendingPatternWork() applies them.
+std::atomic<int>  pendingSelectUpload{-1};
+std::atomic<int>  pendingQueueUpload{-1};
+std::atomic<bool> pendingQueueCancel{false};
+std::atomic<bool> pendingCurrentPatternSync{false};
 std::atomic<bool> midiSongPrepared{false};
 std::atomic<bool> midiSongPersisted{false};
 uint8_t midiSongPatternCount = 0;
@@ -455,6 +473,49 @@ void SendCurrentState()
     daisyUsb.setTrackSoloMask(soloMask);
     if(p4.is_playing) daisyUsb.start(); else daisyUsb.stop();
 }
+
+// Runs the slow USB work staged by control_send_select_pattern(),
+// control_send_queue_pattern() and control_sync_current_pattern() — see
+// the pendingSelectUpload/pendingQueueUpload/pendingCurrentPatternSync
+// comment at the top of this file. Called once per control_process()
+// pass (loop(), Core 1). Order matters: a select first, so a queue
+// staged in the same window computes its resident slot from the NEW
+// activeDaisyPattern; the current-pattern sync last, so it re-uploads
+// whatever pattern ended up current.
+void ProcessPendingPatternWork()
+{
+    if(pendingQueueCancel.exchange(false, std::memory_order_acq_rel))
+    {
+        if(queuedLogicalPattern >= 0 || queuedDaisyPattern != 0xFF)
+            daisyUsb.cancelPatternQueue();
+        queuedLogicalPattern = -1;
+        queuedDaisyPattern = 0xFF;
+    }
+
+    const int sel = pendingSelectUpload.exchange(-1, std::memory_order_acq_rel);
+    if(sel >= 0)
+    {
+        activeDaisyPattern = DefaultDaisyPattern(sel);
+        UploadPattern(activeDaisyPattern, sel);
+        ApplyPatternPerformance(sel);
+        expectedDaisyPattern = activeDaisyPattern;
+        expectedDaisyPatternSinceMs = millis();
+        daisyUsb.selectPattern(activeDaisyPattern);
+    }
+
+    const int queued = pendingQueueUpload.exchange(-1, std::memory_order_acq_rel);
+    if(queued >= 0)
+    {
+        queuedLogicalPattern = queued;
+        queuedDaisyPattern = static_cast<uint8_t>((activeDaisyPattern + 1u) % 20u);
+        UploadPattern(queuedDaisyPattern, queuedLogicalPattern);
+        daisyUsb.queuePattern(queuedDaisyPattern);
+    }
+
+    if(pendingCurrentPatternSync.exchange(false, std::memory_order_acq_rel))
+        UploadPattern(activeDaisyPattern,
+                      Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1));
+}
 }
 
 void control_init()
@@ -581,7 +642,7 @@ void control_process()
         {
             SequencerInstance().selectPattern(logicalPattern);
             LoadPatternToUi(logicalPattern);
-            ui_sequencer_sync_from_current_pattern();
+            ui_request_sequencer_resync();
         }
     }
     else if(transport.engine_responding && queuedLogicalPattern >= 0
@@ -590,7 +651,7 @@ void control_process()
         activeDaisyPattern = queuedDaisyPattern;
         SequencerInstance().selectPattern(queuedLogicalPattern);
         LoadPatternToUi(queuedLogicalPattern);
-        ui_sequencer_sync_from_current_pattern();
+        ui_request_sequencer_resync();
         ApplyPatternPerformance(queuedLogicalPattern);
         ui_pattern_queue_committed(queuedLogicalPattern);
         queuedLogicalPattern = -1;
@@ -616,7 +677,7 @@ void control_process()
         activeDaisyPattern = transport.pattern;
         SequencerInstance().selectPattern(logicalPattern);
         LoadPatternToUi(logicalPattern);
-        ui_sequencer_sync_from_current_pattern();
+        ui_request_sequencer_resync();
         pendingUploadLogicalPattern = logicalPattern;
         pendingUploadDaisySlot = activeDaisyPattern;
         pendingUploadSinceMs = millis();
@@ -652,6 +713,7 @@ void control_process()
         midiLearnTimeoutRevision.fetch_add(1, std::memory_order_release);
     }
     SequencerInstance().update();
+    ProcessPendingPatternWork();
     control_random_auto_tick();
 }
 
@@ -838,38 +900,34 @@ void control_send_tempo(float bpm)
     daisyUsb.setTempo(bpm);
 }
 
+// Local state changes immediately (the UI repaints the new pattern this
+// frame); the multi-packet USB upload is staged for ProcessPendingPatternWork
+// on the control task — never run it inline here, callers include LVGL
+// touch callbacks holding the LVGL mutex.
 void control_send_select_pattern(int index)
 {
     if(midiSongPrepared) control_cancel_midi_song();
     index = Clamp(index, 0, MAX_PATTERNS - 1);
-    if(queuedLogicalPattern >= 0 || queuedDaisyPattern != 0xFF)
-        daisyUsb.cancelPatternQueue();
     SequencerInstance().selectPattern(index);
     LoadPatternToUi(index);
-    activeDaisyPattern = DefaultDaisyPattern(index);
-    queuedLogicalPattern = -1;
-    queuedDaisyPattern = 0xFF;
-    UploadPattern(activeDaisyPattern, index);
-    ApplyPatternPerformance(index);
-    expectedDaisyPattern = activeDaisyPattern;
-    expectedDaisyPatternSinceMs = millis();
-    daisyUsb.selectPattern(activeDaisyPattern);
+    // Any queued pattern (staged or already uploaded) is obsolete now; the
+    // worker clears the queue bookkeeping before it applies the select.
+    pendingQueueUpload.store(-1, std::memory_order_release);
+    pendingQueueCancel.store(true, std::memory_order_release);
+    pendingSelectUpload.store(index, std::memory_order_release);
 }
 
 void control_send_queue_pattern(int index)
 {
     if(midiSongPrepared) control_cancel_midi_song();
-    queuedLogicalPattern = Clamp(index, 0, MAX_PATTERNS - 1);
-    queuedDaisyPattern = static_cast<uint8_t>((activeDaisyPattern + 1u) % 20u);
-    UploadPattern(queuedDaisyPattern, queuedLogicalPattern);
-    daisyUsb.queuePattern(queuedDaisyPattern);
+    pendingQueueUpload.store(Clamp(index, 0, MAX_PATTERNS - 1),
+                             std::memory_order_release);
 }
 
 void control_send_cancel_pattern_queue()
 {
-    queuedLogicalPattern = -1;
-    queuedDaisyPattern = 0xFF;
-    daisyUsb.cancelPatternQueue();
+    pendingQueueUpload.store(-1, std::memory_order_release);
+    pendingQueueCancel.store(true, std::memory_order_release);
 }
 
 void control_send_fill()
@@ -1452,10 +1510,17 @@ void triggerRandomSongJump()
 // One AUTO VARIATIONS pass: picks a random named structural variation
 // (never UNDO — that stays a manual, deliberate action) and applies it to
 // the current pattern via the exact same path the VAR popup's buttons use.
+// Unlike the popup (whose LVGL callback repaints the grid and stages the
+// Daisy sync itself), this runs on the control task with no UI event — so
+// it must stage both explicitly, or Daisy keeps playing the old pattern
+// while the on-screen grid silently drifts out of date.
 bool VariationApply()
 {
     const uint8_t pick = (uint8_t)randomRange(SEQ_VAR_NEON_BREAK, SEQ_VAR_SPARSE_SPACE);
-    return control_apply_sequencer_variation(pick);
+    if(!control_apply_sequencer_variation(pick)) return false;
+    control_sync_current_pattern();
+    ui_request_sequencer_resync();
+    return true;
 }
 
 // One EVOLVE pass. Kick/snare's structure never changes no matter the
@@ -1535,7 +1600,7 @@ void EvolveApply()
             }
         }
     }
-    if(anyChanged) ui_sequencer_refresh_all_step_dots();
+    if(anyChanged) ui_request_step_dots_refresh();
 }
 } // namespace
 
@@ -1619,8 +1684,10 @@ bool control_random_variation_apply_now() { return VariationApply(); }
 void control_random_auto_tick()
 {
     if(barClockTick(songClock)) triggerRandomSongJump();
-    if(barClockTick(fxClock)) fx_random_apply(false);
-    if(barClockTick(mixClock)) mix_random_apply(false);
+    // FX/MIX re-randomization manipulates LVGL widgets and animations, so
+    // it must run on the LVGL task — request it instead of calling it here.
+    if(barClockTick(fxClock)) ui_request_fx_random_tick();
+    if(barClockTick(mixClock)) ui_request_mix_random_tick();
     if(barClockTick(evolveClock)) EvolveApply();
     if(barClockTick(variationClock)) VariationApply();
 }
@@ -1631,11 +1698,14 @@ bool control_variation_can_undo()
         && variationBackup.pattern == Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
 }
 
+// Fire-and-forget: stages the upload for ProcessPendingPatternWork on the
+// control task instead of running it inline — callers include the LVGL
+// task's deferred-command drain, which must never block on USB retries.
 bool control_sync_current_pattern()
 {
     if(!control_available()) return false;
-    return UploadPattern(activeDaisyPattern,
-                         Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1));
+    pendingCurrentPatternSync.store(true, std::memory_order_release);
+    return true;
 }
 
 bool control_patterns_ready() { return patternBankReady; }

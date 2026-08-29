@@ -83,8 +83,8 @@ void ui_pad_sound_sync_track_engines(const int8_t engines[16]);
 
 // Applies one random FX LAB filter/cutoff/reso/drive/bits/srate pass and one
 // random MIXER rebalance, respectively — the same logic the manual RANDOM
-// buttons run on tap. Exposed so control_random_auto_tick() (control_api.cpp)
-// can call them from AUTO FX / AUTO MIX without any LVGL event to hand it.
+// buttons run on tap. LVGL task only (they touch widgets and start
+// animations); control code uses the ui_request_* setters below instead.
 // showToast is false for AUTO's periodic re-randomization so it does not
 // nag with a toast every few bars during a live set; manual taps pass true.
 void fx_random_apply(bool showToast = true);
@@ -93,7 +93,15 @@ void mix_random_apply(bool showToast = true);
 // Refreshes every step's corner "customized" dot (probability<100% or a
 // parameter lock) on the sequencer's step grid from the Sequencer's stored
 // state. Safe to call even when the sequencer screen was never built (the
-// dot pointers are all NULL then, and each refresh no-ops). Called by
-// control_api.cpp after an EVOLVE pass touches step probabilities in the
-// background, so the grid stays honest even on a different screen.
+// dot pointers are all NULL then, and each refresh no-ops). LVGL task only.
 void ui_sequencer_refresh_all_step_dots(void);
+
+// ── Deferred UI requests for the control task (Core 1) ──
+// LVGL is single-task: control_process() must never call the widget-touching
+// functions above directly (it races lv_timer_handler() on Core 0). These
+// setters only flip an atomic; ui_update_current_screen() performs the real
+// work on the LVGL task within one frame (~16 ms). Safe from any task.
+void ui_request_sequencer_resync(void);   // -> ui_sequencer_sync_from_current_pattern()
+void ui_request_step_dots_refresh(void);  // -> ui_sequencer_refresh_all_step_dots()
+void ui_request_fx_random_tick(void);     // -> fx_random_apply(false)
+void ui_request_mix_random_tick(void);    // -> mix_random_apply(false)
