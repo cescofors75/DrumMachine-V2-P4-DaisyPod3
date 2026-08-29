@@ -2457,9 +2457,20 @@ static inline void ConfigureTrackFlanger(uint8_t track)
     ConfigureFlanger(trkFlanger[track], trkFlgRate[track], trkFlgDepth[track], trkFlgFb[track]);
 }
 
-/* Kill NaN — with FTZ+DN enabled, denormals are flushed by hardware */
+/* Kill NaN AND Inf — with FTZ+DN enabled, denormals are flushed by hardware.
+ * Previously this only caught NaN (Inf was assumed to be "clamped at
+ * output" by the limiter/soft-clip stage). That assumption was wrong: in
+ * the default non-limiter path, SoftClipKnee(Inf) evaluates SoftLimit(Inf)
+ * = Inf/Inf = NaN, and its own `if(shaped>1.0f)` safety clamp silently
+ * fails to catch NaN (all comparisons with NaN are false). That NaN then
+ * reaches dcBlockL/dcBlockR — a stateful 1-pole IIR — and permanently
+ * poisons their feedback history: every output sample from then on is NaN
+ * regardless of upstream signal, with no code path that ever re-inits
+ * them, so the only recovery was rebooting Daisy. Catching Inf here, at
+ * every one of this function's ~50 call sites throughout the FX chain,
+ * stops it from ever reaching that stage in the first place. */
 static inline float sanitizeF(float v){
-    return (v == v) ? v : 0.0f;   /* only catch NaN; Inf clamped at output */
+    return isfinite(v) ? v : 0.0f;
 }
 
 static inline float VolumeByteToGain(uint8_t volumePct)
@@ -2469,6 +2480,12 @@ static inline float VolumeByteToGain(uint8_t volumePct)
 
 static inline float SoftClipKnee(float x)
 {
+    /* Defense in depth: sanitizeF() already guarantees finite input at
+     * every call site today, but this guards the one computation in this
+     * function that does NOT degrade gracefully for Inf — SoftLimit(Inf)
+     * is Inf/Inf = NaN, which then slips past the `shaped>1.0f` clamp
+     * below (NaN fails every comparison) and out of this function. */
+    if(!isfinite(x)) return 0.0f;
     const float knee  = 0.985f;
     const float drive = 2.2f;
     /* 1.007307f == 1.0f / SoftLimit(2.2f) — pre-computed constant denominator */
@@ -6164,6 +6181,21 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         /* M3: DC offset removal — HP 1-polo ~20 Hz */
         L = dcBlockL.Process(L);
         R = dcBlockR.Process(R);
+
+        /* Self-heal instead of requiring a Daisy reboot: DcBlock is a
+         * stateful 1-pole IIR (DaisySP) with no public state reset. If its
+         * internal history was ever poisoned by a non-finite sample before
+         * the sanitizeF()/SoftClipKnee() fixes above existed — or by any
+         * future path this doesn't anticipate — every output sample stays
+         * NaN forever regardless of upstream signal, which is exactly the
+         * "audio keeps playing but sounds broken and controls do nothing"
+         * failure this reboots to fix. Re-init on the spot instead. */
+        if(!isfinite(L) || !isfinite(R)){
+            dcBlockL.Init((float)SAMPLE_RATE);
+            dcBlockR.Init((float)SAMPLE_RATE);
+            L = 0.0f;
+            R = 0.0f;
+        }
 
         out[0][i] = L;
         out[1][i] = R;
