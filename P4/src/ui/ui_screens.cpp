@@ -19521,14 +19521,21 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
     // Seed s_pad_held from the current touch state on this first in-LIVE
     // frame instead of processing rising edges, so BD only actually fires
     // once the finger has been lifted and pressed again for real.
+    // ui_navigate_to's own screen swap fades in over 200ms
+    // (LV_SCR_LOAD_ANIM_FADE_ON): a finger still down on BACK stays a
+    // legitimate touch sample for the whole fade, not just the single frame
+    // where the flag flips, so keep reseeding (never treating it as a fresh
+    // press) until that fade has had time to finish, not just for one tick.
+    static unsigned long live_enter_ms = 0;
+    unsigned long now = millis();
     bool justEnteredLive = !prev_live_active;
+    if (justEnteredLive) live_enter_ms = now;
     prev_live_active = true;
-    if (justEnteredLive) {
+    if (now - live_enter_ms < 250u) {
         for (int p = 0; p < 16; p++) s_pad_held[p] = pressed[p];
         return;
     }
 
-    unsigned long now = millis();
     unsigned long nr_interval = ui_nr_interval_ms();    // 0 if NR off
 
     for (int p = 0; p < 16; p++) {
