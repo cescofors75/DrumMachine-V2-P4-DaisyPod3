@@ -7497,6 +7497,49 @@ static void fx_arc_cb(lv_event_t* e) {
     if (transmit) last_tx_ms[cell] = now;
 }
 
+// Same commit path as fx_arc_cb above (lerp-snap + 25ms send throttle +
+// 800ms "user owns this" window), reused by the LED/BAR alt visualizations
+// so every style can actually change the value, not just look at it.
+static void fx_alt_commit_value(int cell, int val, bool final_value) {
+    if (cell < 0 || cell >= FX_CARD_COUNT) return;
+    val = constrain(val, 0, 127);
+    s_fx_arc_anim[cell] = (float)val;
+    s_fx_arc_user_ms[cell] = millis();
+    static uint32_t last_tx_ms[FX_CARD_COUNT] = {};
+    uint32_t now = millis();
+    bool transmit = final_value || last_tx_ms[cell] == 0 ||
+                    (uint32_t)(now - last_tx_ms[cell]) >= 25;
+    fx_card_send_value(cell, val, transmit);
+    if (transmit) last_tx_ms[cell] = now;
+    if (fx_arcs[cell]) {
+        s_fx_ui_syncing = true;
+        lv_arc_set_value(fx_arcs[cell], val);
+        s_fx_ui_syncing = false;
+    }
+}
+
+// BAR style is a real lv_slider (not a plain lv_bar) so it drags/taps to a
+// value like any other slider in this app.
+static void fx_bar_slider_cb(lv_event_t* e) {
+    if (s_fx_ui_syncing) return;
+    int cell = (int)(intptr_t)lv_event_get_user_data(e);
+    lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
+    int val = lv_slider_get_value(slider);
+    bool final_value = (lv_event_get_code(e) == LV_EVENT_RELEASED ||
+                        lv_event_get_code(e) == LV_EVENT_PRESS_LOST);
+    fx_alt_commit_value(cell, val, final_value);
+}
+
+// LED style: each segment is a discrete step (tap segment N -> jumps the
+// value to that step), the same idea as tapping a step in a step meter.
+static void fx_led_cell_cb(lv_event_t* e) {
+    int packed = (int)(intptr_t)lv_event_get_user_data(e);
+    int cell = packed >> 8;
+    int ledIdx = packed & 0xFF;
+    int val = (int)((float)(ledIdx + 1) / (float)FX_LED_COUNT * 127.0f + 0.5f);
+    fx_alt_commit_value(cell, val, true);
+}
+
 static void fx_page_cb(lv_event_t* e) {
     int dir = (int)(intptr_t)lv_event_get_user_data(e);
     int pages = fx_page_count();
@@ -7905,11 +7948,13 @@ static void create_fx_screen(void) {
         lv_obj_set_style_shadow_opa(fx_arcs[cell], LV_OPA_50, LV_PART_KNOB);
 
         // ── Alt visualization: VU bar (hidden unless VIZ: BAR is selected) ──
-        fx_bars[cell] = lv_bar_create(card);
+        // A real lv_slider (not a plain lv_bar) so it's draggable/tappable
+        // like every other fader in this app, not just a display.
+        fx_bars[cell] = lv_slider_create(card);
         lv_obj_set_size(fx_bars[cell], 240, 18);
         lv_obj_set_pos(fx_bars[cell], 40, 58);
-        lv_bar_set_range(fx_bars[cell], 0, 127);
-        lv_bar_set_value(fx_bars[cell], 0, LV_ANIM_OFF);
+        lv_slider_set_range(fx_bars[cell], 0, 127);
+        lv_slider_set_value(fx_bars[cell], 0, LV_ANIM_OFF);
         lv_obj_set_style_radius(fx_bars[cell], 4, LV_PART_MAIN);
         lv_obj_set_style_radius(fx_bars[cell], 4, LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(fx_bars[cell], RED808_BORDER, LV_PART_MAIN);
@@ -7917,13 +7962,22 @@ static void create_fx_screen(void) {
         lv_obj_set_style_border_width(fx_bars[cell], 0, LV_PART_MAIN);
         lv_obj_set_style_bg_color(fx_bars[cell], lv_color_hex(fx_colors[cell]), LV_PART_INDICATOR);
         lv_obj_set_style_bg_opa(fx_bars[cell], LV_OPA_COVER, LV_PART_INDICATOR);
-        lv_obj_clear_flag(fx_bars[cell], LV_OBJ_FLAG_CLICKABLE);
+        // Small knob instead of the default big circle — this is meant to
+        // read as a VU bar, not an obvious slider, until touched.
+        lv_obj_set_style_bg_color(fx_bars[cell], lv_color_white(), LV_PART_KNOB);
+        lv_obj_set_style_bg_opa(fx_bars[cell], LV_OPA_COVER, LV_PART_KNOB);
+        lv_obj_set_style_pad_all(fx_bars[cell], 1, LV_PART_KNOB);
+        lv_obj_add_event_cb(fx_bars[cell], fx_bar_slider_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)cell);
+        lv_obj_add_event_cb(fx_bars[cell], fx_bar_slider_cb, LV_EVENT_RELEASED, (void*)(intptr_t)cell);
+        lv_obj_add_event_cb(fx_bars[cell], fx_bar_slider_cb, LV_EVENT_PRESS_LOST, (void*)(intptr_t)cell);
         lv_obj_add_flag(fx_bars[cell], LV_OBJ_FLAG_HIDDEN);
 
         // ── Alt visualization: LED ladder (hidden unless VIZ: LED) — plain
         // lv_obj rectangles with bg_color/bg_opa toggling, the same proven
         // technique as the fx_page_dot page indicators, rather than the
-        // unverified lv_led widget API. ──
+        // unverified lv_led widget API. Each segment is tappable: tapping
+        // segment N jumps the value to that step, same as tapping a step
+        // on a step meter. ──
         for (int i = 0; i < FX_LED_COUNT; i++) {
             lv_obj_t* led = lv_obj_create(card);
             fx_leds[cell][i] = led;
@@ -7934,7 +7988,8 @@ static void create_fx_screen(void) {
             lv_obj_set_style_bg_opa(led, LV_OPA_20, 0);
             lv_obj_set_style_border_width(led, 0, 0);
             lv_obj_clear_flag(led, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_clear_flag(led, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(led, fx_led_cell_cb, LV_EVENT_CLICKED,
+                                (void*)(intptr_t)((cell << 8) | i));
             lv_obj_add_flag(led, LV_OBJ_FLAG_HIDDEN);
         }
 
@@ -8181,7 +8236,11 @@ static void update_fx_screen(void) {
 
         // Keep BAR/LED in sync too, even while hidden — switching VIZ style
         // then shows the right value immediately instead of a stale one.
-        if (fx_bars[cell]) lv_bar_set_value(fx_bars[cell], anim_val, LV_ANIM_OFF);
+        if (fx_bars[cell]) {
+            s_fx_ui_syncing = true;
+            lv_slider_set_value(fx_bars[cell], anim_val, LV_ANIM_OFF);
+            s_fx_ui_syncing = false;
+        }
         {
             int lit = (anim_val * FX_LED_COUNT + 63) / 127;   // round to nearest
             if (lit > FX_LED_COUNT) lit = FX_LED_COUNT;
