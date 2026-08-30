@@ -16140,66 +16140,65 @@ static void matrix_song_load_from_disk(void) {
 static void matrix_col_refresh(int c) {
     if (c < 0 || c >= MATRIX_UI_STEPS) return;
     const MatrixUiColumn& s = s_matrix_cols[c];
+    char buf[72];
     if (s_matrix_pattern_lbls[c]) {
-        if (s.pattern >= 0) lv_label_set_text_fmt(s_matrix_pattern_lbls[c], "P%02d", s.pattern + 1);
-        else lv_label_set_text(s_matrix_pattern_lbls[c], "--");
+        if (s.pattern >= 0)
+            snprintf(buf, sizeof(buf), "P%02d\n%s", s.pattern + 1, seq_pattern_name(s.pattern));
+        else
+            snprintf(buf, sizeof(buf), "--\nVACIA");
+        lv_label_set_text(s_matrix_pattern_lbls[c], buf);
     }
     if (s_matrix_filter_lbls[c]) {
-        if (s.filterPreset >= 0) lv_label_set_text_fmt(s_matrix_filter_lbls[c], "F%d", s.filterPreset + 1);
-        else lv_label_set_text(s_matrix_filter_lbls[c], "F-");
+        if (s.filterPreset >= 0 && s.filterPreset < FILTER_PRESET_COUNT) {
+            const FilterPresetSlot& p = s_filter_presets[s.filterPreset];
+            snprintf(buf, sizeof(buf), "F%d\n%s", s.filterPreset + 1, p.used ? p.name : "VACIO");
+        } else snprintf(buf, sizeof(buf), "--\nSIN FILTRO");
+        lv_label_set_text(s_matrix_filter_lbls[c], buf);
     }
     if (s_matrix_mixer_lbls[c]) {
-        if (s.mixerPreset >= 0) lv_label_set_text_fmt(s_matrix_mixer_lbls[c], "M%d", s.mixerPreset + 1);
-        else lv_label_set_text(s_matrix_mixer_lbls[c], "M-");
+        if (s.mixerPreset >= 0 && s.mixerPreset < MIXER_PRESET_COUNT) {
+            const MixerPresetSlot& p = s_mixer_presets[s.mixerPreset];
+            snprintf(buf, sizeof(buf), "M%d\n%s", s.mixerPreset + 1, p.used ? p.name : "VACIO");
+        } else snprintf(buf, sizeof(buf), "--\nSIN MIXER");
+        lv_label_set_text(s_matrix_mixer_lbls[c], buf);
     }
     if (s_matrix_melody_lbls[c]) {
-        if (s.melodyPreset >= 0) lv_label_set_text_fmt(s_matrix_melody_lbls[c], "N%d", s.melodyPreset + 1);
-        else lv_label_set_text(s_matrix_melody_lbls[c], "N-");
+        if (s.melodyPreset >= 0 && s.melodyPreset < MELODY_PRESET_COUNT) {
+            const MelodyPresetSlot& p = s_melody_presets[s.melodyPreset];
+            snprintf(buf, sizeof(buf), "N%d\n%s", s.melodyPreset + 1, p.used ? p.name : "VACIO");
+        } else snprintf(buf, sizeof(buf), "--\nSIN MELODIA");
+        lv_label_set_text(s_matrix_melody_lbls[c], buf);
     }
 }
 
+// Forward declarations — the picker modal (defined below, after the preset
+// systems it lists) opens on tap instead of the old blind tap-to-cycle,
+// which is what caused both problems reported: a flicker from writing
+// /matrix_song.txt to flash on every single tap while cycling through up
+// to 128 patterns, and no visibility into what a preset slot actually is
+// while picking. One picker, one save, one clean list of names.
+enum MatrixPickKind { MATRIX_PICK_PATTERN, MATRIX_PICK_FILTER, MATRIX_PICK_MIXER, MATRIX_PICK_MELODY };
+static void matrix_pattern_picker_show(int col);
+static void matrix_preset_picker_show(int col, MatrixPickKind kind);
+
 static void matrix_pattern_cell_cb(lv_event_t* e) {
     int c = (int)(intptr_t)lv_event_get_user_data(e);
-    if (c < 0 || c >= MATRIX_UI_STEPS) return;
-    if (lv_event_get_code(e) == LV_EVENT_LONG_PRESSED) {
-        s_matrix_cols[c].pattern = -1;
-    } else {
-        int next = s_matrix_cols[c].pattern + 1;
-        if (next >= Config::MAX_PATTERNS) next = 0;
-        s_matrix_cols[c].pattern = (int8_t)next;
-    }
-    matrix_col_refresh(c);
-    matrix_song_save_to_disk();
+    matrix_pattern_picker_show(c);
 }
 
 static void matrix_filter_cell_cb(lv_event_t* e) {
     int c = (int)(intptr_t)lv_event_get_user_data(e);
-    if (c < 0 || c >= MATRIX_UI_STEPS) return;
-    int next = s_matrix_cols[c].filterPreset + 1;
-    if (next >= FILTER_PRESET_COUNT) next = -1;
-    s_matrix_cols[c].filterPreset = (int8_t)next;
-    matrix_col_refresh(c);
-    matrix_song_save_to_disk();
+    matrix_preset_picker_show(c, MATRIX_PICK_FILTER);
 }
 
 static void matrix_mixer_cell_cb(lv_event_t* e) {
     int c = (int)(intptr_t)lv_event_get_user_data(e);
-    if (c < 0 || c >= MATRIX_UI_STEPS) return;
-    int next = s_matrix_cols[c].mixerPreset + 1;
-    if (next >= MIXER_PRESET_COUNT) next = -1;
-    s_matrix_cols[c].mixerPreset = (int8_t)next;
-    matrix_col_refresh(c);
-    matrix_song_save_to_disk();
+    matrix_preset_picker_show(c, MATRIX_PICK_MIXER);
 }
 
 static void matrix_melody_cell_cb(lv_event_t* e) {
     int c = (int)(intptr_t)lv_event_get_user_data(e);
-    if (c < 0 || c >= MATRIX_UI_STEPS) return;
-    int next = s_matrix_cols[c].melodyPreset + 1;
-    if (next >= MELODY_PRESET_COUNT) next = -1;
-    s_matrix_cols[c].melodyPreset = (int8_t)next;
-    matrix_col_refresh(c);
-    matrix_song_save_to_disk();
+    matrix_preset_picker_show(c, MATRIX_PICK_MELODY);
 }
 
 static void matrix_status_refresh(void) {
@@ -16230,6 +16229,234 @@ static void matrix_bars_cb(lv_event_t* e) {
     uint8_t bars = (uint8_t)(intptr_t)lv_event_get_user_data(e);
     control_matrix_set_bars(bars);
     matrix_bars_refresh();
+}
+
+// =============================================================================
+// MATRIX pickers — a scrollable list of named options instead of the old
+// tap-to-cycle. Each pick writes /matrix_song.txt exactly once (on
+// selection), not once per tap, which was the real cause of the flicker
+// reported when cycling through patterns.
+// =============================================================================
+static lv_obj_t* s_matrix_picker_modal = NULL;
+static int        s_matrix_picker_col  = -1;
+static MatrixPickKind s_matrix_picker_kind = MATRIX_PICK_PATTERN;
+
+static void matrix_picker_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_matrix_picker_modal) {
+        lv_obj_del(s_matrix_picker_modal);
+        s_matrix_picker_modal = NULL;
+    }
+    s_matrix_picker_col = -1;
+}
+
+static void matrix_picker_pattern_pick_cb(lv_event_t* e) {
+    int p = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_matrix_picker_col >= 0 && s_matrix_picker_col < MATRIX_UI_STEPS) {
+        s_matrix_cols[s_matrix_picker_col].pattern = (int8_t)p;
+        matrix_col_refresh(s_matrix_picker_col);
+        matrix_song_save_to_disk();
+    }
+    matrix_picker_close_cb(NULL);
+}
+
+static void matrix_pattern_picker_show(int col) {
+    if (col < 0 || col >= MATRIX_UI_STEPS) return;
+    matrix_picker_close_cb(NULL);
+    s_matrix_picker_col = col;
+
+    s_matrix_picker_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_matrix_picker_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_matrix_picker_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_matrix_picker_modal, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_matrix_picker_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_matrix_picker_modal, 0, 0);
+    lv_obj_clear_flag(s_matrix_picker_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_matrix_picker_modal, matrix_picker_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_matrix_picker_modal);
+    lv_obj_set_size(card, 850, 530);
+    lv_obj_center(card);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text_fmt(title, "COLUMNA %d \xC2\xB7 ELIGE PATRON", col + 1);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 16, 10);
+
+    lv_obj_t* close = lv_btn_create(card);
+    lv_obj_set_size(close, 42, 38);
+    lv_obj_set_pos(close, 800, 6);
+    apply_control_button_style(close, RED808_ERROR, false, 8);
+    lv_obj_add_event_cb(close, matrix_picker_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* cl = lv_label_create(close);
+    lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+    lv_obj_center(cl);
+
+    lv_obj_t* list = lv_obj_create(card);
+    lv_obj_set_size(list, 818, 466);
+    lv_obj_set_pos(list, 16, 52);
+    lv_obj_set_style_bg_color(list, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_opa(list, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 6, 0);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+
+    // Row 0: clears the column (marks it empty / end of song).
+    {
+        lv_obj_t* btn = lv_btn_create(list);
+        lv_obj_set_size(btn, 806, 42);
+        lv_obj_set_pos(btn, 0, 0);
+        bool sel = (s_matrix_cols[col].pattern < 0);
+        apply_control_button_style(btn, sel ? RED808_WARNING : RED808_BORDER, sel, 7);
+        lv_obj_add_event_cb(btn, matrix_picker_pattern_pick_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, "-- VACIA / FIN DE CANCION --");
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 6, 0);
+    }
+    for (int p = 0; p < Config::MAX_PATTERNS; ++p) {
+        const int visibleIndex = p + 1;   // offset by the clear row above
+        const int pcol = visibleIndex & 1;
+        const int prow = visibleIndex >> 1;
+        lv_obj_t* btn = lv_btn_create(list);
+        lv_obj_set_size(btn, 394, 42);
+        lv_obj_set_pos(btn, pcol * 402, prow * 46);
+        const bool current = (p == s_matrix_cols[col].pattern);
+        apply_control_button_style(btn, current ? RED808_ACCENT : RED808_BORDER, current, 7);
+        lv_obj_add_event_cb(btn, matrix_picker_pattern_pick_cb, LV_EVENT_CLICKED, (void*)(intptr_t)p);
+        lv_obj_t* label = lv_label_create(btn);
+        lv_label_set_text_fmt(label, "P%03d  %s", p + 1, seq_pattern_name(p));
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(label, current ? lv_color_white() : RED808_TEXT, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 6, 0);
+    }
+}
+
+static void matrix_picker_preset_pick_cb(lv_event_t* e) {
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_matrix_picker_col >= 0 && s_matrix_picker_col < MATRIX_UI_STEPS) {
+        MatrixUiColumn& c = s_matrix_cols[s_matrix_picker_col];
+        switch (s_matrix_picker_kind) {
+            case MATRIX_PICK_FILTER: c.filterPreset = (int8_t)slot; break;
+            case MATRIX_PICK_MIXER:  c.mixerPreset  = (int8_t)slot; break;
+            case MATRIX_PICK_MELODY: c.melodyPreset = (int8_t)slot; break;
+            default: break;
+        }
+        matrix_col_refresh(s_matrix_picker_col);
+        matrix_song_save_to_disk();
+    }
+    matrix_picker_close_cb(NULL);
+}
+
+static void matrix_preset_picker_show(int col, MatrixPickKind kind) {
+    if (col < 0 || col >= MATRIX_UI_STEPS) return;
+    matrix_picker_close_cb(NULL);
+    s_matrix_picker_col = col;
+    s_matrix_picker_kind = kind;
+
+    const char* titleTxt = "PRESET";
+    lv_color_t accent = RED808_CYAN;
+    int8_t current = -1;
+    switch (kind) {
+        case MATRIX_PICK_FILTER:
+            titleTxt = "FILTRO"; accent = lv_color_hex(0xFFE066);
+            current = s_matrix_cols[col].filterPreset; break;
+        case MATRIX_PICK_MIXER:
+            titleTxt = "MIXER"; accent = lv_color_hex(0x7CFF6B);
+            current = s_matrix_cols[col].mixerPreset; break;
+        case MATRIX_PICK_MELODY:
+            titleTxt = "MELODIA"; accent = lv_color_hex(0xFF1493);
+            current = s_matrix_cols[col].melodyPreset; break;
+        default: break;
+    }
+
+    s_matrix_picker_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_matrix_picker_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_matrix_picker_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_matrix_picker_modal, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_matrix_picker_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_matrix_picker_modal, 0, 0);
+    lv_obj_clear_flag(s_matrix_picker_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_matrix_picker_modal, matrix_picker_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_matrix_picker_modal);
+    lv_obj_set_size(card, 480, 500);
+    lv_obj_center(card);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, accent, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text_fmt(title, "COLUMNA %d \xC2\xB7 %s", col + 1, titleTxt);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, accent, 0);
+    lv_obj_set_pos(title, 16, 10);
+
+    lv_obj_t* close = lv_btn_create(card);
+    lv_obj_set_size(close, 42, 38);
+    lv_obj_set_pos(close, 422, 6);
+    apply_control_button_style(close, RED808_ERROR, false, 8);
+    lv_obj_add_event_cb(close, matrix_picker_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* cl = lv_label_create(close);
+    lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+    lv_obj_center(cl);
+
+    int y = 56;
+    {
+        lv_obj_t* btn = lv_btn_create(card);
+        lv_obj_set_size(btn, 448, 40);
+        lv_obj_set_pos(btn, 16, y);
+        bool sel = (current < 0);
+        apply_control_button_style(btn, sel ? RED808_WARNING : RED808_BORDER, sel, 8);
+        lv_obj_add_event_cb(btn, matrix_picker_preset_pick_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, "-- NINGUNO --");
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_center(lbl);
+    }
+    y += 46;
+    for (int i = 0; i < 8; i++) {
+        bool used = false;
+        const char* name = "VACIO";
+        switch (kind) {
+            case MATRIX_PICK_FILTER:
+                used = s_filter_presets[i].used;
+                name = used ? s_filter_presets[i].name : "VACIO"; break;
+            case MATRIX_PICK_MIXER:
+                used = s_mixer_presets[i].used;
+                name = used ? s_mixer_presets[i].name : "VACIO"; break;
+            case MATRIX_PICK_MELODY:
+                used = s_melody_presets[i].used;
+                name = used ? s_melody_presets[i].name : "VACIO"; break;
+            default: break;
+        }
+        lv_obj_t* btn = lv_btn_create(card);
+        lv_obj_set_size(btn, 448, 40);
+        lv_obj_set_pos(btn, 16, y);
+        bool sel = (current == i);
+        apply_control_button_style(btn, sel ? accent : RED808_BORDER, sel, 8);
+        lv_obj_add_event_cb(btn, matrix_picker_preset_pick_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_label_set_text_fmt(lbl, "%d \xC2\xB7 %s", i + 1, name);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl, sel ? RED808_BG : (used ? RED808_TEXT : RED808_TEXT_DIM), 0);
+        lv_obj_center(lbl);
+        y += 46;
+    }
 }
 
 // Called from the SONG modal's own PLAY, and from the bar-clock tick bridge
@@ -16284,6 +16511,11 @@ static void matrix_play_btn_cb(lv_event_t* e) {
     ui_show_toast("MATRIX: reproduciendo", RED808_SUCCESS);
 }
 
+static lv_obj_t* s_matrix_grid_area = NULL;
+static lv_obj_t* s_matrix_page_lbl  = NULL;
+static int        s_matrix_view_page = 0;
+static constexpr int MATRIX_VIS_COLS = 8;   // per page — bigger cells than showing all 16 at once
+
 static void matrix_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     if (s_matrix_modal) {
@@ -16298,8 +16530,93 @@ static void matrix_modal_close_cb(lv_event_t* e) {
         s_matrix_status_lbl = NULL;
         s_matrix_play_btn = NULL;
         s_matrix_play_lbl = NULL;
+        s_matrix_grid_area = NULL;
+        s_matrix_page_lbl = NULL;
+        s_matrix_view_page = 0;
         for (int i = 0; i < 4; i++) s_matrix_bars_btns[i] = NULL;
     }
+}
+
+// (Re)builds only the grid area's cells for the current page — called on
+// open and on PREV/NEXT — instead of tearing down the whole screen, so
+// paging feels instant and doesn't touch the header/footer controls.
+static void matrix_build_grid_page(void) {
+    if (!s_matrix_grid_area) return;
+    lv_obj_clean(s_matrix_grid_area);
+    for (int i = 0; i < MATRIX_UI_STEPS; i++) {
+        s_matrix_pattern_lbls[i] = NULL;
+        s_matrix_filter_lbls[i] = NULL;
+        s_matrix_mixer_lbls[i] = NULL;
+        s_matrix_melody_lbls[i] = NULL;
+    }
+
+    constexpr int colW = 118, colGap = 8;
+    constexpr int rowH = 108, rowGap = 8;
+    static const uint32_t rowColors[4] = {0x00E5FF, 0xFFE066, 0x7CFF6B, 0xFF1493};
+    static const char* rowIcons[4]     = {LV_SYMBOL_AUDIO, LV_SYMBOL_TINT,
+                                          LV_SYMBOL_VOLUME_MAX, LV_SYMBOL_KEYBOARD};
+
+    const int pageCount = (MATRIX_UI_STEPS + MATRIX_VIS_COLS - 1) / MATRIX_VIS_COLS;
+    if (s_matrix_view_page >= pageCount) s_matrix_view_page = pageCount - 1;
+    if (s_matrix_view_page < 0) s_matrix_view_page = 0;
+    const int start = s_matrix_view_page * MATRIX_VIS_COLS;
+    const int visible = constrain(MATRIX_UI_STEPS - start, 0, MATRIX_VIS_COLS);
+
+    for (int vc = 0; vc < visible; vc++) {
+        int c = start + vc;
+        int x = vc * (colW + colGap);
+
+        lv_obj_t* idxLbl = lv_label_create(s_matrix_grid_area);
+        lv_label_set_text_fmt(idxLbl, "COL %d", c + 1);
+        lv_obj_set_style_text_font(idxLbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(idxLbl, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(idxLbl, x + 4, 0);
+
+        for (int r = 0; r < 4; r++) {
+            lv_obj_t* btn = lv_btn_create(s_matrix_grid_area);
+            lv_obj_set_size(btn, colW, rowH);
+            lv_obj_set_pos(btn, x, 18 + r * (rowH + rowGap));
+            apply_control_button_style(btn, lv_color_hex(rowColors[r]), false, 8);
+            lv_event_cb_t cb = r == 0 ? matrix_pattern_cell_cb
+                              : r == 1 ? matrix_filter_cell_cb
+                              : r == 2 ? matrix_mixer_cell_cb
+                                       : matrix_melody_cell_cb;
+            lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
+
+            lv_obj_t* icon = lv_label_create(btn);
+            lv_label_set_text(icon, rowIcons[r]);
+            lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(icon, lv_color_hex(rowColors[r]), 0);
+            lv_obj_align(icon, LV_ALIGN_TOP_LEFT, 6, 6);
+
+            lv_obj_t* lbl = lv_label_create(btn);
+            lv_obj_set_width(lbl, colW - 14);
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 8);
+            switch (r) {
+                case 0: s_matrix_pattern_lbls[c] = lbl; break;
+                case 1: s_matrix_filter_lbls[c]  = lbl; break;
+                case 2: s_matrix_mixer_lbls[c]   = lbl; break;
+                default: s_matrix_melody_lbls[c] = lbl; break;
+            }
+        }
+        matrix_col_refresh(c);
+    }
+
+    if (s_matrix_page_lbl) {
+        int lastVisible = start + (visible > 0 ? visible - 1 : 0) + 1;
+        lv_label_set_text_fmt(s_matrix_page_lbl, "COL %d-%d / %d",
+            start + 1, lastVisible, MATRIX_UI_STEPS);
+    }
+}
+
+static void matrix_page_cb(lv_event_t* e) {
+    int dir = (int)(intptr_t)lv_event_get_user_data(e);
+    int pageCount = (MATRIX_UI_STEPS + MATRIX_VIS_COLS - 1) / MATRIX_VIS_COLS;
+    s_matrix_view_page = (s_matrix_view_page + dir + pageCount) % pageCount;
+    matrix_build_grid_page();
 }
 
 static void matrix_modal_show(lv_event_t* e) {
@@ -16309,6 +16626,7 @@ static void matrix_modal_show(lv_event_t* e) {
         matrix_song_load_from_disk();
         s_matrix_loaded_from_disk = true;
     }
+    s_matrix_view_page = 0;
 
     s_matrix_modal = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_matrix_modal, LV_HOR_RES, LV_VER_RES);
@@ -16324,78 +16642,69 @@ static void matrix_modal_show(lv_event_t* e) {
     lv_obj_set_style_text_color(title, RED808_CYAN, 0);
     lv_obj_set_pos(title, 12, 6);
 
+    // Page nav — top right, since only MATRIX_VIS_COLS of MATRIX_UI_STEPS
+    // columns fit on screen at this cell size.
+    lv_obj_t* prev = lv_btn_create(s_matrix_modal);
+    lv_obj_set_size(prev, 42, 36);
+    lv_obj_set_pos(prev, 700, 6);
+    apply_control_button_style(prev, RED808_CYAN, false, 8);
+    lv_obj_add_event_cb(prev, matrix_page_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
+    lv_obj_t* prevLbl = lv_label_create(prev);
+    lv_label_set_text(prevLbl, LV_SYMBOL_LEFT);
+    lv_obj_center(prevLbl);
+
+    s_matrix_page_lbl = lv_label_create(s_matrix_modal);
+    lv_label_set_text(s_matrix_page_lbl, "COL 1-8 / 16");
+    lv_obj_set_style_text_font(s_matrix_page_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_matrix_page_lbl, RED808_TEXT, 0);
+    lv_obj_set_pos(s_matrix_page_lbl, 748, 16);
+
+    lv_obj_t* next = lv_btn_create(s_matrix_modal);
+    lv_obj_set_size(next, 42, 36);
+    lv_obj_set_pos(next, 858, 6);
+    apply_control_button_style(next, RED808_CYAN, false, 8);
+    lv_obj_add_event_cb(next, matrix_page_cb, LV_EVENT_CLICKED, (void*)(intptr_t)1);
+    lv_obj_t* nextLbl = lv_label_create(next);
+    lv_label_set_text(nextLbl, LV_SYMBOL_RIGHT);
+    lv_obj_center(nextLbl);
+
+    lv_obj_t* closeBtn = lv_btn_create(s_matrix_modal);
+    lv_obj_set_size(closeBtn, 42, 36);
+    lv_obj_set_pos(closeBtn, 970, 6);
+    apply_control_button_style(closeBtn, RED808_ERROR, false, 8);
+    lv_obj_add_event_cb(closeBtn, matrix_modal_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(closeLbl);
+
     lv_obj_t* hint = lv_label_create(s_matrix_modal);
-    lv_label_set_text(hint, "Fila 1 patron - Fila 2 filtro - Fila 3 mixer - Fila 4 melodia. "
-                             "Toca para ciclar; manten pulsado el patron para vaciar la columna.");
-    lv_obj_set_width(hint, LV_HOR_RES - 24);
+    lv_label_set_text(hint, "Toca una celda para elegir de una lista: patron, filtro, mixer o melodia.");
+    lv_obj_set_width(hint, 680);
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(hint, 12, 34);
 
-    constexpr int colW = 58, colGap = 4, x0 = 12;
-    constexpr int rowY[4] = {66, 122, 168, 214};
-    constexpr int rowH[4] = {50, 40, 40, 40};
-    static const uint32_t rowColors[4] = {0x00E5FF, 0xFFE066, 0x7CFF6B, 0xFF1493};
-
-    for (int c = 0; c < MATRIX_UI_STEPS; c++) {
-        int x = x0 + c * (colW + colGap);
-
-        lv_obj_t* pb = lv_btn_create(s_matrix_modal);
-        lv_obj_set_size(pb, colW, rowH[0]);
-        lv_obj_set_pos(pb, x, rowY[0]);
-        apply_control_button_style(pb, lv_color_hex(rowColors[0]), false, 6);
-        lv_obj_add_event_cb(pb, matrix_pattern_cell_cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
-        lv_obj_add_event_cb(pb, matrix_pattern_cell_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)c);
-        lv_obj_t* pl = lv_label_create(pb);
-        s_matrix_pattern_lbls[c] = pl;
-        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
-        lv_obj_center(pl);
-
-        lv_obj_t* fb = lv_btn_create(s_matrix_modal);
-        lv_obj_set_size(fb, colW, rowH[1]);
-        lv_obj_set_pos(fb, x, rowY[1]);
-        apply_control_button_style(fb, lv_color_hex(rowColors[1]), false, 6);
-        lv_obj_add_event_cb(fb, matrix_filter_cell_cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
-        lv_obj_t* fl = lv_label_create(fb);
-        s_matrix_filter_lbls[c] = fl;
-        lv_obj_set_style_text_font(fl, &lv_font_montserrat_12, 0);
-        lv_obj_center(fl);
-
-        lv_obj_t* mb = lv_btn_create(s_matrix_modal);
-        lv_obj_set_size(mb, colW, rowH[2]);
-        lv_obj_set_pos(mb, x, rowY[2]);
-        apply_control_button_style(mb, lv_color_hex(rowColors[2]), false, 6);
-        lv_obj_add_event_cb(mb, matrix_mixer_cell_cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
-        lv_obj_t* ml = lv_label_create(mb);
-        s_matrix_mixer_lbls[c] = ml;
-        lv_obj_set_style_text_font(ml, &lv_font_montserrat_12, 0);
-        lv_obj_center(ml);
-
-        lv_obj_t* ndb = lv_btn_create(s_matrix_modal);
-        lv_obj_set_size(ndb, colW, rowH[3]);
-        lv_obj_set_pos(ndb, x, rowY[3]);
-        apply_control_button_style(ndb, lv_color_hex(rowColors[3]), false, 6);
-        lv_obj_add_event_cb(ndb, matrix_melody_cell_cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
-        lv_obj_t* nl = lv_label_create(ndb);
-        s_matrix_melody_lbls[c] = nl;
-        lv_obj_set_style_text_font(nl, &lv_font_montserrat_12, 0);
-        lv_obj_center(nl);
-
-        matrix_col_refresh(c);
-    }
+    s_matrix_grid_area = lv_obj_create(s_matrix_modal);
+    lv_obj_set_size(s_matrix_grid_area, 1000, 480);
+    lv_obj_set_pos(s_matrix_grid_area, 12, 52);
+    lv_obj_set_style_bg_opa(s_matrix_grid_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_matrix_grid_area, 0, 0);
+    lv_obj_set_style_pad_all(s_matrix_grid_area, 0, 0);
+    lv_obj_clear_flag(s_matrix_grid_area, LV_OBJ_FLAG_SCROLLABLE);
+    matrix_build_grid_page();
 
     lv_obj_t* barsLbl = lv_label_create(s_matrix_modal);
     lv_label_set_text(barsLbl, "COMPASES:");
     lv_obj_set_style_text_font(barsLbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(barsLbl, RED808_TEXT_DIM, 0);
-    lv_obj_set_pos(barsLbl, 12, 269);
+    lv_obj_set_pos(barsLbl, 12, 546);
     {
         static const uint8_t barOptions[4] = {1, 2, 4, 8};
         for (int i = 0; i < 4; i++) {
             lv_obj_t* chip = lv_btn_create(s_matrix_modal);
             s_matrix_bars_btns[i] = chip;
-            lv_obj_set_size(chip, 48, 30);
-            lv_obj_set_pos(chip, 100 + i * 54, 262);
+            lv_obj_set_size(chip, 48, 32);
+            lv_obj_set_pos(chip, 100 + i * 54, 540);
             lv_obj_add_event_cb(chip, matrix_bars_cb, LV_EVENT_CLICKED, (void*)(intptr_t)barOptions[i]);
             lv_obj_t* lbl = lv_label_create(chip);
             lv_label_set_text_fmt(lbl, "%d", barOptions[i]);
@@ -16409,11 +16718,11 @@ static void matrix_modal_show(lv_event_t* e) {
     lv_label_set_text(s_matrix_status_lbl, "MATRIX: OFF");
     lv_obj_set_style_text_font(s_matrix_status_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_matrix_status_lbl, RED808_TEXT, 0);
-    lv_obj_set_pos(s_matrix_status_lbl, 340, 270);
+    lv_obj_set_pos(s_matrix_status_lbl, 340, 548);
 
     s_matrix_play_btn = lv_btn_create(s_matrix_modal);
     lv_obj_set_size(s_matrix_play_btn, 120, 40);
-    lv_obj_set_pos(s_matrix_play_btn, LV_HOR_RES - 260, 258);
+    lv_obj_set_pos(s_matrix_play_btn, LV_HOR_RES - 260, 540);
     apply_control_button_style(s_matrix_play_btn, RED808_SUCCESS, false, 8);
     lv_obj_add_event_cb(s_matrix_play_btn, matrix_play_btn_cb, LV_EVENT_CLICKED, NULL);
     s_matrix_play_lbl = lv_label_create(s_matrix_play_btn);
@@ -16421,15 +16730,15 @@ static void matrix_modal_show(lv_event_t* e) {
     lv_obj_set_style_text_font(s_matrix_play_lbl, &lv_font_montserrat_16, 0);
     lv_obj_center(s_matrix_play_lbl);
 
-    lv_obj_t* closeBtn = lv_btn_create(s_matrix_modal);
-    lv_obj_set_size(closeBtn, 120, 40);
-    lv_obj_set_pos(closeBtn, LV_HOR_RES - 132, 258);
-    apply_control_button_style(closeBtn, RED808_BORDER, false, 8);
-    lv_obj_add_event_cb(closeBtn, matrix_modal_close_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t* closeLbl = lv_label_create(closeBtn);
-    lv_label_set_text(closeLbl, "CERRAR");
-    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_14, 0);
-    lv_obj_center(closeLbl);
+    lv_obj_t* closeBtn2 = lv_btn_create(s_matrix_modal);
+    lv_obj_set_size(closeBtn2, 120, 40);
+    lv_obj_set_pos(closeBtn2, LV_HOR_RES - 132, 540);
+    apply_control_button_style(closeBtn2, RED808_BORDER, false, 8);
+    lv_obj_add_event_cb(closeBtn2, matrix_modal_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl2 = lv_label_create(closeBtn2);
+    lv_label_set_text(closeLbl2, "CERRAR");
+    lv_obj_set_style_text_font(closeLbl2, &lv_font_montserrat_14, 0);
+    lv_obj_center(closeLbl2);
 
     matrix_status_refresh();
 }
