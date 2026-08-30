@@ -16668,6 +16668,8 @@ static lv_obj_t* s_matrix_col_btns[MATRIX_UI_STEPS][4] = {};
 // maps chain index back to the UI column so the highlight lands on the
 // right cell. Filled in by matrix_play_btn_cb() alongside the chain upload.
 static int8_t s_matrix_chain_to_col[MATRIX_MAX_STEPS] = {};
+static int        s_matrix_view_page = 0;
+static constexpr int MATRIX_VIS_COLS = 8;   // per page — bigger cells than showing all 16 at once
 
 // Fills the active column's 4 cells solid (same "selected tab" convention
 // used elsewhere in this app: filled=true swaps bg to the accent color and
@@ -16756,8 +16758,6 @@ static void matrix_play_btn_cb(lv_event_t* e) {
 
 static lv_obj_t* s_matrix_grid_area = NULL;
 static lv_obj_t* s_matrix_page_lbl  = NULL;
-static int        s_matrix_view_page = 0;
-static constexpr int MATRIX_VIS_COLS = 8;   // per page — bigger cells than showing all 16 at once
 
 static void matrix_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
