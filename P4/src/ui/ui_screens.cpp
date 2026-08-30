@@ -16595,6 +16595,55 @@ static void matrix_preset_picker_show(int col, MatrixPickKind kind) {
     }
 }
 
+// Same row identity colors used by the grid cells and the preset pickers —
+// a real function (not a `static const` array) so it always reflects the
+// live theme, never a color cached from whichever theme was active first.
+static lv_color_t matrix_row_color(int r) {
+    switch (r) {
+        case 0: return RED808_CYAN;
+        case 1: return RED808_WARNING;
+        case 2: return RED808_SUCCESS;
+        default: return RED808_ACCENT2;
+    }
+}
+
+// Which column is currently playing (-1 = none/stopped). Cell buttons for
+// every built column, indexed [col][row], so the highlight can restyle
+// them directly without rebuilding the page.
+static int       s_matrix_active_col = -1;
+static lv_obj_t* s_matrix_col_btns[MATRIX_UI_STEPS][4] = {};
+// control_matrix_get_entry()'s index is a position in the COMPACTED chain
+// (empty columns skipped), not the authored grid's own column index — this
+// maps chain index back to the UI column so the highlight lands on the
+// right cell. Filled in by matrix_play_btn_cb() alongside the chain upload.
+static int8_t s_matrix_chain_to_col[MATRIX_MAX_STEPS] = {};
+
+// Fills the active column's 4 cells solid (same "selected tab" convention
+// used elsewhere in this app: filled=true swaps bg to the accent color and
+// text to RED808_BG for contrast) and any other visible column back to its
+// normal outline. Safe to call whether or not the column is on-screen.
+static void matrix_highlight_refresh(void) {
+    const int start = s_matrix_view_page * MATRIX_VIS_COLS;
+    const int visible = constrain(MATRIX_UI_STEPS - start, 0, MATRIX_VIS_COLS);
+    for (int vc = 0; vc < visible; vc++) {
+        int c = start + vc;
+        bool active = (c == s_matrix_active_col);
+        for (int r = 0; r < 4; r++) {
+            lv_obj_t* btn = s_matrix_col_btns[c][r];
+            if (!btn) continue;
+            lv_color_t rc = matrix_row_color(r);
+            apply_control_button_style(btn, rc, active, 8);
+            lv_obj_set_style_shadow_width(btn, active ? 16 : 0, 0);
+            lv_obj_set_style_shadow_color(btn, rc, 0);
+            lv_obj_set_style_shadow_opa(btn, active ? LV_OPA_60 : LV_OPA_0, 0);
+            lv_obj_t* icon = lv_obj_get_child(btn, 0);
+            lv_obj_t* lbl  = lv_obj_get_child(btn, 1);
+            if (icon) lv_obj_set_style_text_color(icon, active ? RED808_BG : rc, 0);
+            if (lbl)  lv_obj_set_style_text_color(lbl, active ? RED808_BG : RED808_TEXT, 0);
+        }
+    }
+}
+
 // Called from the SONG modal's own PLAY, and from the bar-clock tick bridge
 // (see ui_request_matrix_tick / ui_update_current_screen) whenever MATRIX
 // advances to a new column while running unattended — recalls that
@@ -16605,6 +16654,8 @@ static void matrix_apply_column(uint8_t idx) {
     if (e.filterPreset >= 0) filter_preset_recall(e.filterPreset);
     if (e.mixerPreset  >= 0) mixer_preset_recall(e.mixerPreset);
     if (e.melodyPreset >= 0) melody_preset_recall(e.melodyPreset);
+    s_matrix_active_col = (idx < MATRIX_MAX_STEPS) ? s_matrix_chain_to_col[idx] : -1;
+    if (s_matrix_modal) matrix_highlight_refresh();
     matrix_status_refresh();
 }
 
@@ -16612,6 +16663,8 @@ static void matrix_play_btn_cb(lv_event_t* e) {
     LV_UNUSED(e);
     if (control_matrix_active()) {
         control_matrix_set_active(false);
+        s_matrix_active_col = -1;
+        matrix_highlight_refresh();
         matrix_status_refresh();
         ui_show_toast("MATRIX detenido", RED808_WARNING);
         return;
@@ -16624,6 +16677,7 @@ static void matrix_play_btn_cb(lv_event_t* e) {
         entries[count].filterPreset = s_matrix_cols[c].filterPreset;
         entries[count].mixerPreset  = s_matrix_cols[c].mixerPreset;
         entries[count].melodyPreset = s_matrix_cols[c].melodyPreset;
+        s_matrix_chain_to_col[count] = (int8_t)c;
         count++;
     }
     if (count == 0) {
@@ -16643,6 +16697,8 @@ static void matrix_play_btn_cb(lv_event_t* e) {
     control_send_select_pattern(entries[0].pattern);
     if (!p4.is_playing) control_send_start();
     control_matrix_set_active(true);
+    s_matrix_active_col = s_matrix_chain_to_col[0];
+    matrix_highlight_refresh();
     matrix_status_refresh();
     ui_show_toast("MATRIX: reproduciendo", RED808_SUCCESS);
 }
@@ -16662,6 +16718,7 @@ static void matrix_modal_close_cb(lv_event_t* e) {
             s_matrix_filter_lbls[i] = NULL;
             s_matrix_mixer_lbls[i] = NULL;
             s_matrix_melody_lbls[i] = NULL;
+            for (int r = 0; r < 4; r++) s_matrix_col_btns[i][r] = NULL;
         }
         s_matrix_status_lbl = NULL;
         s_matrix_play_btn = NULL;
@@ -16684,15 +16741,11 @@ static void matrix_build_grid_page(void) {
         s_matrix_filter_lbls[i] = NULL;
         s_matrix_mixer_lbls[i] = NULL;
         s_matrix_melody_lbls[i] = NULL;
+        for (int r = 0; r < 4; r++) s_matrix_col_btns[i][r] = NULL;
     }
 
     constexpr int colW = 118, colGap = 8;
     constexpr int rowH = 108, rowGap = 8;
-    // Theme tokens, not fixed hex — re-read on every call (never `static`)
-    // so switching themes and reopening MATRIX actually picks up the new
-    // palette instead of freezing on whatever theme was active the first
-    // time this page was built.
-    const lv_color_t rowColors[4] = {RED808_CYAN, RED808_WARNING, RED808_SUCCESS, RED808_ACCENT2};
     static const char* rowIcons[4] = {LV_SYMBOL_AUDIO, LV_SYMBOL_TINT,
                                       LV_SYMBOL_VOLUME_MAX, LV_SYMBOL_KEYBOARD};
 
@@ -16713,10 +16766,12 @@ static void matrix_build_grid_page(void) {
         lv_obj_set_pos(idxLbl, x + 4, 0);
 
         for (int r = 0; r < 4; r++) {
+            lv_color_t rc = matrix_row_color(r);
             lv_obj_t* btn = lv_btn_create(s_matrix_grid_area);
+            s_matrix_col_btns[c][r] = btn;
             lv_obj_set_size(btn, colW, rowH);
             lv_obj_set_pos(btn, x, 18 + r * (rowH + rowGap));
-            apply_control_button_style(btn, rowColors[r], false, 8);
+            apply_control_button_style(btn, rc, false, 8);
             lv_event_cb_t cb = r == 0 ? matrix_pattern_cell_cb
                               : r == 1 ? matrix_filter_cell_cb
                               : r == 2 ? matrix_mixer_cell_cb
@@ -16726,7 +16781,7 @@ static void matrix_build_grid_page(void) {
             lv_obj_t* icon = lv_label_create(btn);
             lv_label_set_text(icon, rowIcons[r]);
             lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
-            lv_obj_set_style_text_color(icon, rowColors[r], 0);
+            lv_obj_set_style_text_color(icon, rc, 0);
             lv_obj_align(icon, LV_ALIGN_TOP_LEFT, 6, 6);
 
             lv_obj_t* lbl = lv_label_create(btn);
@@ -16734,6 +16789,7 @@ static void matrix_build_grid_page(void) {
             lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
             lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
             lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_color(lbl, RED808_TEXT, 0);
             lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 8);
             switch (r) {
                 case 0: s_matrix_pattern_lbls[c] = lbl; break;
@@ -16750,6 +16806,11 @@ static void matrix_build_grid_page(void) {
         lv_label_set_text_fmt(s_matrix_page_lbl, "COL %d-%d / %d",
             start + 1, lastVisible, MATRIX_UI_STEPS);
     }
+    // Picks up whatever s_matrix_active_col already is — matters when
+    // reopening MATRIX (or flipping pages) while it's still playing in
+    // the background: the newly-built cells show the right highlight
+    // immediately instead of waiting for the next bar-clock tick.
+    matrix_highlight_refresh();
 }
 
 static void matrix_page_cb(lv_event_t* e) {
