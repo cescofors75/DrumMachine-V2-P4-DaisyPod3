@@ -5391,10 +5391,13 @@ static void apply_pad_layout(int mode) {
         else            lv_obj_clear_flag(live_home_panels[i], LV_OBJ_FLAG_HIDDEN);
     }
 
+    // Same bottom-left-to-top-right row order as create_live_screen's own
+    // pad grid, kept consistent across every pad-count view mode.
+    const int rows = (count + cols - 1) / cols;
     for (int i = 0; i < 16; i++) {
         if (!live_pad_btns[i]) continue;
         if (i < count) {
-            int c = i % cols, r = i / cols;
+            int c = i % cols, r = (rows - 1) - i / cols;
             lv_obj_set_size(live_pad_btns[i], pw, ph);
             lv_obj_set_pos(live_pad_btns[i], M + c*(pw+G), M + r*(ph+G));
             lv_obj_clear_flag(live_pad_btns[i], LV_OBJ_FLAG_HIDDEN);
@@ -5702,8 +5705,12 @@ static void create_live_screen(void) {
     live_home_panels[live_home_panel_count++] = sep;
 
     // === LEFT 4×4: Drum Pads (Neon Ring Style) ===
+    // Row flipped (3 - i/4 instead of i/4) so pad order reads bottom-left
+    // to top-right like an MPD218/MPC-style pad controller — pad 1 (BD)
+    // sits bottom-left, pad 16 top-right, matching the physical layout
+    // muscle memory instead of top-to-bottom reading order.
     for (int i = 0; i < 16; i++) {
-        int c = i % 4, r = i / 4;
+        int c = i % 4, r = 3 - i / 4;
         lv_color_t tc = ui_track_color(i);
 
         live_pad_btns[i] = lv_btn_create(scr_live);
@@ -19387,7 +19394,9 @@ int ui_pad_from_xy(uint16_t x, uint16_t y, uint8_t* cell_x, uint8_t* cell_y) {
     if (col >= 4 || row >= 4) return -1;
     if (cell_x) *cell_x = (uint8_t)constrain((x_in * 127) / (LIVE_CW - 1), 0, 127);
     if (cell_y) *cell_y = (uint8_t)constrain((y_in * 127) / (LIVE_CH - 1), 0, 127);
-    return row * 4 + col;
+    // Row flipped to match the bottom-left-to-top-right MPD218-style pad
+    // order used by create_live_screen/apply_pad_layout above.
+    return (3 - row) * 4 + col;
 }
 
 static inline uint8_t ui_live_pad_velocity(void) {
