@@ -19434,9 +19434,23 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
         return;
     }
     
-    // Entering LIVE screen: reset transition flag
-    // Entering/in LIVE screen: reset transition flag for next time we leave
+    // Entering LIVE screen: reset transition flag for next time we leave.
+    // The BACK button on every other screen sits at the exact same (8,8)
+    // spot as LIVE's own pad 0 (BD) — tapping BACK there while still
+    // holding the finger down means the very next touch_task sample can
+    // land here with g_live_screen_active freshly true and pressed[0]
+    // still true from that same finger. s_pad_held[0] was already forced
+    // false by the "leaving/not-LIVE" branch above, so without this guard
+    // that looks exactly like a fresh finger-down on BD and fires it.
+    // Seed s_pad_held from the current touch state on this first in-LIVE
+    // frame instead of processing rising edges, so BD only actually fires
+    // once the finger has been lifted and pressed again for real.
+    bool justEnteredLive = !prev_live_active;
     prev_live_active = true;
+    if (justEnteredLive) {
+        for (int p = 0; p < 16; p++) s_pad_held[p] = pressed[p];
+        return;
+    }
 
     unsigned long now = millis();
     unsigned long nr_interval = ui_nr_interval_ms();    // 0 if NR off
