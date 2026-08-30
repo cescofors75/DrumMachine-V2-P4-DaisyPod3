@@ -7596,6 +7596,26 @@ static void filter_presets_save_to_disk(void) {
     f.close();
 }
 
+// First-boot factory content — 8 ready-to-use filter presets instead of 8
+// empty slots, covering the filter models actually useful on a drum
+// machine. Only applied when /filter_presets.txt has never been written
+// (a fresh SPIFFS partition); once the user saves anything, this never
+// runs again for that slot's file.
+struct FilterPresetDefault {
+    const char* name; int filterType; int cutoffHz; int resonanceX10;
+    int distortionPct; int bitcrushBits; int sampleRateHz; uint8_t morphU7;
+};
+static const FilterPresetDefault FILTER_PRESET_FACTORY[FILTER_PRESET_COUNT] = {
+    { "DEEP LOWPASS",  1,   800,  12,  0, 16,     0,   0 },
+    { "ACID SWEEP",   10,  1200,  85, 15, 16,     0,   0 },
+    { "HAT HIGHPASS",  2,  4000,   7,  0, 16,     0,   0 },
+    { "TELEPHONE BP",  3,  1500,  30,  0, 16,     0,   0 },
+    { "RESONANT ZAP",  9,  2000, 150,  0, 16,     0,   0 },
+    { "LOFI CRUSH",    1,  6000,   7, 10,  8, 12000,   0 },
+    { "COMB METAL",   14,  3000,  50,  0, 16,     0,   0 },
+    { "MORPH SWEEP",  15,  1000,  20,  0, 16,     0,  64 },
+};
+
 static void filter_presets_load_from_disk(void) {
     memset(s_filter_presets, 0, sizeof(s_filter_presets));
     for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
@@ -7603,7 +7623,23 @@ static void filter_presets_load_from_disk(void) {
         s_filter_presets[i].bitcrushBits = 16;
     }
     File f = SPIFFS.open(FILTER_PRESETS_FILE, FILE_READ);
-    if (!f) return;
+    if (!f) {
+        for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
+            const FilterPresetDefault& d = FILTER_PRESET_FACTORY[i];
+            FilterPresetSlot& s = s_filter_presets[i];
+            s.used = true;
+            strncpy(s.name, d.name, sizeof(s.name) - 1);
+            s.filterType = d.filterType;
+            s.cutoffHz = d.cutoffHz;
+            s.resonanceX10 = d.resonanceX10;
+            s.distortionPct = d.distortionPct;
+            s.bitcrushBits = d.bitcrushBits;
+            s.sampleRateHz = d.sampleRateHz;
+            s.morphU7 = d.morphU7;
+        }
+        filter_presets_save_to_disk();
+        return;
+    }
     int idx = 0;
     char line[128];
     while (idx < FILTER_PRESET_COUNT && fs_read_line(f, line, sizeof(line))) {
@@ -11705,12 +11741,43 @@ static void mixer_presets_save_to_disk(void) {
     f.close();
 }
 
+// First-boot factory content, same idea as FILTER_PRESET_FACTORY above —
+// 8 ready-made volume balances (track order: BD SD CH OH CY CP RS CB LT MT
+// HT MA CL HC MC LC) instead of 8 empty slots. Mute/solo intentionally left
+// off in every factory preset so recalling one never unexpectedly silences
+// tracks — only actual volumes differ.
+struct MixerPresetDefault { const char* name; uint8_t vol[16]; };
+static const MixerPresetDefault MIXER_PRESET_FACTORY[MIXER_PRESET_COUNT] = {
+    { "FLAT",           {100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100} },
+    { "DRUMS FOCUS",    {130,125,110,105,100, 90, 85, 70, 80, 80, 80, 60, 60, 65, 65, 65} },
+    { "PERC FOCUS",     { 90, 90, 80, 80, 85,100,100,120,110,110,110,130,125,120,120,120} },
+    { "CLUB LOUD",      {145,140, 95, 95, 90,110, 90, 85, 90, 90, 90, 80, 80, 80, 80, 80} },
+    { "LOFI QUIET PERC",{100,100,100,100, 90, 90, 70, 50, 60, 60, 60, 45, 45, 50, 50, 50} },
+    { "BREAKBEAT",      {105,130, 95,120,100,115, 90, 80, 85, 85, 85, 75, 75, 75, 75, 75} },
+    { "HALF TIME",      {135,135, 70, 70, 90,100, 90, 85,100,100,100, 80, 80, 80, 80, 80} },
+    { "WIDE MIX",       {110,110,105,105,105,105,100,100,100,100,100, 95, 95, 95, 95, 95} },
+};
+
 static void mixer_presets_load_from_disk(void) {
     memset(s_mixer_presets, 0, sizeof(s_mixer_presets));
     for (int i = 0; i < MIXER_PRESET_COUNT; i++)
         for (int t = 0; t < 16; t++) s_mixer_presets[i].volume[t] = 100;
     File f = SPIFFS.open(MIXER_PRESETS_FILE, FILE_READ);
-    if (!f) return;
+    if (!f) {
+        for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
+            const MixerPresetDefault& d = MIXER_PRESET_FACTORY[i];
+            MixerPresetSlot& s = s_mixer_presets[i];
+            s.used = true;
+            strncpy(s.name, d.name, sizeof(s.name) - 1);
+            for (int t = 0; t < 16; t++) {
+                s.volume[t] = d.vol[t];
+                s.muted[t] = false;
+                s.solo[t] = false;
+            }
+        }
+        mixer_presets_save_to_disk();
+        return;
+    }
     char line[64];
     for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
         if (!fs_read_line(f, line, sizeof(line))) break;
