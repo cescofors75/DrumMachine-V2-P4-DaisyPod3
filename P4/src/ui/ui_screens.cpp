@@ -6735,14 +6735,34 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
             int hz = constrain((int)(20.0f
                 * powf(1000.0f, (float)u7 / 127.0f) + 0.5f), 20, 20000);
             p4.cutoff_hz = hz;
-            if (transmit && control_available()) control_send_set_filter_cutoff(hz);
+            if (transmit && control_available()) {
+                // CUTOFF only has an audible effect once a filter MODEL is
+                // picked on the FILTER card — every other card in this row
+                // is its own self-contained on/off, so leaving CUTOFF silent
+                // until a separate card is touched read as "does nothing".
+                // Auto-engage a sensible default (LOWPASS = model 1) the
+                // first time this leaves its neutral (fully open) position;
+                // the FILTER card can still pick a different model any time.
+                if (u7 != fx_card_neutral_u7(FX_CARD_CUTOFF) && p4.filter_type == 0) {
+                    p4.filter_type = 1;
+                    control_send_set_filter(1);
+                }
+                control_send_set_filter_cutoff(hz);
+            }
             break;
         }
         case FX_CARD_RESO: {
             int resonanceX10 = constrain((int)(7.0f
                 + ((float)u7 / 127.0f) * 193.0f + 0.5f), 7, 200);
             p4.resonance_x10 = resonanceX10;
-            if (transmit && control_available()) control_send_set_filter_resonance((float)resonanceX10 / 10.0f);
+            if (transmit && control_available()) {
+                // Same reasoning as FX_CARD_CUTOFF above.
+                if (u7 != fx_card_neutral_u7(FX_CARD_RESO) && p4.filter_type == 0) {
+                    p4.filter_type = 1;
+                    control_send_set_filter(1);
+                }
+                control_send_set_filter_resonance((float)resonanceX10 / 10.0f);
+            }
             break;
         }
         case FX_CARD_DRIVE: {
