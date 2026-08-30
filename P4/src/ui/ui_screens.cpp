@@ -14926,7 +14926,7 @@ static void piano_refresh_gesture_controls(void) {
     }
     if (s_piano_glide_btn) {
         lv_obj_set_style_border_color(s_piano_glide_btn,
-            s_piano_glide_enabled ? lv_color_hex(0x00E5FF) : RED808_BORDER, 0);
+            s_piano_glide_enabled ? RED808_CYAN : RED808_BORDER, 0);
         lv_obj_set_style_border_width(s_piano_glide_btn, s_piano_glide_enabled ? 2 : 1, 0);
     }
 
@@ -14935,7 +14935,7 @@ static void piano_refresh_gesture_controls(void) {
     }
     if (s_piano_bend_btn) {
         lv_obj_set_style_border_color(s_piano_bend_btn,
-            s_piano_bend_enabled ? lv_color_hex(0x7CFF6B) : RED808_BORDER, 0);
+            s_piano_bend_enabled ? RED808_SUCCESS : RED808_BORDER, 0);
         lv_obj_set_style_border_width(s_piano_bend_btn, s_piano_bend_enabled ? 2 : 1, 0);
     }
 }
@@ -15551,7 +15551,7 @@ static void piano_play_btn_cb(lv_event_t* e) {
         lv_label_set_text(s_piano_play_lbl, s_piano_play_active ? "■ STOP" : "▶ PLAY");
     if (s_piano_play_btn) {
         lv_obj_set_style_border_color(s_piano_play_btn,
-            s_piano_play_active ? lv_color_hex(0x7CFF6B) : RED808_BORDER, 0);
+            s_piano_play_active ? RED808_SUCCESS : RED808_BORDER, 0);
         lv_obj_set_style_border_width(s_piano_play_btn, s_piano_play_active ? 3 : 1, 0);
     }
     if (!s_piano_play_active) piano_grid_refresh_all();
@@ -16483,9 +16483,9 @@ static void create_piano_screen(void) {
     /* PARAMS button → synth parameter editor screen (id 11) */
     {
         lv_obj_t* pbtn = piano_make_chip(scr_piano, 348, row_y, 100, 36, "PARAMS");
-        lv_obj_set_style_border_color(pbtn, lv_color_hex(0x00E5FF), 0);
+        lv_obj_set_style_border_color(pbtn, RED808_CYAN, 0);
         lv_obj_t* plbl = lv_obj_get_child(pbtn, 0);
-        if (plbl) lv_obj_set_style_text_color(plbl, lv_color_hex(0x00E5FF), 0);
+        if (plbl) lv_obj_set_style_text_color(plbl, RED808_CYAN, 0);
         lv_obj_add_event_cb(pbtn, [](lv_event_t* e){ (void)e; ui_navigate_to(11); },
                              LV_EVENT_CLICKED, NULL);
     }
@@ -16528,8 +16528,8 @@ static void create_piano_screen(void) {
     lv_obj_clear_flag(s_piano_expr_bar, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(s_piano_expr_bar, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_radius(s_piano_expr_bar, 5, 0);
-    lv_obj_set_style_bg_color(s_piano_expr_bar, lv_color_hex(0x00E5FF), 0);
-    lv_obj_set_style_bg_grad_color(s_piano_expr_bar, lv_color_hex(0x7CFFB2), 0);
+    lv_obj_set_style_bg_color(s_piano_expr_bar, RED808_CYAN, 0);
+    lv_obj_set_style_bg_grad_color(s_piano_expr_bar, RED808_SUCCESS, 0);
     lv_obj_set_style_bg_grad_dir(s_piano_expr_bar, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_border_width(s_piano_expr_bar, 0, 0);
     piano_update_expression_bar();
@@ -16538,7 +16538,7 @@ static void create_piano_screen(void) {
     s_piano_gate_lbl = lv_obj_get_child(s_piano_gate_btn, 0);
     if (s_piano_gate_lbl) lv_label_set_text_fmt(s_piano_gate_lbl, "GATE %u%%",
         (unsigned)s_piano_gate_percent.load(std::memory_order_relaxed));
-    lv_obj_set_style_border_color(s_piano_gate_btn, lv_color_hex(0x7CFF6B), 0);
+    lv_obj_set_style_border_color(s_piano_gate_btn, RED808_SUCCESS, 0);
     lv_obj_add_event_cb(s_piano_gate_btn, piano_gate_btn_cb, LV_EVENT_CLICKED, NULL);
 
     // MELODY PRESETS — sits in the gap between GATE (ends 568) and GLIDE
@@ -16568,24 +16568,24 @@ static void create_piano_screen(void) {
     int row_y2 = 104;
     int x_cursor = 12;
     lv_obj_t* pad_minus = piano_make_chip(scr_piano, x_cursor, row_y2, 54, 42, "PAD-");
-    lv_obj_set_style_border_color(pad_minus, lv_color_hex(0xFF1493), 0);
+    lv_obj_set_style_border_color(pad_minus, RED808_ACCENT2, 0);
     lv_obj_add_event_cb(pad_minus, piano_pad_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
     x_cursor += 54 + 4;
     s_piano_pad_lbl = lv_label_create(scr_piano);
     lv_label_set_text_fmt(s_piano_pad_lbl, "PAD %d", s_piano_assign_pad + 1);
     lv_obj_set_style_text_font(s_piano_pad_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_piano_pad_lbl, lv_color_hex(0xFF1493), 0);
+    lv_obj_set_style_text_color(s_piano_pad_lbl, RED808_ACCENT2, 0);
     lv_obj_set_pos(s_piano_pad_lbl, x_cursor, row_y2 + 11);
     x_cursor += 70 + 4;
     lv_obj_t* pad_plus = piano_make_chip(scr_piano, x_cursor, row_y2, 54, 42, "PAD+");
-    lv_obj_set_style_border_color(pad_plus, lv_color_hex(0xFF1493), 0);
+    lv_obj_set_style_border_color(pad_plus, RED808_ACCENT2, 0);
     lv_obj_add_event_cb(pad_plus, piano_pad_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)+1);
     x_cursor += 54 + 6;
     {
         lv_obj_t* assign = piano_make_chip(scr_piano, x_cursor, row_y2, 90, 42, "ASSIGN");
-        lv_obj_set_style_border_color(assign, lv_color_hex(0xFF1493), 0);
+        lv_obj_set_style_border_color(assign, RED808_ACCENT2, 0);
         lv_obj_t* l = lv_obj_get_child(assign, 0);
-        if (l) lv_obj_set_style_text_color(l, lv_color_hex(0xFF1493), 0);
+        if (l) lv_obj_set_style_text_color(l, RED808_ACCENT2, 0);
         lv_obj_add_event_cb(assign, piano_assign_btn_cb, LV_EVENT_CLICKED, NULL);
     }
     x_cursor += 90 + 10;
@@ -16607,14 +16607,14 @@ static void create_piano_screen(void) {
             x_cursor += 64 + 4;
         }
         lv_obj_t* clr = piano_make_chip(scr_piano, x_cursor, row_y2, 64, 42, "CLEAR");
-        lv_obj_set_style_border_color(clr, lv_color_hex(0xFF6060), 0);
+        lv_obj_set_style_border_color(clr, RED808_ERROR, 0);
         lv_obj_add_event_cb(clr, piano_clear_btn_cb, LV_EVENT_CLICKED, NULL);
         x_cursor += 64 + 8;
 
         s_piano_play_btn = piano_make_chip(scr_piano, x_cursor, row_y2, 84, 42, "PLAY");
         s_piano_play_lbl = lv_obj_get_child(s_piano_play_btn, 0);
-        lv_obj_set_style_border_color(s_piano_play_btn, lv_color_hex(0x7CFF6B), 0);
-        if (s_piano_play_lbl) lv_obj_set_style_text_color(s_piano_play_lbl, lv_color_hex(0x7CFF6B), 0);
+        lv_obj_set_style_border_color(s_piano_play_btn, RED808_SUCCESS, 0);
+        if (s_piano_play_lbl) lv_obj_set_style_text_color(s_piano_play_lbl, RED808_SUCCESS, 0);
         lv_obj_add_event_cb(s_piano_play_btn, piano_play_btn_cb, LV_EVENT_CLICKED, NULL);
         x_cursor += 84 + 12;
     }
@@ -17217,7 +17217,7 @@ static void pp_rebuild_param_grid(void) {
         lv_obj_set_size(bar, bar_full_w, bar_h);
         lv_obj_set_pos(bar, 7, cell_h - bar_h - 6);
         lv_obj_set_style_radius(bar, bar_h / 2, 0);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(0x00E5FF), 0);
+        lv_obj_set_style_bg_color(bar, RED808_CYAN, 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(bar, 0, 0);
         lv_obj_set_style_shadow_width(bar, 0, 0);
@@ -17237,7 +17237,7 @@ static void pp_rebuild_param_grid(void) {
         // Value text (centered, very big)
         lv_obj_t* vlbl = lv_label_create(cell);
         lv_obj_set_style_text_font(vlbl, &lv_font_montserrat_20, 0);
-        lv_obj_set_style_text_color(vlbl, lv_color_hex(0xFFE066), 0);
+        lv_obj_set_style_text_color(vlbl, RED808_WARNING, 0);
         lv_obj_align(vlbl, LV_ALIGN_CENTER, 0, 4);
         s_pp_val_lbls[i] = vlbl;
 
@@ -17482,7 +17482,7 @@ static void create_piano_params_screen(void) {
         lv_obj_t* b = lv_btn_create(scr_piano_params);
         lv_obj_set_size(b, p_w, p_h);
         lv_obj_set_pos(b, 12 + i * (p_w + p_gap), p_y);
-        apply_control_button_style(b, lv_color_hex(0xFF1493), false, 8);
+        apply_control_button_style(b, RED808_BORDER, false, 8);
         lv_obj_t* lbl = lv_label_create(b);
         lv_label_set_text(lbl, SP_ENGINES[s_pp_engine_idx].presets[i].name);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
@@ -17524,7 +17524,7 @@ static void create_piano_params_screen(void) {
     s_pp_wave_line = lv_line_create(s_pp_wave_card);
     lv_obj_set_size(s_pp_wave_line, 300, 68);
     lv_obj_align(s_pp_wave_line, LV_ALIGN_BOTTOM_MID, 0, -4);
-    lv_obj_set_style_line_color(s_pp_wave_line, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_line_color(s_pp_wave_line, RED808_CYAN, 0);
     lv_obj_set_style_line_width(s_pp_wave_line, 3, 0);
     lv_obj_set_style_line_rounded(s_pp_wave_line, true, 0);
 
