@@ -686,7 +686,7 @@ void ui_update_header(void) {
 // ── Boot estilo terminal 90s (BIOS/POST) pero moderno ────────────────────────
 // Líneas que van apareciendo tipo consola con estados dinámicos ([....]→ OK)
 // y cursor de bloque parpadeante. Fuente pixel UNSCII_16 (mono retro).
-#define BOOT_TERM_LINES 8
+#define BOOT_TERM_LINES 9
 static lv_obj_t* s_boot_term[BOOT_TERM_LINES] = {};
 static lv_obj_t* s_boot_cursor = NULL;
 static lv_obj_t* s_boot_progress = NULL;
@@ -1123,6 +1123,11 @@ static int s_xtra_scan_idx   = 0;  // next item index to process
 // result on an explicit RESCAN press, not the automatic scan-on-entry —
 // see xtra_page_rescan_cb / xtra_pages_request_folders / xtra_scan_advance.
 static bool s_xtra_scan_toast_on_done = false;
+// Sum of every CMD_SD_LIST_FILES response's file count seen during a scan —
+// unlike s_xtra_page_count (capped at XTRA_PAGE_MAX, only folders that
+// became a page), this is the real total WAV count across every folder and
+// subfolder visited, used for the boot-screen inventory line.
+static int s_xtra_scan_total_wavs = 0;
 
 static const uint8_t XTRA_SYNTH_ENGINE_CODES[7] = {0, 1, 2, 3, 4, 5, 6};
 static const char* XTRA_SYNTH_ENGINE_NAMES[7] = {"808", "909", "505", "303", "WT", "SH101", "FM2"};
@@ -1808,6 +1813,7 @@ static void xtra_pages_request_folders(void) {
     s_xtra_page_count = 1;
     s_xtra_scan_count = 0;
     s_xtra_scan_idx = 0;
+    s_xtra_scan_total_wavs = 0;
     if (!ui_control_available()) {
         xtra_page_refresh_label();
         if (s_xtra_scan_toast_on_done) {
@@ -1870,6 +1876,7 @@ static void xtra_pages_poll(void) {
 
     if (s_xtra_page_req == XTRA_PAGE_REQ_ITEM_FILES) {
         const XtraScanItem it = s_xtra_scan_queue[s_xtra_scan_idx];  // copy: push() below may not touch it, but keep it stable regardless
+        s_xtra_scan_total_wavs += state.daisy_sd_file_count;
         if (state.daisy_sd_file_count > 0 && s_xtra_page_count < XTRA_PAGE_MAX) {
             strncpy(s_xtra_page_names[s_xtra_page_count], it.path,
                     sizeof(s_xtra_page_names[0]) - 1);
@@ -19879,9 +19886,29 @@ void ui_update_current_screen(void) {
         if (scanFinished) progress = 100;
         if (s_boot_progress) lv_bar_set_value(s_boot_progress, progress, LV_ANIM_ON);
 
+        // Kick off the /data/xtra inventory scan the moment Daisy answers —
+        // reuses the exact same walk XTRAPADS itself uses (see
+        // xtra_pages_request_folders / xtra_pages_poll), just triggered here
+        // instead of on-entry to that screen, and polled every frame while
+        // the boot screen is up so it actually progresses (xtra_pages_poll()
+        // otherwise only runs while PERFORMANCE is the active screen).
+        static bool bootXtraScanKicked = false;
+        // Wait until the factory-kit autoload sequence (sd_factory_autoload_tick,
+        // above) is done with the SD/upload channel — both it and this scan
+        // ride the same USB command/response slot (daisy_sd_revision), and
+        // starting ours mid-scan or mid-upload would read back whichever
+        // response happened to land last, corrupting either result.
+        if (protocolReady && !bootXtraScanKicked && elapsed >= 1500u
+            && !sd_upload_in_flight() && !sd_midi_load_in_flight()
+            && s_sd_scan_state.load(std::memory_order_acquire) == 0) {
+            bootXtraScanKicked = true;
+            xtra_pages_request_folders();
+        }
+        if (bootXtraScanKicked) xtra_pages_poll();
+
         // Cada línea aparece a su tiempo, como un POST de BIOS.
         static const uint32_t revealMs[BOOT_TERM_LINES] =
-            { 100, 350, 600, 850, 1100, 1500, 1900, 2300 };
+            { 100, 350, 600, 850, 1100, 1500, 1900, 2300, 2700 };
         int lastVisible = -1;
         for (int i = 0; i < BOOT_TERM_LINES; i++) {
             if (!s_boot_term[i]) continue;
@@ -19978,6 +20005,24 @@ void ui_update_current_screen(void) {
                     loadedSamples > 0 ? "OK" : "WAIT");
                 setBootLine(7, loadedSamples > 0
                     ? boot_phosphor() : RED808_WARNING, line);
+            }
+
+            if (!bootXtraScanKicked) {
+                setBootLine(8, boot_phosphor_dim(),
+                    "> XTRA /data/xtra INVENTORY .......... WAIT");
+            } else if (s_xtra_page_req != XTRA_PAGE_REQ_NONE) {
+                snprintf(line, sizeof(line),
+                    "> XTRA SCANNING /data/xtra (%d) ....... SCAN",
+                    s_xtra_scan_count);
+                setBootLine(8, RED808_CYAN, line);
+            } else if (s_xtra_scan_count == 0) {
+                setBootLine(8, RED808_WARNING,
+                    "> XTRA /data/xtra SIN CARPETAS ....... WARN");
+            } else {
+                snprintf(line, sizeof(line),
+                    "> XTRA %d CARPETAS / %d WAV ........... OK",
+                    s_xtra_scan_count, s_xtra_scan_total_wavs);
+                setBootLine(8, boot_phosphor(), line);
             }
         }
         // Cursor de bloque parpadeante bajo la última línea visible
