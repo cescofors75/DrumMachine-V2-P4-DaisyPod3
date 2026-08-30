@@ -1100,7 +1100,10 @@ static uint8_t s_xtra_wave_count[4] = {};
 #define XTRA_PAGE_MAX        64  // DEFAULT + up to 63 discovered pages
 #define XTRA_SCAN_MAX_DEPTH  4   // xtra/A, xtra/A/B, xtra/A/B/C, xtra/A/B/C/D
 #define XTRA_SCAN_MAX_VISITS 250 // folders inspected per RESCAN, across all depths
-static char     s_xtra_page_names[XTRA_PAGE_MAX][40] = {};
+// 96 chars matches SdListFilesPayload.folderName — a depth-4 path with long
+// segment names ("xtra/DRUMS/DRUMS - LOOPS/PERCUSSION") needs more than the
+// 40 this used to be, which silently truncated real nested libraries.
+static char     s_xtra_page_names[XTRA_PAGE_MAX][96] = {};
 static int      s_xtra_page_count = 1;   // DEFAULT always exists
 static int      s_xtra_page_index = 0;
 static uint32_t s_xtra_seen_rev = 0;
@@ -1118,7 +1121,7 @@ static lv_obj_t* s_xtra_page_next_btn = NULL;
 
 // Breadth-first scan queue: each item is a folder path relative to
 // /data/xtra (e.g. "HOUSE" or "HOUSE/KICKS"), not yet checked for WAVs.
-struct XtraScanItem { char path[40]; uint8_t depth; };
+struct XtraScanItem { char path[96]; uint8_t depth; };
 static XtraScanItem s_xtra_scan_queue[XTRA_SCAN_MAX_VISITS];
 static int s_xtra_scan_count = 0;  // items pushed so far
 static int s_xtra_scan_idx   = 0;  // next item index to process
@@ -1734,7 +1737,7 @@ static void xtra_page_request_files(int pageIdx) {
     s_xtra_page_index = pageIdx;
     xtra_page_refresh_label();
     if (!ui_control_available()) return;
-    char folder[48];
+    char folder[104];  // "xtra/" + up to a 96-char nested path
     xtra_page_folder_path(pageIdx, folder, sizeof(folder));
     SdListFilesPayload payload = {};
     strncpy(payload.folderName, folder, sizeof(payload.folderName) - 1);
@@ -1766,7 +1769,7 @@ static void xtra_scan_push(const char* parentPath, const char* name, uint8_t dep
 // xtra_pages_poll below).
 static void xtra_scan_request_item_files(void) {
     const XtraScanItem& it = s_xtra_scan_queue[s_xtra_scan_idx];
-    char folder[48];
+    char folder[104];
     snprintf(folder, sizeof(folder), "xtra/%s", it.path);
     SdListFilesPayload payload = {};
     strncpy(payload.folderName, folder, sizeof(payload.folderName) - 1);
@@ -1899,7 +1902,7 @@ static void xtra_pages_poll(void) {
             s_xtra_page_count++;
         }
         if (it.depth < XTRA_SCAN_MAX_DEPTH && s_xtra_page_count < XTRA_PAGE_MAX) {
-            char folder[48];
+            char folder[104];
             snprintf(folder, sizeof(folder), "xtra/%s", it.path);
             SdListFilesPayload payload = {};
             strncpy(payload.folderName, folder, sizeof(payload.folderName) - 1);
@@ -1923,7 +1926,7 @@ static void xtra_pages_poll(void) {
 
     // XTRA_PAGE_REQ_FILES — a user-triggered PREV/NEXT page load onto pads 16-19
     s_xtra_page_req = XTRA_PAGE_REQ_NONE;
-    char folder[48];
+    char folder[104];
     xtra_page_folder_path(s_xtra_page_index, folder, sizeof(folder));
     int count = state.daisy_sd_file_count;
     if (count > 4) count = 4;

@@ -946,19 +946,24 @@ typedef struct __attribute__((packed)) {
 
 // --- SD: List Folders Request (no payload, response below) ---
 // --- SD: List Files Request ---
+// folderName holds a full relative path, not just one segment — XTRA's
+// recursive scan sends things like "xtra/DRUMS/DRUMS - LOOPS/PERCUSSION"
+// (see XTRA_SCAN_MAX_DEPTH). At 32 bytes that truncated silently past ~31
+// chars, corrupting the path for any real, deeply-nested sample library and
+// making Daisy's f_opendir fail on it (looks identical to "folder empty").
 typedef struct __attribute__((packed)) {
-    char     folderName[32]; // null-terminated folder name
+    char     folderName[96]; // null-terminated relative path under /data
 } SdListFilesPayload;
 
 // --- SD: File Info Request ---
 typedef struct __attribute__((packed)) {
-    char     folderName[32]; // kit folder
+    char     folderName[96]; // kit folder / relative path
     char     fileName[32];   // WAV filename
 } SdFileInfoPayload;
 
-// --- SD: Load Sample (65 bytes — folder[32] + filename[32] + padIdx) ---
+// --- SD: Load Sample (folder[64] + filename[32] + padIdx) ---
 typedef struct __attribute__((packed)) {
-    char     folderName[32]; // kit folder on SD (e.g. "BD", "xtra", "RED 808 KARZ")
+    char     folderName[96]; // kit folder on SD, or a nested xtra path
     char     fileName[32];   // WAV file name
     uint8_t  padIndex;       // 0-23 destination pad slot
 } SdLoadSamplePayload;

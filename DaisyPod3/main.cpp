@@ -686,8 +686,13 @@ struct __attribute__((packed)) SdStatusResponse {
     char     currentKit[32];
 };
 
+/* folder holds a full relative path under /data, not just one segment —
+ * XTRA's recursive scan on the P4 side sends nested paths like
+ * "xtra/DRUMS/DRUMS - LOOPS/PERCUSSION". Must stay 64 bytes to match
+ * SdListFilesPayload in P4/src/master/protocol.h — a size mismatch here
+ * would silently truncate every deep path back to ~31 chars again. */
 struct __attribute__((packed)) SdListFilesPayload {
-    char folder[32];        /* e.g. "BD", "xtra", "RED 808 KARZ" */
+    char folder[96];        /* e.g. "BD", "xtra", "xtra/DRUMS/DRUMS - LOOPS" */
 };
 
 struct __attribute__((packed)) SdListFilesResponse {
@@ -696,7 +701,7 @@ struct __attribute__((packed)) SdListFilesResponse {
 };
 
 struct __attribute__((packed)) SdFileInfoPayload {
-    char folder[32];
+    char folder[96];
     char filename[32];
 };
 
@@ -710,7 +715,7 @@ struct __attribute__((packed)) SdFileInfoResponse {
 };
 
 struct __attribute__((packed)) SdLoadSamplePayload {
-    char    folder[32];
+    char    folder[96];
     char    filename[32];
     uint8_t padIdx;
 };
@@ -8171,11 +8176,11 @@ static void ProcessCommand()
          * before this was added. */
         SdKitListResponse resp;   /* reuse: count + names[16][32] */
         memset(&resp, 0, sizeof(resp));
-        char rootPath[96];
+        char rootPath[160];  /* "/data/" + up to a 95-char nested xtra path */
         if(len >= sizeof(SdListFilesPayload)){
             SdListFilesPayload pl;
             memcpy(&pl, p, sizeof(pl));
-            pl.folder[31] = 0;
+            pl.folder[95] = 0;
             if(!JoinPath(rootPath, sizeof(rootPath), SD_DATA_ROOT, pl.folder)){
                 BuildResponse(CMD_SD_LIST_FOLDERS, hdr->sequence, (uint8_t*)&resp, 1);
                 return;
@@ -8205,8 +8210,8 @@ static void ProcessCommand()
         if(len >= sizeof(SdListFilesPayload)){
             SdListFilesPayload pl;
             memcpy(&pl, p, sizeof(pl));
-            pl.folder[31] = 0;
-            char path[96];
+            pl.folder[95] = 0;
+            char path[160];  /* "/data/" + up to a 95-char nested xtra path */
             if(!JoinPath(path, sizeof(path), SD_DATA_ROOT, pl.folder)){
                 BuildResponse(CMD_SD_LIST_FILES, hdr->sequence, (uint8_t*)&resp, 1);
                 return;
@@ -8238,7 +8243,7 @@ static void ProcessCommand()
         if(len >= sizeof(SdFileInfoPayload)){
             SdFileInfoPayload pl;
             memcpy(&pl, p, sizeof(pl));
-            pl.folder[31] = 0; pl.filename[31] = 0;
+            pl.folder[95] = 0; pl.filename[31] = 0;
             char path[160];
             snprintf(path, sizeof(path), "%s/%s/%s",
                      SD_DATA_ROOT, pl.folder, pl.filename);
@@ -8269,7 +8274,7 @@ static void ProcessCommand()
         if(len >= sizeof(SdLoadSamplePayload)){
             SdLoadSamplePayload pl;
             memcpy(&pl, p, sizeof(pl));
-            pl.folder[31] = 0; pl.filename[31] = 0;
+            pl.folder[95] = 0; pl.filename[31] = 0;
             char path[160];
             snprintf(path, sizeof(path), "%s/%s/%s",
                      SD_DATA_ROOT, pl.folder, pl.filename);
