@@ -5172,13 +5172,19 @@ static void pod_control_map_modal_show(void) {
     }
 
     // FADER — row 10, its own section since it's a distinct piece of
-    // hardware from the DaisyPod's own buttons/knobs.
-    lv_obj_t* faderPanel = sectionPanel(528, 238, 480, 64, "FADER", RED808_SUCCESS);
-    controlRow(faderPanel, 14, 8, 10);
+    // hardware from the DaisyPod's own buttons/knobs. The row sits at the
+    // same y=44 offset the other sections use for their first line, well
+    // clear of the "FADER" section header itself (it used to sit right on
+    // top of it at y=8, both labels rendering in the same spot).
+    lv_obj_t* faderPanel = sectionPanel(528, 238, 480, 110, "FADER", RED808_SUCCESS);
+    controlRow(faderPanel, 14, 44, 10);
 
-    lv_obj_t* ledPanel = sectionPanel(16, 306, 992, 254, "LEDS", RED808_ACCENT);
+    // Same 62px row stride as DAISYPOD/ROTARYS above — the old 96px stride
+    // and 222px panel height left LEDS looking half-empty next to sections
+    // with more rows packed into less space.
+    lv_obj_t* ledPanel = sectionPanel(16, 358, 992, 164, "LEDS", RED808_ACCENT);
     for (uint8_t led = 0; led < 2; led++) {
-        const int y = 44 + led * 96;
+        const int y = 44 + led * 62;
         lv_obj_t* label = lv_label_create(ledPanel);
         lv_label_set_text_fmt(label, "LED %u", led + 1);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
