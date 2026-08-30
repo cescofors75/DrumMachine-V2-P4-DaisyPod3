@@ -173,7 +173,11 @@ typedef struct __attribute__((packed)) {
 #define CMD_PAD_REVERSE       0x75  // Reverse sample
 #define CMD_PAD_PITCH         0x76  // Per-pad pitch shift
 #define CMD_PAD_STUTTER       0x77  // Stutter effect
+// 0x78/0x79 are CMD_PAD_SCRATCH/CMD_PAD_TURNTABLISM on DaisyPod3's own
+// (separately maintained, not #include-shared) copy of these constants —
+// this file never listed them, so don't reuse those two values here either.
 #define CMD_PAD_CLEAR_FX      0x7A  // Clear all pad FX
+#define CMD_PAD_TRIM          0x7B  // Non-destructive trim window: [pad(1), startPct(1), endPct(1)] 0-100
 
 // ═══════════════════════════════════════════════════════
 // COMMANDS: PER-PAD LFO (0x80 - 0x8F)

@@ -391,6 +391,7 @@ static inline void DspProfBlockDone() {}
 #define CMD_PAD_SCRATCH       0x78
 #define CMD_PAD_TURNTABLISM   0x79
 #define CMD_PAD_CLEAR_FX      0x7A
+#define CMD_PAD_TRIM          0x7B  // [pad(1), startPct(1), endPct(1)] 0-100, non-destructive
 
 /* Sidechain */
 #define CMD_SIDECHAIN_SET     0x90
@@ -716,6 +717,16 @@ static uint32_t sampleTotalSamples[MAX_PADS];
 static uint32_t sampleRateHz[MAX_PADS];
 static uint32_t sampleOffsetSamples[MAX_PADS];
 static uint32_t sampleCapacitySamples[MAX_PADS];
+/* Non-destructive per-pad trim window, as a fraction of sampleLength[pad]
+ * (0.0..1.0). Applied at trigger time in TriggerPad() — never touches the
+ * uploaded PCM in sampleStorage[]. Both zero-init to 0.0f, which TriggerPad
+ * treats as "no trim set" (start>=end) and falls back to the full sample —
+ * so a freshly booted pad plays whole without any explicit reset needed.
+ * CMD_PAD_TRIM is the only writer; CMD_SAMPLE_END/CMD_SAMPLE_UNLOAD reset
+ * a pad back to that same "unset" state on a new/no WAV, so a trim sized
+ * for one file can never misapply to a differently-sized one. */
+static float padTrimStartPct[MAX_PADS];
+static float padTrimEndPct[MAX_PADS];
 /* volatile: the ISR (AudioCallback/TriggerPad) gates every read of
  * sampleStorage/sampleLength/sampleOffsetSamples on this flag. Main-loop
  * loaders (CMD_SAMPLE_END, LoadWavToPad, the QSPI boot loader) __DMB()
@@ -886,7 +897,9 @@ struct Voice {
     float    envDecayCoef;
     uint8_t  envStage; /* 0=attack,1=decay,2=bypass */
     uint32_t age;
-    uint32_t maxLen;  /* 0 = full sample, else corta al llegar aquí */
+    uint32_t maxLen;    /* absolute end position (sample index), not a duration */
+    uint32_t trimStart; /* absolute start position — non-zero only when the
+                         * pad has a trim window set; see padTrimStartPct */
     bool     liveSource; /* true when triggered by CMD_TRIGGER_LIVE */
     /* Last routed sample and click-free residual used by voice stealing. */
     float    lastOutL;
@@ -4130,11 +4143,20 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
     float stealTailL = voices[slot].active ? voices[slot].lastOutL : 0.0f;
     float stealTailR = voices[slot].active ? voices[slot].lastOutR : 0.0f;
 
-    uint32_t len = sampleLength[pad];
-    if(maxSamples > 0 && maxSamples < len) len = maxSamples;
+    /* Non-destructive trim window (see padTrimStartPct comment). start>=end
+     * means "no trim set" (covers both the zero-init and any malformed
+     * CMD_PAD_TRIM) and falls back to the full sample. */
+    uint32_t trimStart = (uint32_t)(padTrimStartPct[pad] * (float)sampleLength[pad]);
+    uint32_t trimEnd   = (uint32_t)(padTrimEndPct[pad]   * (float)sampleLength[pad]);
+    if(trimEnd > sampleLength[pad]) trimEnd = sampleLength[pad];
+    if(trimStart >= trimEnd){ trimStart = 0; trimEnd = sampleLength[pad]; }
+
+    uint32_t len = trimEnd;
+    if(maxSamples > 0 && trimStart + maxSamples < len) len = trimStart + maxSamples;
 
     /* Guardar límite efectivo en la voz */
     voices[slot].maxLen = len;
+    voices[slot].trimStart = trimStart;
 
     float gain = (velocity / 127.0f)
                * VolumeByteToGain(trkVol)
@@ -4147,7 +4169,7 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
 
     voices[slot].active       = true;
     voices[slot].pad          = pad;
-    voices[slot].pos          = padReverse[pad] ? (float)(sampleLength[pad] - 1) : 0.0f;
+    voices[slot].pos          = padReverse[pad] ? (float)(trimEnd - 1) : (float)trimStart;
     voices[slot].speed        = PadPlaybackSpeed(pad, sourcePitch);
     voices[slot].baseGain     = gain;  // gain pre-pan — para LFO vol/pan live update
     voices[slot].gainL        = gL;
@@ -5564,13 +5586,13 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             uint32_t endLen = (vx.maxLen > 0 && vx.maxLen < sampleLength[p])
                              ? vx.maxLen : sampleLength[p];
             if(padReverse[p]){
-                if(vx.pos < 0.0f){
+                if(vx.pos < (float)vx.trimStart){
                     if(padLoop[p]) vx.pos = (float)(endLen - 1);
                     else { vx.active = false; continue; }
                 }
             } else {
                 if(idx >= endLen){
-                    if(padLoop[p]){ vx.pos = 0.0f; idx = 0; }
+                    if(padLoop[p]){ vx.pos = (float)vx.trimStart; idx = vx.trimStart; }
                     else { vx.active = false; continue; }
                 }
             }
@@ -7479,6 +7501,18 @@ static void ProcessCommand()
             padStutterOn[pad] = false;
         }
         break;
+    case CMD_PAD_TRIM:
+        /* Non-destructive: only changes where TriggerPad starts/stops
+         * reading sampleStorage[pad] for future voices. Already-playing
+         * voices keep whatever window they were triggered with. */
+        if(len >= 3 && p[0] < MAX_PADS){
+            uint8_t pad = p[0];
+            uint8_t startPct = p[1] > 100 ? 100 : p[1];
+            uint8_t endPct   = p[2] > 100 ? 100 : p[2];
+            padTrimStartPct[pad] = (float)startPct / 100.0f;
+            padTrimEndPct[pad]   = (float)endPct   / 100.0f;
+        }
+        break;
 
     /* ════════════════════════════════════════════
      *  SIDECHAIN (0x90-0x91)
@@ -7621,6 +7655,11 @@ static void ProcessCommand()
                     if(sampleTotalSamples[pad] > MAX_SAMPLE_BYTES / 2)
                         sampleTotalSamples[pad] = MAX_SAMPLE_BYTES / 2;
                     sampleLength[pad] = sampleTotalSamples[pad];
+                    /* A trim window sized for the PREVIOUS file at this pad
+                     * makes no sense against a new one of different length —
+                     * reset to "no trim" (see padTrimStartPct comment). */
+                    padTrimStartPct[pad] = 0.0f;
+                    padTrimEndPct[pad] = 0.0f;
                     /* Every CMD_SAMPLE_DATA memcpy into sampleData[] and the
                      * sampleLength write above must be visible to the audio
                      * ISR before it sees sampleLoaded[pad]==true and starts
@@ -7695,6 +7734,8 @@ static void ProcessCommand()
             sampleRateHz[pad] = SAMPLE_RATE;
             sampleUploadValid[pad] = false;
             sampleUploadReceivedBytes[pad] = 0;
+            padTrimStartPct[pad] = 0.0f;
+            padTrimEndPct[pad] = 0.0f;
             FreeSampleStorage(pad);
         }
         break;
@@ -10469,6 +10510,11 @@ static bool LoadWavToPad(const char* filepath, uint8_t padIdx)
     sampleLength[padIdx] = 0;
     sampleTotalSamples[padIdx] = 0;
     sampleRateHz[padIdx] = SAMPLE_RATE;
+    /* A trim window sized for whatever was on this pad before makes no
+     * sense against a new file of different length — reset to "no trim"
+     * (see padTrimStartPct comment) regardless of how this load turns out. */
+    padTrimStartPct[padIdx] = 0.0f;
+    padTrimEndPct[padIdx] = 0.0f;
     FreeSampleStorage(padIdx);
     padLoading[padIdx] = true;
 

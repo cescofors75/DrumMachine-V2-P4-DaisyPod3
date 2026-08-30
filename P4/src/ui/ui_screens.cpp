@@ -10450,21 +10450,15 @@ static void xtra_editor_apply_cb(lv_event_t* e) {
     int end = s_xtra_editor_end ? lv_slider_get_value(s_xtra_editor_end) : 100;
     int gate = s_xtra_editor_gate ? lv_slider_get_value(s_xtra_editor_gate) : 180;
     slot.gate_ms = (uint16_t)constrain(gate, 40, 2000);
-    if (!slot.synth_mode && (start > 0 || end < 100)) {
+    slot.trim_start_pct = (uint8_t)constrain(start, 0, 95);
+    slot.trim_end_pct = (uint8_t)constrain(end, 5, 100);
+    // Non-destructive on Daisy (CMD_PAD_TRIM applies start/end at trigger
+    // time — never rewrites the uploaded PCM), so the sliders keep showing
+    // exactly what's active instead of resetting to 0/100 as if consumed.
+    if (!slot.synth_mode) {
         control_send_trim_sample(slot.pad, start / 100.0f, end / 100.0f);
-        if (slot.duration_ms > 0) {
-            slot.duration_ms = (uint32_t)((uint64_t)slot.duration_ms * (uint32_t)(end - start) / 100U);
-        }
-        // trimSample cuts the currently loaded buffer. Reset the handles so
-        // pressing APPLY twice cannot destructively trim the same region again.
-        slot.trim_start_pct = 0;
-        slot.trim_end_pct = 100;
-        lv_slider_set_value(s_xtra_editor_start, 0, LV_ANIM_OFF);
-        lv_slider_set_value(s_xtra_editor_end, 100, LV_ANIM_OFF);
         ui_show_toast("Trim aplicado al sample", theme_success());
     } else {
-        slot.trim_start_pct = (uint8_t)constrain(start, 0, 95);
-        slot.trim_end_pct = (uint8_t)constrain(end, 5, 100);
         ui_show_toast("Ajustes XTRA guardados", theme_success());
     }
     xtra_save_state();
@@ -11125,6 +11119,16 @@ static lv_obj_t* sd_file_list   = NULL;
 static lv_obj_t* sd_selected_lbl = NULL;
 static lv_obj_t* sd_assign_lbl = NULL;
 static lv_obj_t* sd_pad_btns[16] = {};
+// Non-destructive per-pad trim window + captured waveform for the 16 main
+// pads (see the PAD SAMPLE TRIM EDITOR section below, near
+// create_sdcard_screen, for the editor UI that reads/writes these).
+static uint8_t s_pad_trim_start_pct[16] = {};
+static uint8_t s_pad_trim_end_pct[16] = {
+    100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100
+};
+static uint8_t s_pad_wave_count[16] = {};
+static int8_t  s_pad_wave_max[16][96] = {};
+static int8_t  s_pad_wave_min[16][96] = {};
 static lv_obj_t* sd_load_btn    = NULL;
 static lv_obj_t* sd_load_lbl    = NULL;
 static lv_obj_t* sd_preview_btn = NULL;
@@ -12657,6 +12661,14 @@ static void sd_upload_consume_result(void) {
         pad_inst_refresh_pad_badge(pad);
         seq_refresh_track_label(pad);
         pad_inst_refresh_controls();
+        // A trim window sized for the previous file makes no sense against
+        // a new one of a different length — reset, mirroring what Daisy
+        // itself does for this pad in CMD_SAMPLE_END/LoadWavToPad.
+        s_pad_trim_start_pct[pad] = 0;
+        s_pad_trim_end_pct[pad] = 100;
+        s_pad_wave_count[pad] = job.peak_count;
+        memcpy(s_pad_wave_max[pad], job.peak_max, sizeof(job.peak_max));
+        memcpy(s_pad_wave_min[pad], job.peak_min, sizeof(job.peak_min));
     }
 
     if (job.trigger_after && control_available()) {
@@ -13044,6 +13056,187 @@ static void sd_refresh_ui(void) {
     }
 }
 
+// =============================================================================
+// PAD SAMPLE TRIM EDITOR — non-destructive start/end window for the 16 main
+// sequencer pads. Sends CMD_PAD_TRIM (DaisyPod3 applies it in TriggerPad()
+// at trigger time, never touching the uploaded PCM). Mirrors XTRAPADS'
+// editor UI (waveform + start/end sliders + preview) minus gate/play-mode,
+// which are live-performance concepts (hold-to-repeat) that don't map onto
+// a pattern-triggered pad — note length there is already the per-step
+// noteLenDiv the sequencer editor sets. Reachable from the SD CARD screen's
+// pad panel, where "this pad's sample" is already the selected context.
+// Data arrays (s_pad_trim_start_pct etc.) are declared earlier, near
+// sd_pad_btns[], since sd_upload_consume_result() writes them too.
+static lv_obj_t*  s_pad_trim_modal = NULL;
+static lv_obj_t*  s_pad_trim_wave  = NULL;
+static lv_point_t s_pad_trim_wave_points[192];
+static lv_obj_t*  s_pad_trim_start_slider = NULL;
+static lv_obj_t*  s_pad_trim_end_slider   = NULL;
+static lv_obj_t*  s_pad_trim_start_lbl    = NULL;
+static lv_obj_t*  s_pad_trim_end_lbl      = NULL;
+static int        s_pad_trim_editor_pad   = -1;
+
+static void pad_trim_editor_refresh_values(void) {
+    if (s_pad_trim_editor_pad < 0) return;
+    int start = s_pad_trim_start_slider ? lv_slider_get_value(s_pad_trim_start_slider)
+                                        : s_pad_trim_start_pct[s_pad_trim_editor_pad];
+    int end = s_pad_trim_end_slider ? lv_slider_get_value(s_pad_trim_end_slider)
+                                    : s_pad_trim_end_pct[s_pad_trim_editor_pad];
+    if (s_pad_trim_start_lbl) lv_label_set_text_fmt(s_pad_trim_start_lbl, "START  %d%%", start);
+    if (s_pad_trim_end_lbl) lv_label_set_text_fmt(s_pad_trim_end_lbl, "END  %d%%", end);
+}
+
+static void pad_trim_slider_cb(lv_event_t* e) {
+    if (!s_pad_trim_start_slider || !s_pad_trim_end_slider) return;
+    int start = lv_slider_get_value(s_pad_trim_start_slider);
+    int end = lv_slider_get_value(s_pad_trim_end_slider);
+    if (start >= end - 2) {
+        lv_obj_t* target = (lv_obj_t*)lv_event_get_target(e);
+        if (target == s_pad_trim_start_slider) lv_slider_set_value(s_pad_trim_start_slider, end - 2, LV_ANIM_OFF);
+        else lv_slider_set_value(s_pad_trim_end_slider, start + 2, LV_ANIM_OFF);
+    }
+    pad_trim_editor_refresh_values();
+}
+
+static void pad_trim_editor_close_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_pad_trim_modal) lv_obj_del(s_pad_trim_modal);
+    s_pad_trim_modal = NULL;
+    s_pad_trim_wave = NULL;
+    s_pad_trim_start_slider = NULL;
+    s_pad_trim_end_slider = NULL;
+    s_pad_trim_start_lbl = NULL;
+    s_pad_trim_end_lbl = NULL;
+    s_pad_trim_editor_pad = -1;
+}
+
+static void pad_trim_preview_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_pad_trim_editor_pad < 0 || !control_available()) return;
+    control_send_trigger((uint8_t)s_pad_trim_editor_pad, 112);
+}
+
+static void pad_trim_apply_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_pad_trim_editor_pad < 0) return;
+    int pad = s_pad_trim_editor_pad;
+    int start = s_pad_trim_start_slider ? lv_slider_get_value(s_pad_trim_start_slider) : 0;
+    int end = s_pad_trim_end_slider ? lv_slider_get_value(s_pad_trim_end_slider) : 100;
+    s_pad_trim_start_pct[pad] = (uint8_t)constrain(start, 0, 95);
+    s_pad_trim_end_pct[pad] = (uint8_t)constrain(end, 5, 100);
+    control_send_trim_sample((uint8_t)pad, s_pad_trim_start_pct[pad] / 100.0f,
+                             s_pad_trim_end_pct[pad] / 100.0f);
+    ui_show_toast("Trim aplicado al pad", theme_success());
+}
+
+static void pad_trim_editor_open(int pad) {
+    if (pad < 0 || pad >= 16) return;
+    pad_trim_editor_close_cb(NULL);
+    s_pad_trim_editor_pad = pad;
+
+    s_pad_trim_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_pad_trim_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(s_pad_trim_modal, 0, 0);
+    lv_obj_set_style_bg_color(s_pad_trim_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_pad_trim_modal, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_pad_trim_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_pad_trim_modal, 0, 0);
+    lv_obj_clear_flag(s_pad_trim_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_color_t accent = lv_color_hex(theme_presets[ui_theme_index()].track_colors[pad]);
+
+    lv_obj_t* card = lv_obj_create(s_pad_trim_modal);
+    lv_obj_set_size(card, 900, 420);
+    lv_obj_center(card);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_bg_grad_color(card, RED808_BG, 0);
+    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_color(card, accent, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text_fmt(title, "%s  ·  P%02d  ·  TRIM", trackNames[pad], pad + 1);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, accent, 0);
+    lv_obj_set_pos(title, 24, 18);
+
+    lv_obj_t* wave_card = lv_obj_create(card);
+    lv_obj_set_pos(wave_card, 24, 62);
+    lv_obj_set_size(wave_card, 852, 150);
+    lv_obj_set_style_radius(wave_card, 12, 0);
+    lv_obj_set_style_bg_color(wave_card, RED808_SURFACE, 0);
+    lv_obj_set_style_border_color(wave_card, theme_border(), 0);
+    lv_obj_set_style_border_width(wave_card, 1, 0);
+    lv_obj_set_style_pad_all(wave_card, 0, 0);
+    lv_obj_clear_flag(wave_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    bool real_wave = s_pad_wave_count[pad] == 96;
+    uint32_t seed = 2166136261u;
+    for (const char* c = trackNames[pad]; *c; ++c) seed = (seed ^ (uint8_t)*c) * 16777619u;
+    for (int i = 0; i < 96; i++) {
+        int vmax, vmin;
+        if (real_wave) {
+            vmax = s_pad_wave_max[pad][i];
+            vmin = s_pad_wave_min[pad][i];
+        } else {
+            seed = seed * 1664525u + 1013904223u;
+            int envelope = 20 + (int)((seed >> 25) & 31U);
+            vmax = envelope;
+            vmin = -envelope;
+        }
+        int x = 8 + i * 8;
+        s_pad_trim_wave_points[i * 2].x = x;
+        s_pad_trim_wave_points[i * 2].y = 75 - vmax * 64 / 127;
+        s_pad_trim_wave_points[i * 2 + 1].x = x;
+        s_pad_trim_wave_points[i * 2 + 1].y = 75 - vmin * 64 / 127;
+    }
+    s_pad_trim_wave = lv_line_create(wave_card);
+    lv_line_set_points(s_pad_trim_wave, s_pad_trim_wave_points, 192);
+    lv_obj_set_style_line_color(s_pad_trim_wave, accent, 0);
+    lv_obj_set_style_line_width(s_pad_trim_wave, 2, 0);
+
+    auto make_slider = [&](int y, int minv, int maxv, int value, lv_obj_t** out,
+                           lv_obj_t** out_lbl) {
+        *out_lbl = lv_label_create(card);
+        lv_obj_set_style_text_font(*out_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(*out_lbl, theme_text(), 0);
+        lv_obj_set_pos(*out_lbl, 28, y - 5);
+        *out = lv_slider_create(card);
+        lv_obj_set_pos(*out, 170, y);
+        lv_obj_set_size(*out, 520, 18);
+        lv_slider_set_range(*out, minv, maxv);
+        lv_slider_set_value(*out, value, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(*out, RED808_SURFACE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(*out, accent, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(*out, lv_color_white(), LV_PART_KNOB);
+        lv_obj_add_event_cb(*out, pad_trim_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    };
+    make_slider(244, 0, 95, s_pad_trim_start_pct[pad], &s_pad_trim_start_slider, &s_pad_trim_start_lbl);
+    make_slider(298, 5, 100, s_pad_trim_end_pct[pad], &s_pad_trim_end_slider, &s_pad_trim_end_lbl);
+
+    lv_obj_t* preview = piano_make_chip(card, 712, 232, 164, 54, "PREVIEW");
+    lv_obj_set_style_border_color(preview, theme_success(), 0);
+    lv_obj_add_event_cb(preview, pad_trim_preview_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* apply = piano_make_chip(card, 24, 344, 200, 52, "APLICAR TRIM");
+    lv_obj_set_style_border_color(apply, accent, 0);
+    lv_obj_add_event_cb(apply, pad_trim_apply_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* reset = piano_make_chip(card, 240, 344, 160, 52, "RESET");
+    lv_obj_add_event_cb(reset, [](lv_event_t*) {
+        if (s_pad_trim_editor_pad < 0) return;
+        if (s_pad_trim_start_slider) lv_slider_set_value(s_pad_trim_start_slider, 0, LV_ANIM_OFF);
+        if (s_pad_trim_end_slider) lv_slider_set_value(s_pad_trim_end_slider, 100, LV_ANIM_OFF);
+        pad_trim_editor_refresh_values();
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* close = piano_make_chip(card, 708, 344, 168, 52, "CERRAR");
+    lv_obj_add_event_cb(close, pad_trim_editor_close_cb, LV_EVENT_CLICKED, NULL);
+
+    pad_trim_editor_refresh_values();
+}
+
 static void create_sdcard_screen(void) {
     scr_sdcard = lv_obj_create(NULL);
     apply_screen_theme_bg(scr_sdcard);
@@ -13243,6 +13436,20 @@ static void create_sdcard_screen(void) {
     lv_obj_set_style_text_color(sd_load_lbl, lv_color_white(), 0);
     lv_obj_center(sd_load_lbl);
     lv_obj_add_event_cb(sd_load_btn, sd_load_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Trim editor for whichever pad is selected above — works whether it
+    // just got a new WAV or already had one from a previous session.
+    lv_obj_t* sd_edit_sample_btn = lv_btn_create(sd_wav_section);
+    lv_obj_set_size(sd_edit_sample_btn, RIGHT_W - 24, 48);
+    lv_obj_set_pos(sd_edit_sample_btn, 8, 432);
+    apply_control_button_style(sd_edit_sample_btn, RED808_INFO, false, 10);
+    lv_obj_t* sd_edit_sample_lbl = lv_label_create(sd_edit_sample_btn);
+    lv_label_set_text(sd_edit_sample_lbl, LV_SYMBOL_EDIT "  EDITAR SAMPLE (TRIM)");
+    lv_obj_set_style_text_font(sd_edit_sample_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(sd_edit_sample_lbl);
+    lv_obj_add_event_cb(sd_edit_sample_btn, [](lv_event_t*) {
+        pad_trim_editor_open(constrain(p4sd.selected_pad, 0, 15));
+    }, LV_EVENT_CLICKED, NULL);
 
     // ── MIDI section (hidden by default) ──────────────────────────────────
     sd_midi_section = lv_obj_create(sd_right_panel);

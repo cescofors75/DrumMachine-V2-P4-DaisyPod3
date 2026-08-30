@@ -2524,9 +2524,17 @@ void control_send_synth_preset(uint8_t engine, uint8_t preset)
     daisyUsb.synthPreset(engine, preset);
 }
 
-void control_send_trim_sample(uint8_t, float, float)
+// Non-destructive: DaisyPod3 stores this as a start/end fraction applied at
+// trigger time (see padTrimStartPct in main.cpp) — it never rewrites the
+// uploaded PCM, so pressing this repeatedly, in either order with a new
+// upload, is always safe.
+void control_send_trim_sample(uint8_t pad, float start, float end)
 {
-    // The current RED808 DSP contract has no destructive trim command.
+    if(pad >= 24) return; // MAX_PADS on DaisyPod3 (16 main pads + 4 XTRAPADS + spare)
+    const uint8_t startPct = (uint8_t)Clamp((int)(start * 100.0f + 0.5f), 0, 100);
+    const uint8_t endPct = (uint8_t)Clamp((int)(end * 100.0f + 0.5f), 0, 100);
+    const uint8_t payload[3] = {pad, startPct, endPct};
+    SendWithRetry(CMD_PAD_TRIM, payload, sizeof(payload));
 }
 
 void control_send_melody_rec_note(uint8_t engine, uint8_t note)
