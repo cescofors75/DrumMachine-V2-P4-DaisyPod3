@@ -19984,18 +19984,34 @@ void ui_update_current_screen(void) {
         // the boot screen is up so it actually progresses (xtra_pages_poll()
         // otherwise only runs while PERFORMANCE is the active screen).
         static bool bootXtraScanKicked = false;
+        static uint8_t bootXtraRetries = 0;
+        static uint32_t bootXtraNextTryMs = 0;
         // Wait until the factory-kit autoload sequence (sd_factory_autoload_tick,
         // above) is done with the SD/upload channel — both it and this scan
         // ride the same USB command/response slot (daisy_sd_revision), and
         // starting ours mid-scan or mid-upload would read back whichever
         // response happened to land last, corrupting either result.
         if (protocolReady && !bootXtraScanKicked && elapsed >= 1500u
+            && now >= bootXtraNextTryMs
             && !sd_upload_in_flight() && !sd_midi_load_in_flight()
             && s_sd_scan_state.load(std::memory_order_acquire) == 0) {
             bootXtraScanKicked = true;
             xtra_pages_request_folders();
         }
         if (bootXtraScanKicked) xtra_pages_poll();
+        // Daisy's SD reader is a Dupont-wired SPI card (see InitSD's own
+        // 3-attempt mount retry) — an occasional first read landing right
+        // after boot can come back empty even though the card is fine and
+        // genuinely has folders under /data/xtra. Rather than trust a single
+        // zero-folder result this early, retry a couple of times before the
+        // boot line settles on WARN.
+        if (bootXtraScanKicked && s_xtra_page_req == XTRA_PAGE_REQ_NONE
+            && s_xtra_scan_count == 0 && bootXtraRetries < 2
+            && now >= bootXtraNextTryMs) {
+            bootXtraRetries++;
+            bootXtraNextTryMs = now + 900u;
+            bootXtraScanKicked = false;
+        }
 
         // Cada línea aparece a su tiempo, como un POST de BIOS.
         static const uint32_t revealMs[BOOT_TERM_LINES] =
