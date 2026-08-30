@@ -6514,11 +6514,21 @@ enum FxCardKind : uint8_t {
     FX_CARD_BITS,
     FX_CARD_SRATE,
     FX_CARD_FILTER,
+    // Already fully implemented in DaisyPod3's DSP and wired into the
+    // protocol (tremolo/chorus/compressor/autowah), just never had a card
+    // here before — see control_send_set_*_macro in control_api.cpp.
+    FX_CARD_TREMOLO,
+    FX_CARD_CHORUS,
+    FX_CARD_COMP,
+    FX_CARD_AUTOWAH,
 };
 
-static constexpr int FX_CARD_COUNT = 12;
+static constexpr int FX_CARD_COUNT = 16;
 static constexpr int FX_VIEW_MODE_COUNT = 3;
-static constexpr int FX_PAGE_DOT_COUNT = 4;
+// 16 cards at 3-per-page is 6 pages (was 4, for the old 12-card total) —
+// bumped so the page-dot row still has one dot per page in the densest-page
+// (fewest-per-page) view mode.
+static constexpr int FX_PAGE_DOT_COUNT = 6;
 static const int fx_view_modes[FX_VIEW_MODE_COUNT] = {3, 6, 12};
 
 static int fx_page = 0;
@@ -6569,18 +6579,25 @@ static uint32_t s_fx_toggle_last_ms[FX_CARD_COUNT] = {};
 static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX buttons
 static float    s_fx_arc_anim[FX_CARD_COUNT] = {};    // file-scope for snap access
 static uint32_t s_fx_arc_user_ms[FX_CARD_COUNT] = {}; // last user-touch timestamp
-static uint8_t  s_fx_last_active_u7[FX_CARD_COUNT] = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64};
+static uint8_t  s_fx_last_active_u7[FX_CARD_COUNT] = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 64, 64, 64, 64};
 // True current value of every card, updated on every send (unlike
 // s_fx_last_active_u7 above, which only tracks the last non-neutral value).
 // Used as the ramp start point for the smooth-transition RANDOM mode.
-static uint8_t  s_fx_current_u7[FX_CARD_COUNT]     = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64};
+// The 4 new cards (TREMOLO/CHORUS/COMP/AUTOWAH) start at 0, not 64 like the
+// rest — 0 is their true "off" value (matching Daisy's actual boot-time
+// tremoloActive/chorusActive/compActive/autowahActive == false), and this
+// array directly drives each card's mute/arc display, unlike
+// s_fx_last_active_u7 above which only seeds the value a later re-enable
+// restores.
+static uint8_t  s_fx_current_u7[FX_CARD_COUNT]     = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 0, 0, 0, 0};
 static bool     s_fx_random_smooth = false;   // false = brusca (snap), true = suave (ramp)
 static bool     fx_random_smooth_get(void) { return s_fx_random_smooth; }
 static void     fx_random_smooth_set(bool v) { s_fx_random_smooth = v; }
 
 static const char* fx_names[FX_CARD_COUNT] = {
     "FLANGE", "DELAY", "REVERB", "FOLD", "CRUSH", "PHASER",
-    "CUTOFF", "RESO", "DRIVE", "BITS", "SRATE", "FILTER"
+    "CUTOFF", "RESO", "DRIVE", "BITS", "SRATE", "FILTER",
+    "TREMOLO", "CHORUS", "COMP", "A.WAH"
 };
 
 static const char* fx_filter_model_name(int type) {
@@ -6594,21 +6611,27 @@ static const char* fx_filter_model_name(int type) {
 
 static const uint32_t fx_colors[FX_CARD_COUNT] = {
     0xC9271B, 0xE86820, 0xF5BC31, 0xF2552F, 0xFF8C2A, 0xF7EAD7,
-    0x27B0D0, 0x31D2A1, 0xF2466B, 0xD18A2B, 0x4CA8FF, 0xA17BFF
+    0x27B0D0, 0x31D2A1, 0xF2466B, 0xD18A2B, 0x4CA8FF, 0xA17BFF,
+    0x5FD9A0, 0xB07CF0, 0xFF5C8A, 0x8FE0FF
 };
 
 static const char* fx_src[FX_CARD_COUNT] = {
     "DEPTH", "DRY / WET", "DRY / WET", "INPUT GAIN", "DUAL MACRO", "DEPTH",
-    "FREQUENCY", "Q / RESONANCE", "DRIVE", "RESOLUTION", "HOLD RATE", "MODEL"
+    "FREQUENCY", "Q / RESONANCE", "DRIVE", "RESOLUTION", "HOLD RATE", "MODEL",
+    "DEPTH", "DRY / WET", "SQUASH", "SENSITIVITY"
 };
 
 static uint8_t fx_card_owner_function(int cell) {
+    // The 4 new effects (TREMOLO/CHORUS/COMP/AUTOWAH) have no physical Daisy
+    // Pod knob assigned — POD_FUNC_NONE means no ownership arbitration ever
+    // blocks P4 from driving them, unlike the first 12 cards.
     static const uint8_t functions[FX_CARD_COUNT] = {
         POD_FUNC_FLANGER_DEPTH, POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX,
         POD_FUNC_WAVEFOLDER_GAIN, POD_FUNC_CRUSH_MACRO,
         POD_FUNC_PHASER_DEPTH, POD_FUNC_FILTER_CUTOFF,
         POD_FUNC_FILTER_RESONANCE, POD_FUNC_DISTORTION,
-        POD_FUNC_BIT_DEPTH, POD_FUNC_SAMPLE_RATE, POD_FUNC_FILTER_TYPE
+        POD_FUNC_BIT_DEPTH, POD_FUNC_SAMPLE_RATE, POD_FUNC_FILTER_TYPE,
+        POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE
     };
     return (cell >= 0 && cell < FX_CARD_COUNT) ? functions[cell] : POD_FUNC_NONE;
 }
@@ -6660,6 +6683,14 @@ static int fx_card_current_value_u7(int cell) {
             float norm = (float)constrain(p4.filter_type, 0, 14) / 14.0f;
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
+        // No dedicated p4.* field for these — they have no physical knob or
+        // MIDI mapping to receive state from, so the value P4 itself last
+        // sent (already tracked generically for every cell) is authoritative.
+        case FX_CARD_TREMOLO:
+        case FX_CARD_CHORUS:
+        case FX_CARD_COMP:
+        case FX_CARD_AUTOWAH:
+            return s_fx_current_u7[cell];
     }
     return 0;
 }
@@ -6678,6 +6709,11 @@ static bool fx_card_is_muted(int cell) {
         case FX_CARD_BITS:   return p4.bitcrush_bits >= 16;
         case FX_CARD_SRATE:  return p4.sample_rate_hz <= 0;
         case FX_CARD_FILTER: return p4.filter_type == 0;
+        case FX_CARD_TREMOLO:
+        case FX_CARD_CHORUS:
+        case FX_CARD_COMP:
+        case FX_CARD_AUTOWAH:
+            return s_fx_current_u7[cell] == 0;
     }
     return false;
 }
@@ -6793,6 +6829,18 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
             if (transmit && control_available()) control_send_set_filter(type);
             break;
         }
+        case FX_CARD_TREMOLO:
+            if (transmit && control_available()) control_send_set_tremolo_macro((uint8_t)u7);
+            break;
+        case FX_CARD_CHORUS:
+            if (transmit && control_available()) control_send_set_chorus_macro((uint8_t)u7);
+            break;
+        case FX_CARD_COMP:
+            if (transmit && control_available()) control_send_set_comp_macro((uint8_t)u7);
+            break;
+        case FX_CARD_AUTOWAH:
+            if (transmit && control_available()) control_send_set_autowah_macro((uint8_t)u7);
+            break;
     }
     control_mark_fx_screen_dirty();
 }

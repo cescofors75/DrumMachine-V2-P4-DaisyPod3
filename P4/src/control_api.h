@@ -198,6 +198,15 @@ void control_send_set_distortion(float value);
 void control_send_set_bitcrush(int bits);
 void control_send_set_sample_rate(int rate_hz);
 void control_send_set_crush_macro(uint8_t value);
+// Single-knob macros for master TREMOLO / CHORUS / COMPRESSOR / AUTOWAH —
+// each already fully implemented in DaisyPod3's DSP and wired into the
+// protocol, but until now had no FX LAB card driving them. value 0 = off;
+// away from 0 engages the effect and scales its defining parameter(s)
+// together, same pattern as control_send_set_crush_macro above.
+void control_send_set_tremolo_macro(uint8_t value);
+void control_send_set_chorus_macro(uint8_t value);
+void control_send_set_comp_macro(uint8_t value);
+void control_send_set_autowah_macro(uint8_t value);
 void control_send_fx_enc(int encoder, uint8_t value, bool muted);
 void control_send_fx_pot(int pot, uint8_t value, bool muted);
 void control_send_all_fx_off();

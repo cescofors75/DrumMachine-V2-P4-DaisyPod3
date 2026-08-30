@@ -2333,6 +2333,66 @@ void control_send_set_crush_macro(uint8_t value)
     control_send_set_sample_rate(rate);
 }
 
+void control_send_set_tremolo_macro(uint8_t value)
+{
+    value = static_cast<uint8_t>(Clamp(static_cast<int>(value), 0, 127));
+    daisyUsb.sendU8(CMD_TREMOLO_ACTIVE, value > 0 ? 1u : 0u);
+    if (value > 0) {
+        const uint8_t depthPct = static_cast<uint8_t>(
+            Clamp(static_cast<int>(value / 127.0f * 100.0f + 0.5f), 0, 100));
+        daisyUsb.sendU8(CMD_TREMOLO_DEPTH, depthPct);
+    }
+    fxDirty.store(true, std::memory_order_release);
+}
+
+void control_send_set_chorus_macro(uint8_t value)
+{
+    value = static_cast<uint8_t>(Clamp(static_cast<int>(value), 0, 127));
+    daisyUsb.sendU8(CMD_CHORUS_ACTIVE, value > 0 ? 1u : 0u);
+    if (value > 0) {
+        const uint8_t mixPct = static_cast<uint8_t>(
+            Clamp(static_cast<int>(value / 127.0f * 100.0f + 0.5f), 0, 100));
+        daisyUsb.sendU8(CMD_CHORUS_MIX, mixPct);
+    }
+    fxDirty.store(true, std::memory_order_release);
+}
+
+void control_send_set_comp_macro(uint8_t value)
+{
+    value = static_cast<uint8_t>(Clamp(static_cast<int>(value), 0, 127));
+    daisyUsb.sendU8(CMD_COMP_ACTIVE, value > 0 ? 1u : 0u);
+    if (value > 0) {
+        const float unit = value / 127.0f;
+        // More knob = more squashed: threshold drops, ratio rises, makeup
+        // compensates for the level lost to compression.
+        const uint8_t thresholdMag = static_cast<uint8_t>(
+            Clamp(static_cast<int>(4.0f + unit * 26.0f + 0.5f), 4, 30));   // -4..-30 dB
+        const uint8_t ratio = static_cast<uint8_t>(
+            Clamp(static_cast<int>(2.0f + unit * 6.0f + 0.5f), 2, 8));    // 2:1..8:1
+        const uint8_t makeupTenths = static_cast<uint8_t>(
+            Clamp(static_cast<int>(unit * 80.0f + 0.5f), 0, 80));         // 0..8.0 dB
+        daisyUsb.sendU8(CMD_COMP_THRESHOLD, thresholdMag);
+        daisyUsb.sendU8(CMD_COMP_RATIO, ratio);
+        daisyUsb.sendU8(CMD_COMP_MAKEUP, makeupTenths);
+    }
+    fxDirty.store(true, std::memory_order_release);
+}
+
+void control_send_set_autowah_macro(uint8_t value)
+{
+    value = static_cast<uint8_t>(Clamp(static_cast<int>(value), 0, 127));
+    daisyUsb.sendU8(CMD_AUTOWAH_ACTIVE, value > 0 ? 1u : 0u);
+    if (value > 0) {
+        // Sensitivity and wet/dry mix move together for a single "how much
+        // autowah" feel — CMD_AUTOWAH_LEVEL/MIX only accept the 4-byte float
+        // form (no compact u8 fallback like the other macros above).
+        const float unit = value / 127.0f;
+        daisyUsb.sendFloat(CMD_AUTOWAH_LEVEL, unit);
+        daisyUsb.sendFloat(CMD_AUTOWAH_MIX, unit);
+    }
+    fxDirty.store(true, std::memory_order_release);
+}
+
 void control_send_fx_enc(int encoder, uint8_t value, bool muted)
 {
     if(encoder < 0 || encoder >= 3) return;
