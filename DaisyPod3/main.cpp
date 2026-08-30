@@ -1517,6 +1517,15 @@ static bool    gFilterRouted  = true;
 static uint8_t gFilterType    = FTYPE_NONE;
 static float   gFilterCutoff  = 10000.0f;
 static float   gFilterQ       = 0.707f;
+/* CMD_FILTER_CUTOFF/RESONANCE (a knob/slider actively moving) write the
+ * target above and let UpdateGlobalFilterSmoothing() ease these toward it
+ * once per audio block — recomputing full filter coefficients on every raw
+ * MIDI-CC step used to jump instantly, which is what made a live sweep
+ * sound "brusco" (a series of tiny clicks) instead of a smooth glide.
+ * CMD_FILTER_SET (a full preset/kit recall) applies instantly and snaps
+ * these to match, same as loading a kit shouldn't visibly "glide" in. */
+static float   gFilterCutoffSm = 10000.0f;
+static float   gFilterQSm      = 0.707f;
 static uint8_t gFilterBitDepth= 16;
 static float   gFilterDist    = 0.0f;
 static uint8_t gFilterDistMode= DMODE_SOFT;
@@ -1579,6 +1588,11 @@ static BiquadEQ  padFilter[MAX_PADS];
 static uint8_t padFilterType[MAX_PADS];
 static float   padFilterCut[MAX_PADS];
 static float   padFilterQ[MAX_PADS];
+static float   padFilterGain[MAX_PADS];  /* PEAKING/SHELF only */
+/* Actual coefficients driver, eased toward the target above once per audio
+ * block by UpdatePadFilterSmoothing() — see gFilterCutoffSm for why. */
+static float   padFilterCutSm[MAX_PADS];
+static float   padFilterQSm[MAX_PADS];
 
 /* Pad distortion + bitcrush */
 static float   padDistDrive[MAX_PADS];
@@ -1610,6 +1624,14 @@ static BiquadEQ  trkFilter2[MAX_PADS]; /* 2nd stage for FTYPE_RESONANT (24dB/oct
 static uint8_t trkFilterType[MAX_PADS];
 static float   trkFilterCut[MAX_PADS];
 static float   trkFilterQ[MAX_PADS];
+static float   trkFilterGain[MAX_PADS];  /* PEAKING/SHELF only */
+/* Actual coefficients driver, eased toward the target above once per audio
+ * block by UpdateTrackFilterSmoothing() — see gFilterCutoffSm for why.
+ * Tracks under LFO->filter modulation are skipped: that path already
+ * recomputes every sample from trkFilterCut as its center, which is its
+ * own, already-continuous form of movement. */
+static float   trkFilterCutSm[MAX_PADS];
+static float   trkFilterQSm[MAX_PADS];
 
 /* Per-track distortion + bitcrush */
 static float   trkDistDrive[MAX_PADS];
@@ -2450,6 +2472,88 @@ static inline float clampF(float v, float lo, float hi){
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+/* ── Filter parameter smoothing ──────────────────────────────────────────
+ * A live cutoff/resonance tweak (knob, touch slider, MIDI CC) used to call
+ * BiquadEQ::SetType() immediately with the raw new value: every step of the
+ * sweep recomputed the filter's poles from scratch while its z1/z2 history
+ * kept running under the OLD coefficients, so each step produced its own
+ * small discontinuity — a fast sweep sounded like a series of clicks
+ * instead of a glide ("muy brusco"). These three run once per audio block
+ * (not per sample — cheap) and ease the *_Sm shadow that actually drives
+ * SetType()/SetFreq()/SetRes() toward the raw target a fraction of the way
+ * each block, so a sweep crosses several blocks smoothly instead of
+ * snapping block-to-block. A full reconfigure (CMD_*_FILTER on a type
+ * change, CMD_FILTER_SET, per-step parameter locks, the boot demo sweep)
+ * still snaps the _Sm shadow to match immediately right where it applies —
+ * only a same-type cutoff/Q tweak actually glides. */
+static inline void SmoothFilterParam(float& current, float target, float rate,
+                                      float epsilonCut){
+    const float d = target - current;
+    if(fabsf(d) < epsilonCut) { current = target; return; }
+    current += d * rate;
+}
+
+static void UpdatePadFilterSmoothing()
+{
+    const float kRate = 0.25f;
+    for(uint8_t p = 0; p < MAX_PADS; p++){
+        if(!padFilterType[p]) continue;
+        if(padFilterCutSm[p] == padFilterCut[p] && padFilterQSm[p] == padFilterQ[p])
+            continue;
+        SmoothFilterParam(padFilterCutSm[p], padFilterCut[p], kRate, 0.5f);
+        SmoothFilterParam(padFilterQSm[p],   padFilterQ[p],   kRate, 0.002f);
+        padFilter[p].SetType(padFilterType[p], padFilterCutSm[p], padFilterQSm[p],
+                              (float)SAMPLE_RATE, padFilterGain[p]);
+    }
+}
+
+static void UpdateTrackFilterSmoothing()
+{
+    const float kRate = 0.25f;
+    for(uint8_t t = 0; t < MAX_PADS; t++){
+        if(!trkFilterType[t]) continue;
+        if(trkLfoActive[t] && trkLfoTarget[t] == LFO_TGT_FILTER) continue;
+        if(trkFilterCutSm[t] == trkFilterCut[t] && trkFilterQSm[t] == trkFilterQ[t])
+            continue;
+        SmoothFilterParam(trkFilterCutSm[t], trkFilterCut[t], kRate, 0.5f);
+        SmoothFilterParam(trkFilterQSm[t],   trkFilterQ[t],   kRate, 0.002f);
+        trkFilter[t].SetType(trkFilterType[t], trkFilterCutSm[t], trkFilterQSm[t],
+                              (float)SAMPLE_RATE, trkFilterGain[t]);
+        if(trkFilterType[t] == FTYPE_RESONANT)
+            trkFilter2[t].SetType(FTYPE_RESONANT, trkFilterCutSm[t], trkFilterQSm[t],
+                                   (float)SAMPLE_RATE);
+    }
+}
+
+static void UpdateGlobalFilterSmoothing()
+{
+    if(!gFilterType) return;
+    if(gFilterCutoffSm == gFilterCutoff && gFilterQSm == gFilterQ) return;
+    const float kRate = 0.25f;
+    SmoothFilterParam(gFilterCutoffSm, gFilterCutoff, kRate, 0.5f);
+    SmoothFilterParam(gFilterQSm,      gFilterQ,      kRate, 0.002f);
+    if(gFilterType == FTYPE_LADDER){
+        masterLadderL.SetFreq(gFilterCutoffSm);
+        masterLadderR.SetFreq(gFilterCutoffSm);
+        masterLadderL.SetRes(clampF(gFilterQSm / 28.f, 0.f, 1.f));
+        masterLadderR.SetRes(clampF(gFilterQSm / 28.f, 0.f, 1.f));
+    } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
+        masterSvfL.SetFreq(gFilterCutoffSm);
+        masterSvfR.SetFreq(gFilterCutoffSm);
+        masterSvfL.SetRes(clampF(gFilterQSm / 28.f, 0.f, 1.f));
+        masterSvfR.SetRes(clampF(gFilterQSm / 28.f, 0.f, 1.f));
+    } else {
+        gFilterL.SetType(gFilterType, gFilterCutoffSm, gFilterQSm,
+                          (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
+        gFilterR.SetType(gFilterType, gFilterCutoffSm, gFilterQSm,
+                          (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
+        if(gFilterType == FTYPE_RESONANT){
+            gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoffSm, gFilterQSm, (float)SAMPLE_RATE);
+            gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoffSm, gFilterQSm, (float)SAMPLE_RATE);
+        }
+    }
+}
+
 static inline void ConfigureFlanger(Flanger& flanger, float rateHz, float depth, float feedback)
 {
     flanger.SetLfoFreq(clampF(rateHz, 0.1f, 20.0f));
@@ -2577,6 +2681,8 @@ static void ResetMasterProcessingState()
     gFilterType = FTYPE_NONE;
     gFilterCutoff = 10000.0f;
     gFilterQ = 0.707f;
+    gFilterCutoffSm = gFilterCutoff;
+    gFilterQSm      = gFilterQ;
     gFilterBitDepth = 16;
     gFilterDist = 0.0f;
     gFilterDistMode = DMODE_SOFT;
@@ -2957,6 +3063,11 @@ static void RunStartup808SelfTest(uint32_t nowMs)
         trkFilterType[p] = ((samplerFxStep & 3u) == 2u) ? FTYPE_BANDPASS : FTYPE_LOWPASS;
         trkFilterCut[p]  = clampF(260.0f + 11200.0f * sweep, 20.0f, 18000.0f);
         trkFilterQ[p]    = 0.75f + 2.1f * (1.0f - sweep);
+        /* This showcase already sweeps in discrete, timed steps of its own —
+         * snap the smoothing shadow so UpdateTrackFilterSmoothing() doesn't
+         * additionally ease toward each step. */
+        trkFilterCutSm[p] = trkFilterCut[p];
+        trkFilterQSm[p]   = trkFilterQ[p];
         trkFilter[p].SetType(trkFilterType[p], trkFilterCut[p], trkFilterQ[p], (float)SAMPLE_RATE);
 
         trkDistMode[p]   = (samplerFxStep & 1u) ? DMODE_TUBE : DMODE_SOFT;
@@ -4784,6 +4895,8 @@ static void ResetTrackRuntimeState(uint8_t track)
     trkFilterType[track] = 0;
     trkFilterCut[track]  = 1000.0f;
     trkFilterQ[track]    = 0.707f;
+    trkFilterCutSm[track] = trkFilterCut[track];
+    trkFilterQSm[track]   = trkFilterQ[track];
     trkFilter[track].Reset();
     trkFilter2[track].Reset();
     trkDistDrive[track]  = 0.0f;
@@ -5175,11 +5288,15 @@ static void DsqTriggerTrackNow(uint8_t track, DsqStepFull& s, uint8_t velocity)
     if(!isSynth){
         uint32_t maxS = (div > 1) ? (dseq.samplesPerStep / div) : 0;
         if(s.cutoffEn && trkFilterType[track] && trkFxRouted[track]){
+            /* Per-step parameter lock: a deliberately instant stab, not a
+             * sweep — snap the smoothing shadow too so
+             * UpdateTrackFilterSmoothing() doesn't blur it into a glide. */
             float f = clampF((float)s.cutoffHz, 20.f, 20000.f);
             trkFilter[track].SetType(trkFilterType[track], f, trkFilterQ[track], (float)SAMPLE_RATE);
             if(trkFilterType[track] == FTYPE_RESONANT)
                 trkFilter2[track].SetType(FTYPE_RESONANT, f, trkFilterQ[track], (float)SAMPLE_RATE);
             trkFilterCut[track] = f;
+            trkFilterCutSm[track] = f;
         }
         if(s.reverbEn) trackReverbSend[track] = clampF(s.reverbSend / 100.0f, 0.f, 1.f);
         if(s.volEn) trackGain[track] = VolumeByteToGain(s.volume);
@@ -5415,6 +5532,15 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             break;
         }
     }
+
+    /* Once per block (not per sample — cheap): ease any pad/track/global
+     * filter whose target cutoff/Q moved since the last block a step closer,
+     * instead of the old behavior of snapping straight to it. See
+     * UpdatePadFilterSmoothing() above for why. */
+    UpdatePadFilterSmoothing();
+    UpdateTrackFilterSmoothing();
+    UpdateGlobalFilterSmoothing();
+
     float lfoVal[MAX_PADS];
     uint8_t trkFilterLfoSet[MAX_PADS];
 
@@ -6798,58 +6924,33 @@ static void ProcessCommand()
                     gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
                 }
             }
+            /* A full reconfigure (preset/kit recall) applies instantly — it
+             * should not visibly "glide" in. Only a lone cutoff/resonance
+             * tweak below is left to ease in via UpdateGlobalFilterSmoothing(). */
+            gFilterCutoffSm = gFilterCutoff;
+            gFilterQSm      = gFilterQ;
             podStateRevision++;
         }
         break;
     case CMD_FILTER_CUTOFF:
+        /* A live cutoff sweep used to recompute the filter's coefficients
+         * instantly on every raw step, which is what made a fast sweep
+         * sound like a series of clicks instead of a glide ("muy brusco").
+         * Only the target is set here; UpdateGlobalFilterSmoothing() eases
+         * gFilterCutoffSm toward it once per audio block. */
         if(len >= 4 && (podApplyingCommand
            || !PodOwnsFunction(POD_FUNC_FILTER_CUTOFF))){
             memcpy(&gFilterCutoff, p, 4);
             gFilterCutoff = clampF(gFilterCutoff, 20.f, 20000.f);
-            if(gFilterType){
-                if(gFilterType == FTYPE_LADDER){
-                    masterLadderL.SetFreq(gFilterCutoff);
-                    masterLadderR.SetFreq(gFilterCutoff);
-                } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
-                    masterSvfL.SetFreq(gFilterCutoff);
-                    masterSvfR.SetFreq(gFilterCutoff);
-                } else {
-                    gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                    gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                    if(gFilterType == FTYPE_RESONANT){
-                        gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                        gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                    }
-                }
-            }
             podStateRevision++;
         }
         break;
     case CMD_FILTER_RESONANCE:
+        /* Same reasoning as CMD_FILTER_CUTOFF above — target only. */
         if(len >= 4 && (podApplyingCommand
            || !PodOwnsFunction(POD_FUNC_FILTER_RESONANCE))){
             memcpy(&gFilterQ, p, 4);
             gFilterQ = (gFilterType == FTYPE_RESONANT) ? clampF(gFilterQ, 0.3f, 40.f) : clampF(gFilterQ, 0.3f, 28.f);
-            if(gFilterType){
-                if(gFilterType == FTYPE_LADDER){
-                    masterLadderL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                    masterLadderR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
-                    masterSvfL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                    masterSvfR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-                } else {
-                    gFilterL.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                    gFilterR.SetType(gFilterType, gFilterCutoff, gFilterQ,
-                                     (float)SAMPLE_RATE, GlobalEqGainDb(gFilterType));
-                    if(gFilterType == FTYPE_RESONANT){
-                        gFilter2L.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                        gFilter2R.SetType(FTYPE_RESONANT, gFilterCutoff, gFilterQ, (float)SAMPLE_RATE);
-                    }
-                }
-            }
             podStateRevision++;
         }
         break;
@@ -7127,6 +7228,7 @@ static void ProcessCommand()
         if(len >= 12){
             uint8_t t = p[0]; if(t >= MAX_PADS) break;
             uint8_t ftype = p[1];
+            const bool typeChanged = (ftype != trkFilterType[t]);
             trkFilterType[t] = ftype;
             if(ftype) trkFxRouted[t] = true;   /* auto-enable per-track FX chain */
             float cut, res, gain = 0.f;
@@ -7136,10 +7238,18 @@ static void ProcessCommand()
             trkFilterCut[t] = clampF(cut, 20.f, 20000.f);
             /* RESONANT permite Q hasta 40 para auto-oscilación */
             float qMax = (ftype == FTYPE_RESONANT) ? 40.f : 28.f;
-            trkFilterQ[t] = clampF(res, 0.3f, qMax);
-            trkFilter[t].SetType(ftype, trkFilterCut[t], trkFilterQ[t], (float)SAMPLE_RATE, gain);
-            if(ftype == FTYPE_RESONANT)
-                trkFilter2[t].SetType(FTYPE_RESONANT, trkFilterCut[t], trkFilterQ[t], (float)SAMPLE_RATE);
+            trkFilterQ[t]   = clampF(res, 0.3f, qMax);
+            trkFilterGain[t] = gain;
+            if(typeChanged || !ftype){
+                /* Switching models (or turning off) applies instantly — a
+                 * cutoff/Q tweak within the same type glides in instead, via
+                 * UpdateTrackFilterSmoothing() once per audio block. */
+                trkFilterCutSm[t] = trkFilterCut[t];
+                trkFilterQSm[t]   = trkFilterQ[t];
+                trkFilter[t].SetType(ftype, trkFilterCut[t], trkFilterQ[t], (float)SAMPLE_RATE, gain);
+                if(ftype == FTYPE_RESONANT)
+                    trkFilter2[t].SetType(FTYPE_RESONANT, trkFilterCut[t], trkFilterQ[t], (float)SAMPLE_RATE);
+            }
         }
         break;
     case CMD_TRACK_CLEAR_FILTER:
@@ -7428,14 +7538,26 @@ static void ProcessCommand()
     case CMD_PAD_FILTER:
         if(len >= 12 && p[0] < MAX_PADS){
             uint8_t pad = p[0];
-            padFilterType[pad] = p[1];
+            uint8_t newType = p[1];
             float cut, res, gain = 0.f;
             memcpy(&cut, p + 4, 4);
             memcpy(&res, p + 8, 4);
             if(len >= 16) memcpy(&gain, p + 12, 4);
-            padFilterCut[pad] = clampF(cut, 20.f, 20000.f);
-            padFilterQ[pad]   = clampF(res, 0.3f, 10.f);
-            padFilter[pad].SetType(p[1], padFilterCut[pad], padFilterQ[pad], (float)SAMPLE_RATE, gain);
+            cut = clampF(cut, 20.f, 20000.f);
+            res = clampF(res, 0.3f, 10.f);
+            const bool typeChanged = (newType != padFilterType[pad]);
+            padFilterType[pad] = newType;
+            padFilterCut[pad]  = cut;
+            padFilterQ[pad]    = res;
+            padFilterGain[pad] = gain;
+            if(typeChanged || !newType){
+                /* Switching models (or turning off) applies instantly — a
+                 * cutoff/Q tweak within the same type glides in instead, via
+                 * UpdatePadFilterSmoothing() once per audio block. */
+                padFilterCutSm[pad] = cut;
+                padFilterQSm[pad]   = res;
+                padFilter[pad].SetType(newType, cut, res, (float)SAMPLE_RATE, gain);
+            }
         }
         break;
     case CMD_PAD_CLEAR_FILTER:
@@ -10972,6 +11094,9 @@ static void InitArrays()
         padFilterType[i] = 0;
         padFilterCut[i]  = 10000.f;
         padFilterQ[i]    = 0.707f;
+        padFilterCutSm[i] = padFilterCut[i];
+        padFilterQSm[i]   = padFilterQ[i];
+        padFilterGain[i]  = 0.f;
         padDistDrive[i]  = 0;
         padDistMode[i]   = 0;
         padBitDepth[i]   = 16;
@@ -10985,6 +11110,9 @@ static void InitArrays()
         trkFilterType[i] = 0;
         trkFilterCut[i]  = 10000.f;
         trkFilterQ[i]    = 0.707f;
+        trkFilterCutSm[i] = trkFilterCut[i];
+        trkFilterQSm[i]   = trkFilterQ[i];
+        trkFilterGain[i]  = 0.f;
         trkDistDrive[i]  = 0;
         trkDistMode[i]   = 0;
         trkBitDepth[i]   = 16;

@@ -877,7 +877,7 @@ static PadFxState s_pad_fx_state[16] = {};
 static bool       s_pad_fx_state_init[16] = {};
 static lv_obj_t*  s_pad_fx_modal = NULL;
 static lv_obj_t*  s_pad_fx_modal_title = NULL;
-static lv_obj_t*  s_pad_fx_filter_btns[6] = {};
+static lv_obj_t*  s_pad_fx_filter_btns[7] = {};
 static lv_obj_t*  s_pad_fx_cutoff_slider = NULL;
 static lv_obj_t*  s_pad_fx_reso_slider = NULL;
 static lv_obj_t*  s_pad_fx_drive_slider = NULL;
@@ -2737,9 +2737,16 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
 // =============================================================================
 enum PadFxSliderId : uint8_t { PFX_CUTOFF = 0, PFX_RESO, PFX_DRIVE, PFX_BITS, PFX_RVB, PFX_DLY };
 
-static const uint8_t PAD_FX_FILTER_TYPES[6] = {0, 1, 2, 3, 9, 10};
-static const char* const PAD_FX_FILTER_NAMES[6] = {
-    "OFF", "LOWPASS", "HIGHPASS", "BANDPASS", "RESONANT", "LADDER"
+// LADDER (10) used to be listed here but never actually filtered anything:
+// this modal drives the per-TRACK filter (control_send_track_filter ->
+// trkFilter[track], a plain BiquadEQ), and BiquadEQ::SetType() has no
+// FTYPE_LADDER case — it silently fell through to the identity/bypass
+// coefficients, so picking "LADDER" just played the track dry with no
+// warning. NOTCH and ALLPASS are real BiquadEQ types (same object, same
+// CPU cost) that were simply never exposed here.
+static const uint8_t PAD_FX_FILTER_TYPES[7] = {0, 1, 2, 3, 4, 5, 9};
+static const char* const PAD_FX_FILTER_NAMES[7] = {
+    "OFF", "LOWPASS", "HIGHPASS", "BANDPASS", "NOTCH", "ALLPASS", "RESONANT"
 };
 
 static PadFxState& pad_fx_state_for(uint8_t pad) {
@@ -2789,7 +2796,7 @@ static void pad_fx_modal_refresh(void) {
         lv_label_set_text_fmt(s_pad_fx_subtitle_lbl, "PAD %02d  -  %s",
                               (int)pad + 1, PAD_INST_NAMES[inst]);
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         lv_obj_t* btn = s_pad_fx_filter_btns[i];
         if (!btn) continue;
         bool active = (PAD_FX_FILTER_TYPES[i] == st.filterType);
@@ -2832,7 +2839,7 @@ static void pad_fx_modal_close_cb(lv_event_t* e) {
     if (s_pad_fx_modal) {
         lv_obj_del(s_pad_fx_modal);
         s_pad_fx_modal = NULL;
-        for (int i = 0; i < 6; i++) s_pad_fx_filter_btns[i] = NULL;
+        for (int i = 0; i < 7; i++) s_pad_fx_filter_btns[i] = NULL;
         s_pad_fx_cutoff_slider = s_pad_fx_reso_slider = s_pad_fx_drive_slider = NULL;
         s_pad_fx_bits_slider = s_pad_fx_rvb_slider = s_pad_fx_dly_slider = NULL;
         s_pad_fx_cutoff_lbl = s_pad_fx_reso_lbl = s_pad_fx_drive_lbl = NULL;
@@ -2844,7 +2851,7 @@ static void pad_fx_modal_close_cb(lv_event_t* e) {
 
 static void pad_fx_filter_select_cb(lv_event_t* e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (idx < 0 || idx >= 6) return;
+    if (idx < 0 || idx >= 7) return;
     uint8_t pad = s_pad_fx_focus_pad;
     if (!control_available() && !control_engine_connected()) {
         ui_show_toast("Master no conectado", RED808_WARNING);
@@ -3020,8 +3027,8 @@ static void pad_fx_modal_show_for_pad(uint8_t pad) {
     lv_obj_set_pos(filter_hdr, 4, 58);
 
     {
-        constexpr int btnW = 104, btnH = 40, gapX = 8, y0 = 76;
-        for (int i = 0; i < 6; i++) {
+        constexpr int btnW = 90, btnH = 40, gapX = 6, y0 = 76;
+        for (int i = 0; i < 7; i++) {
             lv_obj_t* fb = lv_btn_create(card);
             s_pad_fx_filter_btns[i] = fb;
             lv_obj_set_size(fb, btnW, btnH);
