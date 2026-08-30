@@ -13906,8 +13906,16 @@ static void sd_upload_consume_result(void) {
         if (job.close_after) {
             s_xtra_pending_slot = -1;
             s_sd_for_xtra = false;
-            ui_show_toast("XTRA cargado", RED808_SUCCESS);
+            // Navigate first, THEN toast: ui_show_toast() parents to
+            // lv_scr_act(), which lv_scr_load_anim() already flips to the
+            // destination screen at call time (only the fade itself is
+            // animated). Toasting before navigating left the toast attached
+            // to the SD screen we're about to leave, so it rendered for a
+            // single frame and vanished with the screen switch — the
+            // "flash" reported when loading XTRA samples. Toasting after
+            // keeps it visible on PERFORMANCE for its full duration.
             ui_navigate_to(6);
+            ui_show_toast("XTRA cargado", RED808_SUCCESS);
         }
     }
 }
