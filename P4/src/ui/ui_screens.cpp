@@ -7616,6 +7616,23 @@ static const FilterPresetDefault FILTER_PRESET_FACTORY[FILTER_PRESET_COUNT] = {
     { "MORPH SWEEP",  15,  1000,  20,  0, 16,     0,  64 },
 };
 
+static void filter_presets_apply_factory(void) {
+    for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
+        const FilterPresetDefault& d = FILTER_PRESET_FACTORY[i];
+        FilterPresetSlot& s = s_filter_presets[i];
+        s.used = true;
+        strncpy(s.name, d.name, sizeof(s.name) - 1);
+        s.filterType = d.filterType;
+        s.cutoffHz = d.cutoffHz;
+        s.resonanceX10 = d.resonanceX10;
+        s.distortionPct = d.distortionPct;
+        s.bitcrushBits = d.bitcrushBits;
+        s.sampleRateHz = d.sampleRateHz;
+        s.morphU7 = d.morphU7;
+    }
+    filter_presets_save_to_disk();
+}
+
 static void filter_presets_load_from_disk(void) {
     memset(s_filter_presets, 0, sizeof(s_filter_presets));
     for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
@@ -7623,23 +7640,8 @@ static void filter_presets_load_from_disk(void) {
         s_filter_presets[i].bitcrushBits = 16;
     }
     File f = SPIFFS.open(FILTER_PRESETS_FILE, FILE_READ);
-    if (!f) {
-        for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
-            const FilterPresetDefault& d = FILTER_PRESET_FACTORY[i];
-            FilterPresetSlot& s = s_filter_presets[i];
-            s.used = true;
-            strncpy(s.name, d.name, sizeof(s.name) - 1);
-            s.filterType = d.filterType;
-            s.cutoffHz = d.cutoffHz;
-            s.resonanceX10 = d.resonanceX10;
-            s.distortionPct = d.distortionPct;
-            s.bitcrushBits = d.bitcrushBits;
-            s.sampleRateHz = d.sampleRateHz;
-            s.morphU7 = d.morphU7;
-        }
-        filter_presets_save_to_disk();
-        return;
-    }
+    if (!f) { filter_presets_apply_factory(); return; }
+    bool any_used = false;
     int idx = 0;
     char line[128];
     while (idx < FILTER_PRESET_COUNT && fs_read_line(f, line, sizeof(line))) {
@@ -7654,6 +7656,7 @@ static void filter_presets_load_from_disk(void) {
         if (parsed >= 2) {
             FilterPresetSlot& s = s_filter_presets[idx];
             s.used = (used != 0);
+            if (s.used) any_used = true;
             strncpy(s.name, name, sizeof(s.name) - 1);
             if (parsed >= 3) s.filterType = constrain(filterType, 0, 15);
             if (parsed >= 4) s.cutoffHz = constrain(cutoffHz, 20, 20000);
@@ -7666,6 +7669,11 @@ static void filter_presets_load_from_disk(void) {
         idx++;
     }
     f.close();
+    // A device that ran an older build before factory presets existed
+    // already has this file, just full of unused slots — checking only
+    // "file missing" would leave it empty forever. Treat "nothing saved
+    // yet" (no slot marked used) the same as "file missing".
+    if (!any_used) filter_presets_apply_factory();
 }
 
 static void filter_preset_modal_refresh(void) {
@@ -8613,6 +8621,7 @@ static lv_obj_t*  seq_hdr_save_btn      = NULL;
 static lv_obj_t*  seq_hdr_save_lbl      = NULL;
 static lv_obj_t*  seq_hdr_kanban_btn    = NULL;
 static lv_obj_t*  seq_kanban_modal      = NULL;
+static lv_obj_t*  seq_hdr_matrix_btn    = NULL;
 static lv_obj_t*  seq_hdr_group_btns[4] = {};
 static uint8_t    seq_hdr_group_state[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 static lv_obj_t*  seq_pattern_list_modal = NULL;
@@ -10651,6 +10660,10 @@ static void create_sequencer_screen(void) {
         seq_set_pattern_dirty(seq_pattern_dirty);
 
         seq_hdr_kanban_btn = makeHeaderButton(64, "AUTO", RED808_CYAN, seq_kanban_modal_show);
+
+        // Direct one-tap access — MATRIX previously lived only as a button
+        // buried inside the SONG modal above, two taps deep.
+        seq_hdr_matrix_btn = makeHeaderButton(72, "MATRIX", RED808_ACCENT2, matrix_modal_show);
     }
 
     // ── Precompute step X positions ──
@@ -11763,26 +11776,28 @@ static const MixerPresetDefault MIXER_PRESET_FACTORY[MIXER_PRESET_COUNT] = {
     { "WIDE MIX",       {110,110,105,105,105,105,100,100,100,100,100, 95, 95, 95, 95, 95} },
 };
 
+static void mixer_presets_apply_factory(void) {
+    for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
+        const MixerPresetDefault& d = MIXER_PRESET_FACTORY[i];
+        MixerPresetSlot& s = s_mixer_presets[i];
+        s.used = true;
+        strncpy(s.name, d.name, sizeof(s.name) - 1);
+        for (int t = 0; t < 16; t++) {
+            s.volume[t] = d.vol[t];
+            s.muted[t] = false;
+            s.solo[t] = false;
+        }
+    }
+    mixer_presets_save_to_disk();
+}
+
 static void mixer_presets_load_from_disk(void) {
     memset(s_mixer_presets, 0, sizeof(s_mixer_presets));
     for (int i = 0; i < MIXER_PRESET_COUNT; i++)
         for (int t = 0; t < 16; t++) s_mixer_presets[i].volume[t] = 100;
     File f = SPIFFS.open(MIXER_PRESETS_FILE, FILE_READ);
-    if (!f) {
-        for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
-            const MixerPresetDefault& d = MIXER_PRESET_FACTORY[i];
-            MixerPresetSlot& s = s_mixer_presets[i];
-            s.used = true;
-            strncpy(s.name, d.name, sizeof(s.name) - 1);
-            for (int t = 0; t < 16; t++) {
-                s.volume[t] = d.vol[t];
-                s.muted[t] = false;
-                s.solo[t] = false;
-            }
-        }
-        mixer_presets_save_to_disk();
-        return;
-    }
+    if (!f) { mixer_presets_apply_factory(); return; }
+    bool any_used = false;
     char line[64];
     for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
         if (!fs_read_line(f, line, sizeof(line))) break;
@@ -11791,6 +11806,7 @@ static void mixer_presets_load_from_disk(void) {
         int parsed = sscanf(line, "%d,%15[^\n]", &used, name);
         MixerPresetSlot& s = s_mixer_presets[i];
         s.used = (used != 0);
+        if (s.used) any_used = true;
         if (parsed >= 2) strncpy(s.name, name, sizeof(s.name) - 1);
         for (int t = 0; t < 16; t++) {
             if (!fs_read_line(f, line, sizeof(line))) break;
@@ -11802,6 +11818,9 @@ static void mixer_presets_load_from_disk(void) {
         }
     }
     f.close();
+    // See filter_presets_load_from_disk()'s comment: a file that already
+    // exists but has nothing saved in it counts as "never saved" too.
+    if (!any_used) mixer_presets_apply_factory();
 }
 
 static void mixer_preset_modal_refresh(void) {
@@ -16069,6 +16088,23 @@ static const MelodyPresetDefault MELODY_PRESET_FACTORY[MELODY_PRESET_COUNT] = {
     { "REGGAETON STAB",  6, 4, 30, {60, 0, 0,60,60, 0, 0,60,60, 0, 0,60,60, 0,60, 0} },
 };
 
+static void melody_presets_apply_factory(void) {
+    for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
+        const MelodyPresetDefault& d = MELODY_PRESET_FACTORY[i];
+        MelodyPresetSlot& s = s_melody_presets[i];
+        s.used = true;
+        strncpy(s.name, d.name, sizeof(s.name) - 1);
+        s.engine = d.engine;
+        s.octave = d.octave;
+        s.gatePercent = d.gatePercent;
+        for (int c = 0; c < 16; c++) {
+            s.notes[c][0] = d.notes[c];
+            s.grid[c][0]  = d.notes[c] > 0;
+        }
+    }
+    melody_presets_save_to_disk();
+}
+
 static void melody_presets_load_from_disk(void) {
     memset(s_melody_presets, 0, sizeof(s_melody_presets));
     for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
@@ -16077,23 +16113,8 @@ static void melody_presets_load_from_disk(void) {
         s_melody_presets[i].gatePercent = 55;
     }
     File f = SPIFFS.open(MELODY_PRESETS_FILE, FILE_READ);
-    if (!f) {
-        for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
-            const MelodyPresetDefault& d = MELODY_PRESET_FACTORY[i];
-            MelodyPresetSlot& s = s_melody_presets[i];
-            s.used = true;
-            strncpy(s.name, d.name, sizeof(s.name) - 1);
-            s.engine = d.engine;
-            s.octave = d.octave;
-            s.gatePercent = d.gatePercent;
-            for (int c = 0; c < 16; c++) {
-                s.notes[c][0] = d.notes[c];
-                s.grid[c][0]  = d.notes[c] > 0;
-            }
-        }
-        melody_presets_save_to_disk();
-        return;
-    }
+    if (!f) { melody_presets_apply_factory(); return; }
+    bool any_used = false;
     char line[160];
     for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
         if (!fs_read_line(f, line, sizeof(line))) break;
@@ -16102,6 +16123,7 @@ static void melody_presets_load_from_disk(void) {
         char name[16] = {};
         int parsed = sscanf(line, "%d,%15[^,],%d,%d,%d", &used, name, &engine, &octave, &gate);
         s.used = (used != 0);
+        if (s.used) any_used = true;
         if (parsed >= 2) strncpy(s.name, name, sizeof(s.name) - 1);
         s.engine = (uint8_t)constrain(engine, 0, 255);
         s.octave = (uint8_t)constrain(octave, 1, 7);
@@ -16119,6 +16141,9 @@ static void melody_presets_load_from_disk(void) {
         }
     }
     f.close();
+    // See filter_presets_load_from_disk()'s comment: a file that already
+    // exists but has nothing saved in it counts as "never saved" too.
+    if (!any_used) melody_presets_apply_factory();
 }
 
 static void melody_preset_modal_refresh(void) {
@@ -18504,6 +18529,7 @@ static void ui_reload_themed_screens(void) {
     seq_hdr_save_lbl = NULL;
     seq_hdr_kanban_btn = NULL;
     seq_kanban_modal = NULL;
+    seq_hdr_matrix_btn = NULL;
     for (int m = 0; m < KANBAN_COUNT; ++m) {
         seq_kanban_toggle_btns[m] = NULL;
         for (int i = 0; i < 4; ++i) seq_kanban_bars_btns[m][i] = NULL;
