@@ -6538,15 +6538,18 @@ enum FxCardKind : uint8_t {
     // model is SVF MORPH (15); touching this card auto-selects that model,
     // same idea as CUTOFF/RESO auto-engaging LOWPASS.
     FX_CARD_MORPH,
+    // Beat Repeat / stutter — CMD_BEAT_REPEAT already existed in DaisyPod3
+    // (only ever sent a hardcoded 0 by a panic/reset path) but had no card
+    // driving an actual division. The 18th FX card.
+    FX_CARD_STUTTER,
 };
 
-static constexpr int FX_CARD_COUNT = 17;
-static constexpr int FX_VIEW_MODE_COUNT = 3;
-// 16 cards at 3-per-page is 6 pages (was 4, for the old 12-card total) —
-// bumped so the page-dot row still has one dot per page in the densest-page
-// (fewest-per-page) view mode.
+static constexpr int FX_CARD_COUNT = 18;
+static constexpr int FX_VIEW_MODE_COUNT = 4;
+// 18 cards at 3-per-page is 6 pages — bumped so the page-dot row still has
+// one dot per page in the densest-page (fewest-per-page) view mode.
 static constexpr int FX_PAGE_DOT_COUNT = 6;
-static const int fx_view_modes[FX_VIEW_MODE_COUNT] = {3, 6, 12};
+static const int fx_view_modes[FX_VIEW_MODE_COUNT] = {3, 6, 12, 18};
 
 static int fx_page = 0;
 static int fx_view_mode = 0;
@@ -6568,6 +6571,22 @@ static lv_obj_t* fx_all_off_btn                = NULL;
 static lv_obj_t* s_fx_random_btn               = NULL;
 static lv_obj_t* fx_midi_badges[FX_CARD_COUNT] = {};
 static bool s_fx_ui_syncing = false;
+
+// ── VIZ: alternate per-card value indicators alongside the original arc ──
+// ARC is the neon circle already built for every card; LED is a horizontal
+// ladder of small segments (plain lv_obj rectangles — the same bg_color/
+// bg_opa toggling already proven by fx_page_dot above, rather than the
+// unverified lv_led widget API); BAR is a horizontal VU-style lv_bar, the
+// same widget already used for the boot progress bar. All three exist for
+// every card at all times; fx_apply_viz_style() just shows/hides them, so
+// switching style never needs to wait for the next value change.
+enum FxVizStyle { FX_VIZ_ARC = 0, FX_VIZ_LED, FX_VIZ_BAR, FX_VIZ_STYLE_COUNT };
+static constexpr int FX_LED_COUNT = 10;
+static int        s_fx_viz_style = FX_VIZ_ARC;
+static lv_obj_t*  s_fx_viz_btn   = NULL;
+static lv_obj_t*  s_fx_viz_lbl   = NULL;
+static lv_obj_t*  fx_bars[FX_CARD_COUNT] = {};
+static lv_obj_t*  fx_leds[FX_CARD_COUNT][FX_LED_COUNT] = {};
 
 // True if any learned MIDI CC maps to this FX LAB knob action. Only the
 // filter-related cards have a matching KnobActionType today.
@@ -6596,17 +6615,17 @@ static uint32_t s_fx_toggle_last_ms[FX_CARD_COUNT] = {};
 static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX buttons
 static float    s_fx_arc_anim[FX_CARD_COUNT] = {};    // file-scope for snap access
 static uint32_t s_fx_arc_user_ms[FX_CARD_COUNT] = {}; // last user-touch timestamp
-static uint8_t  s_fx_last_active_u7[FX_CARD_COUNT] = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64};
+static uint8_t  s_fx_last_active_u7[FX_CARD_COUNT] = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64};
 // True current value of every card, updated on every send (unlike
 // s_fx_last_active_u7 above, which only tracks the last non-neutral value).
 // Used as the ramp start point for the smooth-transition RANDOM mode.
-// The 4 new cards (TREMOLO/CHORUS/COMP/AUTOWAH) start at 0, not 64 like the
-// rest — 0 is their true "off" value (matching Daisy's actual boot-time
-// tremoloActive/chorusActive/compActive/autowahActive == false), and this
-// array directly drives each card's mute/arc display, unlike
-// s_fx_last_active_u7 above which only seeds the value a later re-enable
-// restores.
-static uint8_t  s_fx_current_u7[FX_CARD_COUNT]     = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 0, 0, 0, 0, 0};
+// TREMOLO/CHORUS/COMP/AUTOWAH/STUTTER start at 0, not 64 like the rest — 0
+// is their true "off" value (matching Daisy's actual boot-time
+// tremoloActive/chorusActive/compActive/autowahActive/beatRepActive ==
+// false), and this array directly drives each card's mute/arc display,
+// unlike s_fx_last_active_u7 above which only seeds the value a later
+// re-enable restores.
+static uint8_t  s_fx_current_u7[FX_CARD_COUNT]     = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 0, 0, 0, 0, 0, 0};
 static bool     s_fx_random_smooth = false;   // false = brusca (snap), true = suave (ramp)
 static bool     fx_random_smooth_get(void) { return s_fx_random_smooth; }
 static void     fx_random_smooth_set(bool v) { s_fx_random_smooth = v; }
@@ -6614,7 +6633,7 @@ static void     fx_random_smooth_set(bool v) { s_fx_random_smooth = v; }
 static const char* fx_names[FX_CARD_COUNT] = {
     "FLANGE", "DELAY", "REVERB", "FOLD", "CRUSH", "PHASER",
     "CUTOFF", "RESO", "DRIVE", "BITS", "SRATE", "FILTER",
-    "TREMOLO", "CHORUS", "COMP", "A.WAH", "MORPH"
+    "TREMOLO", "CHORUS", "COMP", "A.WAH", "MORPH", "STUTTER"
 };
 
 static const char* fx_filter_model_name(int type) {
@@ -6629,18 +6648,19 @@ static const char* fx_filter_model_name(int type) {
 static const uint32_t fx_colors[FX_CARD_COUNT] = {
     0xC9271B, 0xE86820, 0xF5BC31, 0xF2552F, 0xFF8C2A, 0xF7EAD7,
     0x27B0D0, 0x31D2A1, 0xF2466B, 0xD18A2B, 0x4CA8FF, 0xA17BFF,
-    0x5FD9A0, 0xB07CF0, 0xFF5C8A, 0x8FE0FF, 0xE0C24C
+    0x5FD9A0, 0xB07CF0, 0xFF5C8A, 0x8FE0FF, 0xE0C24C, 0xFF4FD8
 };
 
 static const char* fx_src[FX_CARD_COUNT] = {
     "DEPTH", "DRY / WET", "DRY / WET", "INPUT GAIN", "DUAL MACRO", "DEPTH",
     "FREQUENCY", "Q / RESONANCE", "DRIVE", "RESOLUTION", "HOLD RATE", "MODEL",
-    "DEPTH", "DRY / WET", "SQUASH", "SENSITIVITY", "LP > BP > HP > NOTCH"
+    "DEPTH", "DRY / WET", "SQUASH", "SENSITIVITY", "LP > BP > HP > NOTCH",
+    "1/2 > 1/32 DIV"
 };
 
 static uint8_t fx_card_owner_function(int cell) {
-    // The 4 new effects (TREMOLO/CHORUS/COMP/AUTOWAH) have no physical Daisy
-    // Pod knob assigned — POD_FUNC_NONE means no ownership arbitration ever
+    // TREMOLO/CHORUS/COMP/AUTOWAH/MORPH/STUTTER have no physical Daisy Pod
+    // knob assigned — POD_FUNC_NONE means no ownership arbitration ever
     // blocks P4 from driving them, unlike the first 12 cards.
     static const uint8_t functions[FX_CARD_COUNT] = {
         POD_FUNC_FLANGER_DEPTH, POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX,
@@ -6648,7 +6668,8 @@ static uint8_t fx_card_owner_function(int cell) {
         POD_FUNC_PHASER_DEPTH, POD_FUNC_FILTER_CUTOFF,
         POD_FUNC_FILTER_RESONANCE, POD_FUNC_DISTORTION,
         POD_FUNC_BIT_DEPTH, POD_FUNC_SAMPLE_RATE, POD_FUNC_FILTER_TYPE,
-        POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE
+        POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE,
+        POD_FUNC_NONE
     };
     return (cell >= 0 && cell < FX_CARD_COUNT) ? functions[cell] : POD_FUNC_NONE;
 }
@@ -6708,6 +6729,7 @@ static int fx_card_current_value_u7(int cell) {
         case FX_CARD_COMP:
         case FX_CARD_AUTOWAH:
         case FX_CARD_MORPH:
+        case FX_CARD_STUTTER:
             return s_fx_current_u7[cell];
     }
     return 0;
@@ -6732,6 +6754,7 @@ static bool fx_card_is_muted(int cell) {
         case FX_CARD_COMP:
         case FX_CARD_AUTOWAH:
         case FX_CARD_MORPH:
+        case FX_CARD_STUTTER:
             return s_fx_current_u7[cell] == 0;
     }
     return false;
@@ -6871,6 +6894,9 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
                 }
                 control_send_set_filter_morph((float)u7 / 127.0f);
             }
+            break;
+        case FX_CARD_STUTTER:
+            if (transmit && control_available()) control_send_set_beatrepeat_macro((uint8_t)u7);
             break;
     }
     control_mark_fx_screen_dirty();
@@ -7214,21 +7240,32 @@ static void fx_apply_layout(void) {
 
     int start = fx_page * perPage;
     int visibleCount = constrain(FX_CARD_COUNT - start, 0, perPage);
-    int cols = visibleCount >= 12 ? 4 : (visibleCount >= 9 ? 3 : 3);
-    int rows = (visibleCount + cols - 1) / cols;
-    if (rows < 1) rows = 1;
 
-    const int topY = 52;
+    // Grid geometry (cols/rows) and "how compact" the styling is are
+    // properties of the VIEW MODE (perPage) itself, never of how many cards
+    // happen to be left on the current page — otherwise a partially-filled
+    // last page (e.g. 18 cards in VIEW 12 leaves only 6 on page 2) would
+    // silently fall back to VIEW 3's oversized styling on an undersized
+    // slot, which is exactly what made the new FX cards "look weird" on
+    // VIEW 6/12's last page before this fix.
+    int cols, rows;
+    bool compact12, compact6;
+    switch (perPage) {
+        case 6:  cols = 3; rows = 2; compact12 = false; compact6 = true;  break;
+        case 12: cols = 4; rows = 3; compact12 = true;  compact6 = false; break;
+        case 18: cols = 6; rows = 3; compact12 = true;  compact6 = false; break;
+        default: cols = 3; rows = 1; compact12 = false; compact6 = false; break; // VIEW 3
+    }
+
+    const int topY = 96;
     const int bottomPad = 8;
     const int sidePad = 12;
     const int gap = 10;
     int gridH = LCD_V_RES - topY - bottomPad;
     int cardW = (LCD_H_RES - sidePad * 2 - gap * (cols - 1)) / cols;
     int cardH = (gridH - gap * (rows - 1)) / rows;
-    bool compact12 = (visibleCount >= 12);
-    bool compact6 = (!compact12 && visibleCount >= 6);
     int arcSize = compact12
-        ? constrain((cardW < cardH ? cardW : cardH) - 96, 72, 130)
+        ? constrain((cardW < cardH ? cardW : cardH) - 96, 60, 130)
         : (compact6
             ? constrain((cardW < cardH ? cardW : cardH) - 84, 96, 190)
             : constrain((cardW < cardH ? cardW : cardH) - 72, 120, 290));
@@ -7294,7 +7331,62 @@ static void fx_apply_layout(void) {
             if (compact12) lv_obj_add_flag(fx_pct_labels[cell], LV_OBJ_FLAG_HIDDEN);
             else lv_obj_clear_flag(fx_pct_labels[cell], LV_OBJ_FLAG_HIDDEN);
         }
+
+        // LED/BAR alt visualizations — sit just under the source tag,
+        // independent of arcSize so they stay legible even in VIEW 18's
+        // tiny cards. Visibility (which of ARC/LED/BAR shows) is handled
+        // separately by fx_apply_viz_style(); this only sizes/positions.
+        {
+            int meterY = srcY + 16;
+            int meterH = compact12 ? 10 : (compact6 ? 14 : 18);
+            int meterX = compact12 ? 6 : 14;
+            int meterW = cardW - meterX * 2;
+            if (meterW < 20) meterW = 20;
+            if (fx_bars[cell]) {
+                lv_obj_set_size(fx_bars[cell], meterW, meterH);
+                lv_obj_set_pos(fx_bars[cell], meterX, meterY);
+            }
+            int ledGap = compact12 ? 2 : 4;
+            int ledW = (meterW - (FX_LED_COUNT - 1) * ledGap) / FX_LED_COUNT;
+            if (ledW < 4) ledW = 4;
+            for (int i = 0; i < FX_LED_COUNT; i++) {
+                if (!fx_leds[cell][i]) continue;
+                lv_obj_set_size(fx_leds[cell][i], ledW, meterH);
+                lv_obj_set_pos(fx_leds[cell][i], meterX + i * (ledW + ledGap), meterY);
+            }
+        }
     }
+}
+
+// Shows the widget matching s_fx_viz_style for every card, hides the other
+// two. All three (arc/bar/led row) already exist and are kept in sync with
+// the live value regardless of which is visible (see update_fx_screen()),
+// so switching style is instant with no stale display.
+static void fx_apply_viz_style(void) {
+    static const char* names[FX_VIZ_STYLE_COUNT] = {"VIZ: ARC", "VIZ: LED", "VIZ: BAR"};
+    if (s_fx_viz_lbl)
+        lv_label_set_text(s_fx_viz_lbl, names[constrain(s_fx_viz_style, 0, FX_VIZ_STYLE_COUNT - 1)]);
+    for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
+        if (fx_arcs[cell]) {
+            if (s_fx_viz_style == FX_VIZ_ARC) lv_obj_clear_flag(fx_arcs[cell], LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(fx_arcs[cell], LV_OBJ_FLAG_HIDDEN);
+        }
+        if (fx_bars[cell]) {
+            if (s_fx_viz_style == FX_VIZ_BAR) lv_obj_clear_flag(fx_bars[cell], LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(fx_bars[cell], LV_OBJ_FLAG_HIDDEN);
+        }
+        for (int i = 0; i < FX_LED_COUNT; i++) {
+            if (!fx_leds[cell][i]) continue;
+            if (s_fx_viz_style == FX_VIZ_LED) lv_obj_clear_flag(fx_leds[cell][i], LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(fx_leds[cell][i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void fx_viz_style_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    s_fx_viz_style = (s_fx_viz_style + 1) % FX_VIZ_STYLE_COUNT;
+    fx_apply_viz_style();
 }
 
 // Callback: toggle FX mute on card click
@@ -7656,9 +7748,15 @@ static void create_fx_screen(void) {
     lv_obj_set_style_text_color(fx_active_lbl, RED808_TEXT_DIM, 0);
     lv_obj_set_style_text_align(fx_active_lbl, LV_TEXT_ALIGN_LEFT, 0);
 
+    // ── Action row (row 2) — kept off row 1 entirely, which was already
+    // fully occupied by TITLE/PAT/ACTIVE FX. PRESETS used to share row 1's
+    // x=708 with the page-nav cluster below (same anchor point, computed
+    // independently) and sat invisibly underneath it; a full second row
+    // both fixes that and leaves room for VIZ without another squeeze.
+    const int actionY = 50;
     fx_all_off_btn = lv_btn_create(scr_fx);
-    lv_obj_set_size(fx_all_off_btn, 136, 36);
-    lv_obj_set_pos(fx_all_off_btn, 490, 8);
+    lv_obj_set_size(fx_all_off_btn, 110, 36);
+    lv_obj_set_pos(fx_all_off_btn, 8, actionY);
     apply_control_button_style(fx_all_off_btn, RED808_ERROR, false, 8);
     lv_obj_add_event_cb(fx_all_off_btn, fx_all_off_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* allOffLabel = lv_label_create(fx_all_off_btn);
@@ -7668,8 +7766,8 @@ static void create_fx_screen(void) {
 
     // ── RANDOM: tasteful global filter randomizer ──
     s_fx_random_btn = lv_btn_create(scr_fx);
-    lv_obj_set_size(s_fx_random_btn, 66, 36);
-    lv_obj_set_pos(s_fx_random_btn, 634, 8);
+    lv_obj_set_size(s_fx_random_btn, 60, 36);
+    lv_obj_set_pos(s_fx_random_btn, 126, actionY);
     lv_obj_add_event_cb(s_fx_random_btn, fx_random_modal_show, LV_EVENT_CLICKED, NULL);
     lv_obj_t* randomLabel = lv_label_create(s_fx_random_btn);
     lv_label_set_text(randomLabel, LV_SYMBOL_SHUFFLE);
@@ -7680,14 +7778,25 @@ static void create_fx_screen(void) {
 
     // ── FILTER PRESETS: 8 savable snapshots of the whole filter section ──
     lv_obj_t* presets_btn = lv_btn_create(scr_fx);
-    lv_obj_set_size(presets_btn, 96, 36);
-    lv_obj_set_pos(presets_btn, 708, 8);
+    lv_obj_set_size(presets_btn, 90, 36);
+    lv_obj_set_pos(presets_btn, 192, actionY);
     apply_control_button_style(presets_btn, RED808_CYAN, false, 8);
     lv_obj_add_event_cb(presets_btn, filter_preset_modal_show, LV_EVENT_CLICKED, NULL);
     lv_obj_t* presetsLabel = lv_label_create(presets_btn);
     lv_label_set_text(presetsLabel, "PRESETS");
     lv_obj_set_style_text_font(presetsLabel, &lv_font_montserrat_12, 0);
     lv_obj_center(presetsLabel);
+
+    // ── VIZ: cycles each card's value indicator between ARC / LED / BAR ──
+    s_fx_viz_btn = lv_btn_create(scr_fx);
+    lv_obj_set_size(s_fx_viz_btn, 90, 36);
+    lv_obj_set_pos(s_fx_viz_btn, 288, actionY);
+    apply_control_button_style(s_fx_viz_btn, RED808_ACCENT2, false, 8);
+    lv_obj_add_event_cb(s_fx_viz_btn, fx_viz_style_cb, LV_EVENT_CLICKED, NULL);
+    s_fx_viz_lbl = lv_label_create(s_fx_viz_btn);
+    lv_label_set_text(s_fx_viz_lbl, "VIZ: ARC");
+    lv_obj_set_style_text_font(s_fx_viz_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(s_fx_viz_lbl);
 
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         // Card container
@@ -7773,6 +7882,40 @@ static void create_fx_screen(void) {
         lv_obj_set_style_shadow_width(fx_arcs[cell], 10, LV_PART_KNOB);
         lv_obj_set_style_shadow_opa(fx_arcs[cell], LV_OPA_50, LV_PART_KNOB);
 
+        // ── Alt visualization: VU bar (hidden unless VIZ: BAR is selected) ──
+        fx_bars[cell] = lv_bar_create(card);
+        lv_obj_set_size(fx_bars[cell], 240, 18);
+        lv_obj_set_pos(fx_bars[cell], 40, 58);
+        lv_bar_set_range(fx_bars[cell], 0, 127);
+        lv_bar_set_value(fx_bars[cell], 0, LV_ANIM_OFF);
+        lv_obj_set_style_radius(fx_bars[cell], 4, LV_PART_MAIN);
+        lv_obj_set_style_radius(fx_bars[cell], 4, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(fx_bars[cell], RED808_BORDER, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(fx_bars[cell], LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_width(fx_bars[cell], 0, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(fx_bars[cell], lv_color_hex(fx_colors[cell]), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(fx_bars[cell], LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_clear_flag(fx_bars[cell], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(fx_bars[cell], LV_OBJ_FLAG_HIDDEN);
+
+        // ── Alt visualization: LED ladder (hidden unless VIZ: LED) — plain
+        // lv_obj rectangles with bg_color/bg_opa toggling, the same proven
+        // technique as the fx_page_dot page indicators, rather than the
+        // unverified lv_led widget API. ──
+        for (int i = 0; i < FX_LED_COUNT; i++) {
+            lv_obj_t* led = lv_obj_create(card);
+            fx_leds[cell][i] = led;
+            lv_obj_set_size(led, 20, 18);
+            lv_obj_set_pos(led, 40 + i * 24, 58);
+            lv_obj_set_style_radius(led, 3, 0);
+            lv_obj_set_style_bg_color(led, lv_color_hex(fx_colors[cell]), 0);
+            lv_obj_set_style_bg_opa(led, LV_OPA_20, 0);
+            lv_obj_set_style_border_width(led, 0, 0);
+            lv_obj_clear_flag(led, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(led, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(led, LV_OBJ_FLAG_HIDDEN);
+        }
+
         // Value label — center of arc (big neon number)
         fx_value_labels[cell] = lv_label_create(card);
         lv_label_set_text(fx_value_labels[cell], "000");
@@ -7809,8 +7952,10 @@ static void create_fx_screen(void) {
         lv_obj_center(tog_lbl);
     }
 
-    // Page controls
-    const int page_ctrl_y = 8;
+    // Page controls — same row 2 as the action buttons above (actionY), far
+    // enough to the right (anchored from LCD_H_RES) that the two clusters
+    // never meet even at VIEW 18's widest page label.
+    const int page_ctrl_y = actionY;
     const int page_ctrl_w = 46;
     const int page_ctrl_gap = 6;
     const int page_lbl_w = 46;
@@ -7840,12 +7985,12 @@ static void create_fx_screen(void) {
     lv_label_set_text(fx_page_lbl, "1 / 4");
     lv_obj_set_style_text_font(fx_page_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(fx_page_lbl, RED808_TEXT_DIM, 0);
-    lv_obj_set_pos(fx_page_lbl, page_group_x + page_ctrl_w * 2 + page_ctrl_gap * 2, 16);
+    lv_obj_set_pos(fx_page_lbl, page_group_x + page_ctrl_w * 2 + page_ctrl_gap * 2, actionY + 8);
 
     for (int p = 0; p < FX_PAGE_DOT_COUNT; p++) {
         fx_page_dot[p] = lv_obj_create(scr_fx);
         lv_obj_set_size(fx_page_dot[p], 8, 8);
-        lv_obj_set_pos(fx_page_dot[p], page_group_x + page_ctrl_w * 2 + page_ctrl_gap * 2 + page_lbl_w + 6 + p * 14, 22);
+        lv_obj_set_pos(fx_page_dot[p], page_group_x + page_ctrl_w * 2 + page_ctrl_gap * 2 + page_lbl_w + 6 + p * 14, actionY + 14);
         lv_obj_set_style_radius(fx_page_dot[p], LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_bg_color(fx_page_dot[p], RED808_CYAN, 0);
         lv_obj_set_style_bg_opa(fx_page_dot[p], p == 0 ? LV_OPA_COVER : LV_OPA_30, 0);
@@ -7877,6 +8022,11 @@ static void create_fx_screen(void) {
 
     filter_presets_load_from_disk();
     fx_apply_layout();
+    // Re-applies s_fx_viz_style's visibility to the freshly (re)created
+    // arc/bar/led widgets above — needed because that style choice
+    // persists across a theme-reload screen rebuild, but every rebuilt
+    // widget starts back at its creation-time default (arc visible).
+    fx_apply_viz_style();
 }
 
 static void fx_format_display_value(int cell, int u7, bool muted,
@@ -7934,6 +8084,15 @@ static void fx_format_display_value(int cell, int u7, bool muted,
         case FX_CARD_FILTER: {
             const int type = constrain((int)(normalized * 15.0f + 0.5f), 0, 15);
             snprintf(value, valueSize, "%s", fx_filter_model_name(type));
+            break;
+        }
+        case FX_CARD_STUTTER: {
+            // Mirrors control_send_set_beatrepeat_macro's binning exactly so
+            // the displayed division always matches what was actually sent.
+            static const uint8_t kDivs[5] = {2, 4, 8, 16, 32};
+            int idx = u7 > 0 ? constrain((int)((u7 - 1) * 5 / 127), 0, 4) : -1;
+            if (idx < 0) snprintf(value, valueSize, "OFF");
+            else snprintf(value, valueSize, "1/%d", kDivs[idx]);
             break;
         }
         default:
@@ -7997,6 +8156,19 @@ static void update_fx_screen(void) {
         if (fx_arcs[cell])
             lv_arc_set_value(fx_arcs[cell], anim_val);
         s_fx_ui_syncing = false;
+
+        // Keep BAR/LED in sync too, even while hidden — switching VIZ style
+        // then shows the right value immediately instead of a stale one.
+        if (fx_bars[cell]) lv_bar_set_value(fx_bars[cell], anim_val, LV_ANIM_OFF);
+        {
+            int lit = (anim_val * FX_LED_COUNT + 63) / 127;   // round to nearest
+            if (lit > FX_LED_COUNT) lit = FX_LED_COUNT;
+            for (int i = 0; i < FX_LED_COUNT; i++) {
+                if (!fx_leds[cell][i]) continue;
+                bool on = i < lit;
+                lv_obj_set_style_bg_opa(fx_leds[cell][i], on ? LV_OPA_COVER : LV_OPA_20, 0);
+            }
+        }
 
         char valueText[16] = {};
         char unitText[8] = {};

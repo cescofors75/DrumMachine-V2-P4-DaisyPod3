@@ -235,6 +235,10 @@ void control_send_set_tremolo_macro(uint8_t value);
 void control_send_set_chorus_macro(uint8_t value);
 void control_send_set_comp_macro(uint8_t value);
 void control_send_set_autowah_macro(uint8_t value);
+// Beat Repeat / stutter — already implemented in DaisyPod3 (CMD_BEAT_REPEAT,
+// off/1/2/1/4/1/8/1/16/1/32) but never exposed in the UI before now. value 0
+// = off; away from 0 picks one of the 5 divisions, coarsest at the low end.
+void control_send_set_beatrepeat_macro(uint8_t value);
 void control_send_fx_enc(int encoder, uint8_t value, bool muted);
 void control_send_fx_pot(int pot, uint8_t value, bool muted);
 void control_send_all_fx_off();

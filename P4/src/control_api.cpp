@@ -2446,6 +2446,20 @@ void control_send_set_autowah_macro(uint8_t value)
     fxDirty.store(true, std::memory_order_release);
 }
 
+void control_send_set_beatrepeat_macro(uint8_t value)
+{
+    value = static_cast<uint8_t>(Clamp(static_cast<int>(value), 0, 127));
+    static const uint8_t kDivs[5] = {2, 4, 8, 16, 32};
+    uint8_t div = 0;
+    if (value > 0) {
+        int idx = static_cast<int>((value - 1) * 5 / 127);
+        if (idx > 4) idx = 4;
+        div = kDivs[idx];
+    }
+    daisyUsb.sendU8(CMD_BEAT_REPEAT, div);
+    fxDirty.store(true, std::memory_order_release);
+}
+
 void control_send_fx_enc(int encoder, uint8_t value, bool muted)
 {
     if(encoder < 0 || encoder >= 3) return;
