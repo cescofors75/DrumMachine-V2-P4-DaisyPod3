@@ -18760,6 +18760,17 @@ void ui_create_all_screens(void) {
     s_pod_owner_badge_count = 0;
     memset(s_pod_owner_badges, 0, sizeof(s_pod_owner_badges));
     pod_config_store_load(s_pod_config);
+    // Load (and, on a fresh SPIFFS partition, factory-fill + persist) the
+    // filter/mixer/melody preset systems here, before any screen exists —
+    // these used to load lazily as a side effect of first opening FX LAB /
+    // MIXER / PIANO, which meant the one-time synchronous SPIFFS write
+    // (writing 8 factory presets to flash) could land in the middle of that
+    // screen's fade-in transition and stall a frame or two right as it
+    // appeared. Doing it here, before lv_scr_load ever runs, means the
+    // stall (if any) happens before the boot screen is even visible.
+    filter_presets_ensure_loaded();
+    mixer_presets_ensure_loaded();
+    melody_presets_ensure_loaded();
     create_boot_screen();
     create_live_screen();
 
