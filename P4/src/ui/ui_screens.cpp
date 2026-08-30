@@ -5098,19 +5098,41 @@ static void pod_control_map_modal_show(void) {
         [](lv_event_t*) { pod_control_map_modal_close_cb(NULL); },
         "MAPEAR DAISYPOD", RED808_ACCENT2);
 
-    for (uint8_t row = 0; row < POD_CONTROL_ROW_COUNT; row++) {
-        const int col = row % 4, line = row / 4;
-        const int x = 20 + col * 246, y = 66 + line * 62;
-        lv_obj_t* label = lv_label_create(s_pod_control_map_modal);
+    // Grouped into 4 labeled sections instead of one flat 4-column grid of
+    // all 11 controls — DAISYPOD (the pod's own buttons/knobs/encoder),
+    // ROTARYS (the 4 I2C rotary encoders + their MIDI channels), FADER
+    // (its own section since it's a distinct piece of hardware), and LEDS
+    // (unchanged, just moved down to make room).
+    auto sectionPanel = [&](int x, int y, int w, int h, const char* title,
+                            lv_color_t color) -> lv_obj_t* {
+        lv_obj_t* panel = lv_obj_create(s_pod_control_map_modal);
+        lv_obj_set_size(panel, w, h);
+        lv_obj_set_pos(panel, x, y);
+        lv_obj_set_style_bg_color(panel, RED808_SURFACE, 0);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(panel, 1, 0);
+        lv_obj_set_style_border_color(panel, RED808_BORDER, 0);
+        lv_obj_set_style_radius(panel, 14, 0);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* head = lv_label_create(panel);
+        lv_label_set_text(head, title);
+        lv_obj_set_style_text_font(head, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(head, color, 0);
+        lv_obj_set_pos(head, 14, 10);
+        return panel;
+    };
+
+    auto controlRow = [&](lv_obj_t* panel, int x, int y, uint8_t row) {
+        lv_obj_t* label = lv_label_create(panel);
         lv_label_set_text(label, POD_CONTROL_TITLES[row]);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
         lv_obj_set_style_text_color(label, RED808_TEXT_DIM, 0);
         lv_obj_set_pos(label, x, y);
-        lv_obj_t* selectButton = lv_btn_create(s_pod_control_map_modal);
+        lv_obj_t* selectButton = lv_btn_create(panel);
         lv_obj_set_size(selectButton, 226, 40);
         lv_obj_set_pos(selectButton, x, y + 15);
         apply_control_button_style(selectButton, RED808_ACCENT2, false, 10);
-        lv_obj_set_style_bg_color(selectButton, RED808_SURFACE, 0);
+        lv_obj_set_style_bg_color(selectButton, RED808_PANEL, 0);
         s_pod_control_value_labels[row] = lv_label_create(selectButton);
         lv_obj_set_width(s_pod_control_value_labels[row], 204);
         lv_obj_set_style_text_align(s_pod_control_value_labels[row],
@@ -5124,27 +5146,48 @@ static void pod_control_map_modal_show(void) {
                             LV_EVENT_CLICKED,
                             reinterpret_cast<void*>(
                                 static_cast<uintptr_t>(row)));
+    };
+
+    // DAISYPOD — rows 0-5: BUTTON1, BUTTON2, KNOB1, KNOB2, ENCODER, ENC PUSH.
+    lv_obj_t* daisyPanel = sectionPanel(16, 60, 496, 236, "DAISYPOD", RED808_ACCENT2);
+    for (uint8_t row = 0; row < 6; row++) {
+        const int col = row % 2, line = row / 2;
+        controlRow(daisyPanel, 14 + col * 240, 44 + line * 62, row);
     }
 
+    // ROTARYS — rows 6-9: the 4 I2C rotary encoders, each already labeled
+    // with its MIDI channel in POD_CONTROL_TITLES ("ROTARY 1 / CH0" etc).
+    lv_obj_t* rotaryPanel = sectionPanel(528, 60, 480, 168, "ROTARYS", RED808_CYAN);
+    for (uint8_t row = 6; row < 10; row++) {
+        const int col = (row - 6) % 2, line = (row - 6) / 2;
+        controlRow(rotaryPanel, 14 + col * 232, 44 + line * 62, row);
+    }
+
+    // FADER — row 10, its own section since it's a distinct piece of
+    // hardware from the DaisyPod's own buttons/knobs.
+    lv_obj_t* faderPanel = sectionPanel(528, 238, 480, 64, "FADER", RED808_SUCCESS);
+    controlRow(faderPanel, 14, 8, 10);
+
+    lv_obj_t* ledPanel = sectionPanel(16, 306, 992, 254, "LEDS", RED808_ACCENT);
     for (uint8_t led = 0; led < 2; led++) {
-        const int y = 260 + led * 64;
-        lv_obj_t* label = lv_label_create(s_pod_control_map_modal);
+        const int y = 44 + led * 96;
+        lv_obj_t* label = lv_label_create(ledPanel);
         lv_label_set_text_fmt(label, "LED %u", led + 1);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(label, led == 0 ? RED808_CYAN : RED808_ACCENT, 0);
-        lv_obj_set_pos(label, 24, y + 14);
-        lv_obj_t* functionButton = lv_btn_create(s_pod_control_map_modal);
+        lv_obj_set_pos(label, 8, y + 14);
+        lv_obj_t* functionButton = lv_btn_create(ledPanel);
         lv_obj_set_size(functionButton, 490, 44);
-        lv_obj_set_pos(functionButton, 110, y);
+        lv_obj_set_pos(functionButton, 94, y);
         apply_control_button_style(functionButton, RED808_INFO, false, 10);
         s_pod_led_function_labels[led] = lv_label_create(functionButton);
         lv_obj_set_style_text_font(s_pod_led_function_labels[led], &lv_font_montserrat_16, 0);
         lv_obj_center(s_pod_led_function_labels[led]);
         lv_obj_add_event_cb(functionButton, pod_led_function_cycle_cb, LV_EVENT_CLICKED,
                             (void*)(intptr_t)led);
-        lv_obj_t* colorButton = lv_btn_create(s_pod_control_map_modal);
-        lv_obj_set_size(colorButton, 270, 44);
-        lv_obj_set_pos(colorButton, 620, y);
+        lv_obj_t* colorButton = lv_btn_create(ledPanel);
+        lv_obj_set_size(colorButton, 380, 44);
+        lv_obj_set_pos(colorButton, 596, y);
         apply_control_button_style(colorButton, RED808_ACCENT, false, 10);
         s_pod_led_color_labels[led] = lv_label_create(colorButton);
         lv_obj_set_style_text_font(s_pod_led_color_labels[led], &lv_font_montserrat_16, 0);
