@@ -1115,6 +1115,14 @@ struct XtraScanItem { char path[40]; uint8_t depth; };
 static XtraScanItem s_xtra_scan_queue[XTRA_SCAN_MAX_VISITS];
 static int s_xtra_scan_count = 0;  // items pushed so far
 static int s_xtra_scan_idx   = 0;  // next item index to process
+// Both exit paths of a scan (root has no subfolders at all / queue
+// exhausted) used to finish in total silence — the user could put files
+// under /data/xtra, RESCAN, and see nothing happen with zero explanation
+// (Daisy not connected, SD not mounted, no WAV directly inside any
+// subfolder, everything nested one level too deep...). Only report the
+// result on an explicit RESCAN press, not the automatic scan-on-entry —
+// see xtra_page_rescan_cb / xtra_pages_request_folders / xtra_scan_advance.
+static bool s_xtra_scan_toast_on_done = false;
 
 static const uint8_t XTRA_SYNTH_ENGINE_CODES[7] = {0, 1, 2, 3, 4, 5, 6};
 static const char* XTRA_SYNTH_ENGINE_NAMES[7] = {"808", "909", "505", "303", "WT", "SH101", "FM2"};
@@ -1755,6 +1763,10 @@ static void xtra_scan_request_item_files(void) {
     } else {
         s_xtra_page_req = XTRA_PAGE_REQ_NONE;
         xtra_page_refresh_label();
+        if (s_xtra_scan_toast_on_done) {
+            ui_show_toast("Daisy USB no disponible", RED808_WARNING);
+            s_xtra_scan_toast_on_done = false;
+        }
     }
 }
 
@@ -1766,6 +1778,18 @@ static void xtra_scan_advance(void) {
         s_xtra_page_req = XTRA_PAGE_REQ_NONE;
         if (s_xtra_page_index >= s_xtra_page_count) s_xtra_page_index = 0;
         xtra_page_refresh_label();
+        if (s_xtra_scan_toast_on_done) {
+            if (s_xtra_page_count <= 1) {
+                ui_show_toast("Ninguna carpeta con WAV directo bajo /data/xtra",
+                              RED808_WARNING);
+            } else {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "%d carpeta(s) encontrada(s) en /data/xtra",
+                         s_xtra_page_count - 1);
+                ui_show_toast(msg, RED808_SUCCESS);
+            }
+            s_xtra_scan_toast_on_done = false;
+        }
         return;
     }
     xtra_scan_request_item_files();
@@ -1786,6 +1810,10 @@ static void xtra_pages_request_folders(void) {
     s_xtra_scan_idx = 0;
     if (!ui_control_available()) {
         xtra_page_refresh_label();
+        if (s_xtra_scan_toast_on_done) {
+            ui_show_toast("Master no conectado", RED808_WARNING);
+            s_xtra_scan_toast_on_done = false;
+        }
         return;
     }
     SdListFilesPayload payload = {};
@@ -1828,6 +1856,11 @@ static void xtra_pages_poll(void) {
             s_xtra_page_req = XTRA_PAGE_REQ_NONE;
             if (s_xtra_page_index >= s_xtra_page_count) s_xtra_page_index = 0;
             xtra_page_refresh_label();
+            if (s_xtra_scan_toast_on_done) {
+                ui_show_toast("No hay carpetas en /data/xtra (o Daisy no ve su SD)",
+                              RED808_WARNING);
+                s_xtra_scan_toast_on_done = false;
+            }
             return;
         }
         s_xtra_scan_idx = 0;
@@ -1919,6 +1952,7 @@ static void xtra_page_next_cb(lv_event_t* e) { LV_UNUSED(e); xtra_page_go(1); }
 static void xtra_page_rescan_cb(lv_event_t* e) {
     LV_UNUSED(e);
     ui_show_toast("Buscando carpetas en /data/xtra...", RED808_CYAN);
+    s_xtra_scan_toast_on_done = true;
     xtra_pages_request_folders();
 }
 
@@ -2657,15 +2691,55 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_set_style_text_color(sub, RED808_TEXT_DIM, 0);
     lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 32);
 
-    s_pad_inst_modal_pad_lbl = lv_label_create(card);
-    lv_obj_set_style_text_font(s_pad_inst_modal_pad_lbl, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(s_pad_inst_modal_pad_lbl, RED808_ACCENT, 0);
-    lv_obj_align(s_pad_inst_modal_pad_lbl, LV_ALIGN_TOP_MID, 0, 64);
+    // Current-selection summary as one highlighted chip instead of two plain
+    // stacked labels — the single most-referenced piece of state on this
+    // screen (which pad, what it currently plays) now reads at a glance
+    // instead of blending into the rest of the title area.
+    lv_obj_t* sel_chip = lv_obj_create(card);
+    lv_obj_set_size(sel_chip, 420, 52);
+    lv_obj_align(sel_chip, LV_ALIGN_TOP_MID, 0, 56);
+    lv_obj_set_style_bg_color(sel_chip, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_opa(sel_chip, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(sel_chip, 1, 0);
+    lv_obj_set_style_border_color(sel_chip, RED808_BORDER, 0);
+    lv_obj_set_style_radius(sel_chip, 12, 0);
+    lv_obj_clear_flag(sel_chip, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_pad_inst_modal_inst_lbl = lv_label_create(card);
-    lv_obj_set_style_text_font(s_pad_inst_modal_inst_lbl, &lv_font_montserrat_24, 0);
+    s_pad_inst_modal_pad_lbl = lv_label_create(sel_chip);
+    lv_obj_set_style_text_font(s_pad_inst_modal_pad_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_pad_inst_modal_pad_lbl, RED808_ACCENT, 0);
+    lv_obj_align(s_pad_inst_modal_pad_lbl, LV_ALIGN_LEFT_MID, 14, 0);
+
+    s_pad_inst_modal_inst_lbl = lv_label_create(sel_chip);
+    lv_obj_set_style_text_font(s_pad_inst_modal_inst_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_pad_inst_modal_inst_lbl, RED808_TEXT, 0);
-    lv_obj_align(s_pad_inst_modal_inst_lbl, LV_ALIGN_TOP_MID, 0, 98);
+    lv_obj_align(s_pad_inst_modal_inst_lbl, LV_ALIGN_RIGHT_MID, -14, 0);
+
+    // Two grouping panels (PAD on the left, INSTRUMENT+DRUM KITS together on
+    // the right, since they sit back-to-back with no real gap between them)
+    // behind the existing grids below — created first so they render behind
+    // every button, without moving a single one of those buttons' original
+    // coordinates. This is what turns "controls scattered on a blank
+    // background" into something that reads as distinct sections.
+    lv_obj_t* pad_panel = lv_obj_create(card);
+    lv_obj_set_size(pad_panel, 308, 220);
+    lv_obj_set_pos(pad_panel, 18, 100);
+    lv_obj_set_style_bg_color(pad_panel, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_opa(pad_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(pad_panel, 1, 0);
+    lv_obj_set_style_border_color(pad_panel, RED808_BORDER, 0);
+    lv_obj_set_style_radius(pad_panel, 14, 0);
+    lv_obj_clear_flag(pad_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* inst_panel = lv_obj_create(card);
+    lv_obj_set_size(inst_panel, 646, 300);
+    lv_obj_set_pos(inst_panel, 336, 100);
+    lv_obj_set_style_bg_color(inst_panel, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_opa(inst_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(inst_panel, 1, 0);
+    lv_obj_set_style_border_color(inst_panel, RED808_BORDER, 0);
+    lv_obj_set_style_radius(inst_panel, 14, 0);
+    lv_obj_clear_flag(inst_panel, LV_OBJ_FLAG_SCROLLABLE);
 
     const int pad_grid_x0 = 32;
     const int pad_grid_y0 = 138;
