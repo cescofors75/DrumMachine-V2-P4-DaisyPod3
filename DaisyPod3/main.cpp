@@ -319,6 +319,7 @@ static inline void DspProfBlockDone() {}
 #define CMD_FILTER_DIST_MODE  0x25
 #define CMD_FILTER_SR_REDUCE  0x26
 #define CMD_MASTER_FX_ROUTE   0x27  /* [fxId(1), connected(1)] estado de ruteo del grafo */
+#define CMD_FILTER_MORPH      0x28  /* float 0.0(LP)-1.0(Notch) — solo con filterType == FTYPE_SVF_MORPH (15) */
 
 /* Master FX */
 #define CMD_DELAY_ACTIVE      0x30
@@ -515,6 +516,8 @@ enum MasterFxRouteId : uint8_t {
 #define CMD_DSQ_SET_TRACK_ENGINE 0xD9 /* [track(1), engine(1)]  0xFF/-1=sampler 0=808 1=909 2=505 3=303     */
 #define CMD_DSQ_SET_TRACK_SWING  0xDA /* E4: [track(1), swing 0-100(1)] per-track swing                    */
 #define CMD_DSQ_SET_HUMANIZE     0xDB /* E2: [timingMs(1), velocityAmt(1)] humanizacion global              */
+#define CMD_CLEAN_TRACK_ACTIVE   0xDC /* [track(1), active(1)] include/exclude clean track from global transport */
+#define CMD_CLEAN_TRACK_MUTE     0xDD /* [track(1), muted(1)] mute clean track audio                        */
 #define CMD_DSQ_SET_STEP_NOTES   0xDE /* [pat,trk,step,flags,note0,note1,note2,note3]                      */
 #define CMD_DSQ_QUEUE_PATTERN     0xDF /* [pat,bars] 0=normal, 1..16=escena temporal con retorno             */
 
