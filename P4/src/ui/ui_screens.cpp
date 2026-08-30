@@ -7699,15 +7699,20 @@ static void filter_preset_save_current(int slot) {
     ui_show_toast("Preset de filtro guardado", RED808_SUCCESS);
 }
 
-static void filter_preset_recall(int slot) {
+// silent=true skips every toast — used when MATRIX recalls this preset
+// automatically during unattended playback (every bar-clock tick, for as
+// long as a column has this preset set), where a toast popping up and
+// disappearing on every column change read as a distracting flash. Manual
+// taps on a preset slot (silent=false, the default) still confirm normally.
+static void filter_preset_recall(int slot, bool silent = false) {
     if (slot < 0 || slot >= FILTER_PRESET_COUNT) return;
     const FilterPresetSlot& s = s_filter_presets[slot];
     if (!s.used) {
-        ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
+        if (!silent) ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
         return;
     }
     if (!control_available()) {
-        ui_show_toast("Master no conectado", RED808_WARNING);
+        if (!silent) ui_show_toast("Master no conectado", RED808_WARNING);
         return;
     }
     control_send_set_filter(s.filterType);
@@ -7719,7 +7724,7 @@ static void filter_preset_recall(int slot) {
     control_send_set_filter_morph(s.morphU7 / 127.0f);
     s_fx_current_u7[FX_CARD_MORPH] = s.morphU7;
     control_mark_fx_screen_dirty();
-    ui_show_toast("Preset de filtro cargado", RED808_SUCCESS);
+    if (!silent) ui_show_toast("Preset de filtro cargado", RED808_SUCCESS);
 }
 
 static void filter_preset_slot_clicked_cb(lv_event_t* e) {
@@ -11828,15 +11833,16 @@ static void mixer_preset_save_current(int slot) {
     ui_show_toast("Preset de mixer guardado", RED808_SUCCESS);
 }
 
-static void mixer_preset_recall(int slot) {
+// silent=true — see filter_preset_recall's comment above; same reasoning.
+static void mixer_preset_recall(int slot, bool silent = false) {
     if (slot < 0 || slot >= MIXER_PRESET_COUNT) return;
     const MixerPresetSlot& s = s_mixer_presets[slot];
     if (!s.used) {
-        ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
+        if (!silent) ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
         return;
     }
     if (!control_available()) {
-        ui_show_toast("Master no conectado", RED808_WARNING);
+        if (!silent) ui_show_toast("Master no conectado", RED808_WARNING);
         return;
     }
     // update_volumes_screen() polls p4.track_volume/muted every frame and
@@ -11847,7 +11853,7 @@ static void mixer_preset_recall(int slot) {
         control_send_mute(t, s.muted[t]);
         control_send_solo(t, s.solo[t]);
     }
-    ui_show_toast("Preset de mixer cargado", RED808_SUCCESS);
+    if (!silent) ui_show_toast("Preset de mixer cargado", RED808_SUCCESS);
 }
 
 static void mixer_preset_slot_clicked_cb(lv_event_t* e) {
@@ -16037,6 +16043,24 @@ static void melody_presets_save_to_disk(void) {
     f.close();
 }
 
+// 8 well-known, genre-standard melodic figures — one 16-step monophonic line
+// each (notes[c][0], rest of the 12-note chord slot stays 0). Engine indices
+// match PIANO_ENGINES: 3=303, 4=WT, 5=SH101, 6=FM2.
+struct MelodyPresetDefault {
+    const char* name; uint8_t engine; uint8_t octave; uint8_t gatePercent;
+    uint8_t notes[16];
+};
+static const MelodyPresetDefault MELODY_PRESET_FACTORY[MELODY_PRESET_COUNT] = {
+    { "C MAJOR RUN",     4, 4, 80, {60,62,64,65,67,69,71,72,71,69,67,65,64,62,60, 0} },
+    { "AM ARPEGGIO",     5, 4, 45, {57,60,64,69,57,60,64,69,57,60,64,69,57,60,64,69} },
+    { "OCTAVE BASSLINE", 3, 2, 60, {36, 0,36, 0,48, 0,36, 0,36, 0,36, 0,48, 0,36, 0} },
+    { "ACID 303 LINE",   3, 2, 55, {45,45, 0,48,45, 0,52,45, 0,43,45, 0,48,52,45, 0} },
+    { "MIN PENTATONIC",  6, 4, 70, {60,63,65,67,70,67,65,63,60,63,65,67,70,72,70,67} },
+    { "CHROMATIC RISE",  4, 4, 75, {60,61,62,63,64,65,66,67,68,69,70,71,72,71,70,69} },
+    { "TRANCE ARP E",    5, 4, 40, {64,67,71,76,71,67,64,67,71,76,71,67,64,67,71,76} },
+    { "REGGAETON STAB",  6, 4, 30, {60, 0, 0,60,60, 0, 0,60,60, 0, 0,60,60, 0,60, 0} },
+};
+
 static void melody_presets_load_from_disk(void) {
     memset(s_melody_presets, 0, sizeof(s_melody_presets));
     for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
@@ -16045,7 +16069,23 @@ static void melody_presets_load_from_disk(void) {
         s_melody_presets[i].gatePercent = 55;
     }
     File f = SPIFFS.open(MELODY_PRESETS_FILE, FILE_READ);
-    if (!f) return;
+    if (!f) {
+        for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
+            const MelodyPresetDefault& d = MELODY_PRESET_FACTORY[i];
+            MelodyPresetSlot& s = s_melody_presets[i];
+            s.used = true;
+            strncpy(s.name, d.name, sizeof(s.name) - 1);
+            s.engine = d.engine;
+            s.octave = d.octave;
+            s.gatePercent = d.gatePercent;
+            for (int c = 0; c < 16; c++) {
+                s.notes[c][0] = d.notes[c];
+                s.grid[c][0]  = d.notes[c] > 0;
+            }
+        }
+        melody_presets_save_to_disk();
+        return;
+    }
     char line[160];
     for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
         if (!fs_read_line(f, line, sizeof(line))) break;
@@ -16102,11 +16142,12 @@ static void melody_preset_save_current(int slot) {
     ui_show_toast("Preset de melodia guardado", RED808_SUCCESS);
 }
 
-static void melody_preset_recall(int slot) {
+// silent=true — see filter_preset_recall's comment above; same reasoning.
+static void melody_preset_recall(int slot, bool silent = false) {
     if (slot < 0 || slot >= MELODY_PRESET_COUNT) return;
     const MelodyPresetSlot& s = s_melody_presets[slot];
     if (!s.used) {
-        ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
+        if (!silent) ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
         return;
     }
     memcpy(s_piano_rec_grid, s.grid, sizeof(s_piano_rec_grid));
@@ -16119,10 +16160,12 @@ static void melody_preset_recall(int slot) {
     for (int i = 0; i < PIANO_ENGINE_COUNT; i++) {
         if (PIANO_ENGINES[i] == s.engine) { s_piano_engine_idx = i; break; }
     }
-    piano_refresh_engine_chips();
-    piano_refresh_engine_presets();
-    piano_grid_refresh_all();
-    ui_show_toast("Preset de melodia cargado", RED808_SUCCESS);
+    if (active_screen == 10) {
+        piano_refresh_engine_chips();
+        piano_refresh_engine_presets();
+        piano_grid_refresh_all();
+    }
+    if (!silent) ui_show_toast("Preset de melodia cargado", RED808_SUCCESS);
 }
 
 static void melody_preset_slot_clicked_cb(lv_event_t* e) {
@@ -16651,9 +16694,9 @@ static void matrix_highlight_refresh(void) {
 static void matrix_apply_column(uint8_t idx) {
     MatrixStepEntry e{};
     if (!control_matrix_get_entry(idx, &e)) return;
-    if (e.filterPreset >= 0) filter_preset_recall(e.filterPreset);
-    if (e.mixerPreset  >= 0) mixer_preset_recall(e.mixerPreset);
-    if (e.melodyPreset >= 0) melody_preset_recall(e.melodyPreset);
+    if (e.filterPreset >= 0) filter_preset_recall(e.filterPreset, true);
+    if (e.mixerPreset  >= 0) mixer_preset_recall(e.mixerPreset, true);
+    if (e.melodyPreset >= 0) melody_preset_recall(e.melodyPreset, true);
     s_matrix_active_col = (idx < MATRIX_MAX_STEPS) ? s_matrix_chain_to_col[idx] : -1;
     if (s_matrix_modal) matrix_highlight_refresh();
     matrix_status_refresh();
@@ -16691,9 +16734,9 @@ static void matrix_play_btn_cb(lv_event_t* e) {
     control_matrix_upload(entries, count);
     // The bar-clock only handles columns AFTER the first — apply column 0
     // immediately so hitting PLAY has an instant effect.
-    if (entries[0].filterPreset >= 0) filter_preset_recall(entries[0].filterPreset);
-    if (entries[0].mixerPreset  >= 0) mixer_preset_recall(entries[0].mixerPreset);
-    if (entries[0].melodyPreset >= 0) melody_preset_recall(entries[0].melodyPreset);
+    if (entries[0].filterPreset >= 0) filter_preset_recall(entries[0].filterPreset, true);
+    if (entries[0].mixerPreset  >= 0) mixer_preset_recall(entries[0].mixerPreset, true);
+    if (entries[0].melodyPreset >= 0) melody_preset_recall(entries[0].melodyPreset, true);
     control_send_select_pattern(entries[0].pattern);
     if (!p4.is_playing) control_send_start();
     control_matrix_set_active(true);
