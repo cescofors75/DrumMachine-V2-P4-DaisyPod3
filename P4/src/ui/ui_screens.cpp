@@ -1023,26 +1023,46 @@ static int8_t s_xtra_wave_max[4][96] = {};
 static int8_t s_xtra_wave_min[4][96] = {};
 static uint8_t s_xtra_wave_count[4] = {};
 
-// ── XTRA PAGES: one page per subfolder of /data/xtra on Daisy's own SD ─────
+// ── XTRA PAGES: one page per folder (at any depth) under /data/xtra on
+// Daisy's own SD that directly contains at least one WAV ───────────────────
 // Page 0 ("DEFAULT") is whatever loose WAVs sit directly in /data/xtra (the
 // folder's original flat layout, kept working exactly as before this was
-// added). Each subfolder found under it becomes one more page; switching
-// pages swaps what's loaded on the 4 backing pads (16-19) for the files
-// found in that folder, in directory order. Building a new page is manual —
-// Daisy can only read its SD card over this link, not write to it — so
-// "add more" means copying a folder with up to 4 WAVs onto the card and
-// pressing RESCAN, not creating one from the UI.
-#define XTRA_PAGE_MAX 9
-static char     s_xtra_page_names[XTRA_PAGE_MAX][32] = {};
+// added). RESCAN walks the tree under /data/xtra breadth-first, up to
+// XTRA_SCAN_MAX_DEPTH levels deep, and any folder it finds containing a WAV
+// becomes one more page (e.g. a folder "HOUSE/KICKS" with WAVs directly in
+// it shows as its own page even though it's two levels down) — a folder
+// with only subfolders and no WAVs of its own is walked through but not
+// added as a page. Switching pages (PREV/NEXT) swaps what's loaded on the
+// 4 backing pads (16-19) for the files found in that folder, in directory
+// order. Building a new page is manual — Daisy can only read its SD card
+// over this link, not write to it — so "add more" means copying a folder
+// with up to 4 WAVs somewhere under /data/xtra and pressing RESCAN, not
+// creating one from the UI.
+#define XTRA_PAGE_MAX        9   // DEFAULT + up to 8 discovered pages
+#define XTRA_SCAN_MAX_DEPTH  3   // xtra/A, xtra/A/B, xtra/A/B/C
+#define XTRA_SCAN_MAX_VISITS 24  // folders inspected per RESCAN, across all depths
+static char     s_xtra_page_names[XTRA_PAGE_MAX][40] = {};
 static int      s_xtra_page_count = 1;   // DEFAULT always exists
 static int      s_xtra_page_index = 0;
-static uint32_t s_xtra_seen_folder_rev = 0;
-static uint32_t s_xtra_seen_file_rev = 0;
-enum XtraPageReq { XTRA_PAGE_REQ_NONE = 0, XTRA_PAGE_REQ_FOLDERS, XTRA_PAGE_REQ_FILES };
+static uint32_t s_xtra_seen_rev = 0;
+enum XtraPageReq {
+    XTRA_PAGE_REQ_NONE = 0,
+    XTRA_PAGE_REQ_ROOT_FOLDERS,  // listing /data/xtra's direct subfolders (seeds the scan queue)
+    XTRA_PAGE_REQ_ITEM_FILES,    // does the scan queue's current folder hold any WAV directly?
+    XTRA_PAGE_REQ_ITEM_FOLDERS,  // listing that folder's own subfolders, to keep walking down
+    XTRA_PAGE_REQ_FILES,         // loading the user-selected active page's files onto pads 16-19
+};
 static XtraPageReq s_xtra_page_req = XTRA_PAGE_REQ_NONE;
 static lv_obj_t* s_xtra_page_lbl = NULL;
 static lv_obj_t* s_xtra_page_prev_btn = NULL;
 static lv_obj_t* s_xtra_page_next_btn = NULL;
+
+// Breadth-first scan queue: each item is a folder path relative to
+// /data/xtra (e.g. "HOUSE" or "HOUSE/KICKS"), not yet checked for WAVs.
+struct XtraScanItem { char path[40]; uint8_t depth; };
+static XtraScanItem s_xtra_scan_queue[XTRA_SCAN_MAX_VISITS];
+static int s_xtra_scan_count = 0;  // items pushed so far
+static int s_xtra_scan_idx   = 0;  // next item index to process
 
 static const uint8_t XTRA_SYNTH_ENGINE_CODES[7] = {0, 1, 2, 3, 4, 5, 6};
 static const char* XTRA_SYNTH_ENGINE_NAMES[7] = {"808", "909", "505", "303", "WT", "SH101", "FM2"};
@@ -1639,7 +1659,7 @@ static void xtra_page_request_files(int pageIdx) {
     s_xtra_page_index = pageIdx;
     xtra_page_refresh_label();
     if (!ui_control_available()) return;
-    char folder[40];
+    char folder[48];
     xtra_page_folder_path(pageIdx, folder, sizeof(folder));
     SdListFilesPayload payload = {};
     strncpy(payload.folderName, folder, sizeof(payload.folderName) - 1);
@@ -1650,13 +1670,65 @@ static void xtra_page_request_files(int pageIdx) {
     }
 }
 
-// Requests the list of /data/xtra subfolders from Daisy's own SD card (one
-// page per folder found; page 0 stays the flat /data/xtra root). Called on
-// entry to the XTRAPADS screen and by the RESCAN button — never creates a
-// folder, only discovers what the user already copied onto the card.
+// Queues one more folder (relative to /data/xtra) to inspect during the
+// current RESCAN walk. Silently drops it once XTRA_SCAN_MAX_VISITS is hit —
+// a safety cap, not something a normal-sized sample library should reach.
+static void xtra_scan_push(const char* parentPath, const char* name, uint8_t depth) {
+    if (s_xtra_scan_count >= XTRA_SCAN_MAX_VISITS) return;
+    XtraScanItem& it = s_xtra_scan_queue[s_xtra_scan_count];
+    if (parentPath && parentPath[0])
+        snprintf(it.path, sizeof(it.path), "%s/%s", parentPath, name);
+    else {
+        strncpy(it.path, name, sizeof(it.path) - 1);
+        it.path[sizeof(it.path) - 1] = '\0';
+    }
+    it.depth = depth;
+    s_xtra_scan_count++;
+}
+
+// Asks Daisy whether the scan queue's current folder holds any WAV directly
+// — the answer decides if it becomes a page (see the ITEM_FILES branch in
+// xtra_pages_poll below).
+static void xtra_scan_request_item_files(void) {
+    const XtraScanItem& it = s_xtra_scan_queue[s_xtra_scan_idx];
+    char folder[48];
+    snprintf(folder, sizeof(folder), "xtra/%s", it.path);
+    SdListFilesPayload payload = {};
+    strncpy(payload.folderName, folder, sizeof(payload.folderName) - 1);
+    if (daisyUsb.send(CMD_SD_LIST_FILES, &payload, sizeof(payload))) {
+        s_xtra_page_req = XTRA_PAGE_REQ_ITEM_FILES;
+    } else {
+        s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+        xtra_page_refresh_label();
+    }
+}
+
+// Moves on to the next unprocessed item in the scan queue, or ends the walk
+// once the queue is exhausted or the page list is full.
+static void xtra_scan_advance(void) {
+    s_xtra_scan_idx++;
+    if (s_xtra_scan_idx >= s_xtra_scan_count || s_xtra_page_count >= XTRA_PAGE_MAX) {
+        s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+        if (s_xtra_page_index >= s_xtra_page_count) s_xtra_page_index = 0;
+        xtra_page_refresh_label();
+        return;
+    }
+    xtra_scan_request_item_files();
+}
+
+// Requests the list of /data/xtra's direct subfolders from Daisy's own SD
+// card, then breadth-first walks down from there (see the header comment on
+// the XTRA PAGES state block above) — one page per folder actually holding
+// a WAV, at any depth up to XTRA_SCAN_MAX_DEPTH. Called on entry to the
+// XTRAPADS screen and by the RESCAN button — read-only, never creates a
+// folder and never touches what's currently loaded on pads 16-19; only
+// PREV/NEXT (xtra_page_go) does that.
 static void xtra_pages_request_folders(void) {
     strncpy(s_xtra_page_names[0], "DEFAULT", sizeof(s_xtra_page_names[0]) - 1);
     s_xtra_page_names[0][sizeof(s_xtra_page_names[0]) - 1] = '\0';
+    s_xtra_page_count = 1;
+    s_xtra_scan_count = 0;
+    s_xtra_scan_idx = 0;
     if (!ui_control_available()) {
         xtra_page_refresh_label();
         return;
@@ -1664,7 +1736,7 @@ static void xtra_pages_request_folders(void) {
     SdListFilesPayload payload = {};
     strncpy(payload.folderName, "xtra", sizeof(payload.folderName) - 1);
     if (daisyUsb.send(CMD_SD_LIST_FOLDERS, &payload, sizeof(payload))) {
-        s_xtra_page_req = XTRA_PAGE_REQ_FOLDERS;
+        s_xtra_page_req = XTRA_PAGE_REQ_ROOT_FOLDERS;
     } else {
         ui_show_toast("Daisy USB no disponible", RED808_WARNING);
     }
@@ -1684,35 +1756,64 @@ static void xtra_page_go(int delta) {
 // buffers it reads are a single shared slot also written by the SD CARD
 // screen's own Daisy-SD browser, so this only runs while that other screen
 // isn't the active one — same revision-counter pattern that screen uses.
+// Only one request is ever in flight at a time (each step waits for its
+// response before firing the next), so one "have I seen this yet" revision
+// counter is enough to cover all four request kinds below.
 static void xtra_pages_poll(void) {
     if (s_xtra_page_req == XTRA_PAGE_REQ_NONE || !ui_control_available()) return;
     const auto& state = daisyUsb.state();
+    if (state.daisy_sd_revision == s_xtra_seen_rev) return;
+    s_xtra_seen_rev = state.daisy_sd_revision;
 
-    if (s_xtra_page_req == XTRA_PAGE_REQ_FOLDERS) {
-        if (state.daisy_sd_revision == s_xtra_seen_folder_rev) return;
-        s_xtra_seen_folder_rev = state.daisy_sd_revision;
-        s_xtra_page_req = XTRA_PAGE_REQ_NONE;
-
+    if (s_xtra_page_req == XTRA_PAGE_REQ_ROOT_FOLDERS) {
         int count = state.daisy_sd_folder_count;
-        if (count > XTRA_PAGE_MAX - 1) count = XTRA_PAGE_MAX - 1;
-        s_xtra_page_count = 1;
-        for (int i = 0; i < count; i++) {
-            strncpy(s_xtra_page_names[s_xtra_page_count], state.daisy_sd_folders[i],
+        for (int i = 0; i < count; i++)
+            xtra_scan_push("", state.daisy_sd_folders[i], 1);
+        if (s_xtra_scan_count == 0) {
+            s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+            if (s_xtra_page_index >= s_xtra_page_count) s_xtra_page_index = 0;
+            xtra_page_refresh_label();
+            return;
+        }
+        s_xtra_scan_idx = 0;
+        xtra_scan_request_item_files();
+        return;
+    }
+
+    if (s_xtra_page_req == XTRA_PAGE_REQ_ITEM_FILES) {
+        const XtraScanItem it = s_xtra_scan_queue[s_xtra_scan_idx];  // copy: push() below may not touch it, but keep it stable regardless
+        if (state.daisy_sd_file_count > 0 && s_xtra_page_count < XTRA_PAGE_MAX) {
+            strncpy(s_xtra_page_names[s_xtra_page_count], it.path,
                     sizeof(s_xtra_page_names[0]) - 1);
             s_xtra_page_names[s_xtra_page_count][sizeof(s_xtra_page_names[0]) - 1] = '\0';
             s_xtra_page_count++;
         }
-        if (s_xtra_page_index >= s_xtra_page_count) s_xtra_page_index = 0;
-        xtra_page_request_files(s_xtra_page_index);
+        if (it.depth < XTRA_SCAN_MAX_DEPTH && s_xtra_page_count < XTRA_PAGE_MAX) {
+            char folder[48];
+            snprintf(folder, sizeof(folder), "xtra/%s", it.path);
+            SdListFilesPayload payload = {};
+            strncpy(payload.folderName, folder, sizeof(payload.folderName) - 1);
+            if (daisyUsb.send(CMD_SD_LIST_FOLDERS, &payload, sizeof(payload))) {
+                s_xtra_page_req = XTRA_PAGE_REQ_ITEM_FOLDERS;
+                return;
+            }
+        }
+        xtra_scan_advance();
         return;
     }
 
-    // XTRA_PAGE_REQ_FILES
-    if (state.daisy_sd_revision == s_xtra_seen_file_rev) return;
-    s_xtra_seen_file_rev = state.daisy_sd_revision;
-    s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+    if (s_xtra_page_req == XTRA_PAGE_REQ_ITEM_FOLDERS) {
+        const XtraScanItem it = s_xtra_scan_queue[s_xtra_scan_idx];
+        int count = state.daisy_sd_folder_count;
+        for (int i = 0; i < count; i++)
+            xtra_scan_push(it.path, state.daisy_sd_folders[i], it.depth + 1);
+        xtra_scan_advance();
+        return;
+    }
 
-    char folder[40];
+    // XTRA_PAGE_REQ_FILES — a user-triggered PREV/NEXT page load onto pads 16-19
+    s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+    char folder[48];
     xtra_page_folder_path(s_xtra_page_index, folder, sizeof(folder));
     int count = state.daisy_sd_file_count;
     if (count > 4) count = 4;
