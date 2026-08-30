@@ -977,6 +977,7 @@ static lv_obj_t* s_pod_led_function_labels[2] = {};
 static lv_obj_t* s_pod_led_color_labels[2] = {};
 static PodConfigPayload s_pod_config = {};
 static uint32_t s_pod_seen_revision = 0;
+static lv_obj_t* pod_overlay_back_button(lv_obj_t* parent, lv_event_cb_t cb);
 static void pod_status_modal_close_cb(lv_event_t* e);
 static void pod_control_map_modal_close_cb(lv_event_t* e);
 static void pod_control_map_modal_show(void);
@@ -2622,31 +2623,30 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
         s_pad_kit_pending[i]  = s_pad_kit_assigned[i];
     }
 
+    // Fullscreen solid background + corner back button, same convention as
+    // STATUS/MATRIX, instead of the old dim-backdrop-behind-a-floating-card
+    // look. "card" keeps its original local padding/coordinate system (14px
+    // pad, same origin) so every position below stays unchanged — it just
+    // fills nearly the whole screen now instead of a small centered panel.
     s_pad_inst_modal = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_pad_inst_modal, LV_HOR_RES, LV_VER_RES);
-    lv_obj_set_style_bg_color(s_pad_inst_modal, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_pad_inst_modal, LV_OPA_70, 0);
+    lv_obj_set_style_bg_color(s_pad_inst_modal, RED808_BG, 0);
+    lv_obj_set_style_bg_opa(s_pad_inst_modal, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_pad_inst_modal, 0, 0);
     lv_obj_set_style_pad_all(s_pad_inst_modal, 0, 0);
     lv_obj_clear_flag(s_pad_inst_modal, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(s_pad_inst_modal, pad_inst_modal_close_cb, LV_EVENT_CLICKED, NULL);
+    pod_overlay_back_button(s_pad_inst_modal, pad_inst_modal_close_cb);
 
     lv_obj_t* card = lv_obj_create(s_pad_inst_modal);
-    lv_obj_set_size(card, 984, 560);
-    lv_obj_center(card);
-    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
-    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
-    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(card, 2, 0);
-    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
-    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_size(card, 1000, 580);
+    lv_obj_set_pos(card, 12, 10);
+    lv_obj_set_style_bg_opa(card, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_pad_all(card, 14, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t* title = lv_label_create(card);
-    lv_label_set_text(title, "PAD INSTRUMENT SELECT");
+    lv_label_set_text(title, "PAD SOUND");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, RED808_CYAN, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
@@ -2720,20 +2720,27 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
     lv_obj_set_pos(inst_hdr, grid_x0, grid_y0 - 20);
 
     // Fila 0 (Sampler/808/909/505) = "SAMPLE + DRUM", fila 1 (303/WT/FM2/SH101)
-    // = "MELODIC". La franja de color a la izquierda de cada botón hace visible
-    // esa agrupación de un vistazo, en vez de que las 8 casillas se vean iguales.
+    // = "MELODICO". La franja de color a la izquierda de cada botón hace
+    // visible esa agrupación de un vistazo, pero el nombre solo ("MELODIC")
+    // no explicaba la diferencia real: un pad SAMPLE+DRUM siempre dispara el
+    // mismo sonido, un pad MELODICO cambia de nota segun lo que toques (via
+    // MIDI/MPD218 o la propia rejilla) porque lleva un motor de sintesis en
+    // vez de un one-shot. La segunda linea deja eso claro sin abrir nada mas.
     // No 'static' on the colors: RED808_ACCENT2/CYAN resolve the active theme
     // at call time, and a static local would freeze on whatever theme was
     // active the first time this modal opened.
     const lv_color_t inst_row_colors[2] = { RED808_ACCENT2, RED808_CYAN };
-    static const char* inst_row_names[2] = { "SAMPLE + DRUM", "MELODIC" };
+    static const char* inst_row_names[2] = {
+        "SAMPLE + DRUM\nsonido fijo", "MELODICO\ncambia con la nota"
+    };
     for (int row = 0; row < 2; row++) {
         lv_obj_t* rl = lv_label_create(card);
         lv_label_set_text(rl, inst_row_names[row]);
+        lv_obj_set_width(rl, 118);
         lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(rl, inst_row_colors[row], 0);
         lv_obj_set_pos(rl, grid_x0 + grid_cols * (btn_w + gap_x) + 6,
-                        grid_y0 + row * (btn_h + gap_y) + btn_h / 2 - 7);
+                        grid_y0 + row * (btn_h + gap_y) + btn_h / 2 - 14);
     }
 
     for (int i = 0; i < 8; i++) {
