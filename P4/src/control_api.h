@@ -262,6 +262,9 @@ void control_send_synth_param(uint8_t engine, uint8_t instrument,
                               uint8_t parameter, float value);
 void control_send_synth_preset(uint8_t engine, uint8_t preset);
 void control_send_trim_sample(uint8_t pad, float start, float end);
+// Non-destructive fade in/out around the trim window above (0-255ms, 0=off).
+void control_send_set_pad_fade_in(uint8_t pad, uint8_t ms);
+void control_send_set_pad_fade_out(uint8_t pad, uint8_t ms);
 void control_send_melody_rec_note(uint8_t engine, uint8_t note);
 void control_send_melody_assign(uint8_t pad, uint8_t engine, uint8_t octave,
                                 const bool grid[16][12],

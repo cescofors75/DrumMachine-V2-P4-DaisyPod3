@@ -997,6 +997,8 @@ struct XtraPadSlot {
     bool synth_mode;
     uint8_t trim_start_pct;
     uint8_t trim_end_pct;
+    uint8_t fade_in_ms;      // 0-255ms, 0=off — ramps from trim_start
+    uint8_t fade_out_ms;     // 0-255ms, 0=off — ramps into trim_end
     uint16_t gate_ms;
     uint8_t play_mode;       // 0=one shot, 1=tempo-synced repeat
     uint32_t duration_ms;
@@ -1025,9 +1027,13 @@ static lv_obj_t* s_xtra_editor_modal = NULL;
 static lv_obj_t* s_xtra_editor_start = NULL;
 static lv_obj_t* s_xtra_editor_end = NULL;
 static lv_obj_t* s_xtra_editor_gate = NULL;
+static lv_obj_t* s_xtra_editor_fade_in = NULL;
+static lv_obj_t* s_xtra_editor_fade_out = NULL;
 static lv_obj_t* s_xtra_editor_start_lbl = NULL;
 static lv_obj_t* s_xtra_editor_end_lbl = NULL;
 static lv_obj_t* s_xtra_editor_gate_lbl = NULL;
+static lv_obj_t* s_xtra_editor_fade_in_lbl = NULL;
+static lv_obj_t* s_xtra_editor_fade_out_lbl = NULL;
 static lv_obj_t* s_xtra_editor_mode_lbl = NULL;
 static lv_obj_t* s_xtra_editor_wave = NULL;
 static lv_point_t s_xtra_editor_wave_points[192];
@@ -1569,14 +1575,14 @@ static void xtra_save_state(void) {
     if (!f) return;
     for (int i = 0; i < 4; i++) {
         const XtraPadSlot& s = s_xtra_slots[i];
-        f.printf("%d,%u,%s,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u\n",
+        f.printf("%d,%u,%s,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u\n",
                  s.used ? 1 : 0, (unsigned)s.pad, s.name,
                  s.synth_mode ? 1U : 0U, (unsigned)s.synth_engine_idx,
                  (unsigned)s.preset_idx, (unsigned)s.trim_start_pct,
                  (unsigned)s.trim_end_pct, (unsigned)s.gate_ms,
                  (unsigned)s.play_mode, (unsigned long)s.duration_ms,
                  (unsigned long)s.sample_rate, (unsigned)s.channels,
-                 (unsigned)s.bits);
+                 (unsigned)s.bits, (unsigned)s.fade_in_ms, (unsigned)s.fade_out_ms);
     }
     f.close();
     xtra_save_param_state();
@@ -1601,11 +1607,12 @@ static void xtra_load_state(void) {
         unsigned trim_start = 0, trim_end = 100, gate_ms = 180, play_mode = 0;
         unsigned long duration_ms = 0, sample_rate = 0;
         unsigned channels = 0, bits = 0;
+        unsigned fade_in = 0, fade_out = 0;
         int parsed = sscanf(line,
-            "%d,%u,%23[^,],%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u",
+            "%d,%u,%23[^,],%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u",
             &used, &pad, name, &synth_mode, &synth_engine_idx, &preset_idx,
             &trim_start, &trim_end, &gate_ms, &play_mode, &duration_ms,
-            &sample_rate, &channels, &bits);
+            &sample_rate, &channels, &bits, &fade_in, &fade_out);
         if (parsed >= 2) {
             s_xtra_slots[idx].used = (used != 0);
             // Enforce fixed XTRA backing slots (16..19) regardless of legacy file values.
@@ -1627,6 +1634,8 @@ static void xtra_load_state(void) {
             if (parsed >= 12) s_xtra_slots[idx].sample_rate = (uint32_t)sample_rate;
             if (parsed >= 13) s_xtra_slots[idx].channels = (uint8_t)constrain((int)channels, 0, 8);
             if (parsed >= 14) s_xtra_slots[idx].bits = (uint8_t)constrain((int)bits, 0, 32);
+            s_xtra_slots[idx].fade_in_ms = (parsed >= 15) ? (uint8_t)constrain((int)fade_in, 0, 255) : 0;
+            s_xtra_slots[idx].fade_out_ms = (parsed >= 16) ? (uint8_t)constrain((int)fade_out, 0, 255) : 0;
             if (parsed >= 3) {
                 strncpy(s_xtra_slots[idx].name, name, sizeof(s_xtra_slots[idx].name) - 1);
                 s_xtra_slots[idx].name[sizeof(s_xtra_slots[idx].name) - 1] = '\0';
@@ -11189,9 +11198,19 @@ static void xtra_editor_refresh_values(void) {
     int start = s_xtra_editor_start ? lv_slider_get_value(s_xtra_editor_start) : slot.trim_start_pct;
     int end = s_xtra_editor_end ? lv_slider_get_value(s_xtra_editor_end) : slot.trim_end_pct;
     int gate = s_xtra_editor_gate ? lv_slider_get_value(s_xtra_editor_gate) : slot.gate_ms;
+    int fadeIn = s_xtra_editor_fade_in ? lv_slider_get_value(s_xtra_editor_fade_in) : slot.fade_in_ms;
+    int fadeOut = s_xtra_editor_fade_out ? lv_slider_get_value(s_xtra_editor_fade_out) : slot.fade_out_ms;
     if (s_xtra_editor_start_lbl) lv_label_set_text_fmt(s_xtra_editor_start_lbl, "START  %d%%", start);
     if (s_xtra_editor_end_lbl) lv_label_set_text_fmt(s_xtra_editor_end_lbl, "END  %d%%", end);
     if (s_xtra_editor_gate_lbl) lv_label_set_text_fmt(s_xtra_editor_gate_lbl, "GATE  %d ms", gate);
+    if (s_xtra_editor_fade_in_lbl) {
+        if (fadeIn == 0) lv_label_set_text(s_xtra_editor_fade_in_lbl, "FADE IN  OFF");
+        else lv_label_set_text_fmt(s_xtra_editor_fade_in_lbl, "FADE IN  %d ms", fadeIn);
+    }
+    if (s_xtra_editor_fade_out_lbl) {
+        if (fadeOut == 0) lv_label_set_text(s_xtra_editor_fade_out_lbl, "FADE OUT  OFF");
+        else lv_label_set_text_fmt(s_xtra_editor_fade_out_lbl, "FADE OUT  %d ms", fadeOut);
+    }
     if (s_xtra_editor_mode_lbl) {
         lv_label_set_text(s_xtra_editor_mode_lbl,
             slot.play_mode == 1 ? "SYNC REPEAT" : "ONE SHOT");
@@ -11218,9 +11237,13 @@ static void xtra_editor_close_cb(lv_event_t* e) {
     s_xtra_editor_start = NULL;
     s_xtra_editor_end = NULL;
     s_xtra_editor_gate = NULL;
+    s_xtra_editor_fade_in = NULL;
+    s_xtra_editor_fade_out = NULL;
     s_xtra_editor_start_lbl = NULL;
     s_xtra_editor_end_lbl = NULL;
     s_xtra_editor_gate_lbl = NULL;
+    s_xtra_editor_fade_in_lbl = NULL;
+    s_xtra_editor_fade_out_lbl = NULL;
     s_xtra_editor_mode_lbl = NULL;
     s_xtra_editor_wave = NULL;
     s_xtra_editor_slot = -1;
@@ -11252,14 +11275,20 @@ static void xtra_editor_apply_cb(lv_event_t* e) {
     int start = s_xtra_editor_start ? lv_slider_get_value(s_xtra_editor_start) : 0;
     int end = s_xtra_editor_end ? lv_slider_get_value(s_xtra_editor_end) : 100;
     int gate = s_xtra_editor_gate ? lv_slider_get_value(s_xtra_editor_gate) : 180;
+    int fadeIn = s_xtra_editor_fade_in ? lv_slider_get_value(s_xtra_editor_fade_in) : 0;
+    int fadeOut = s_xtra_editor_fade_out ? lv_slider_get_value(s_xtra_editor_fade_out) : 0;
     slot.gate_ms = (uint16_t)constrain(gate, 40, 2000);
     slot.trim_start_pct = (uint8_t)constrain(start, 0, 95);
     slot.trim_end_pct = (uint8_t)constrain(end, 5, 100);
+    slot.fade_in_ms = (uint8_t)constrain(fadeIn, 0, 255);
+    slot.fade_out_ms = (uint8_t)constrain(fadeOut, 0, 255);
     // Non-destructive on Daisy (CMD_PAD_TRIM applies start/end at trigger
     // time — never rewrites the uploaded PCM), so the sliders keep showing
     // exactly what's active instead of resetting to 0/100 as if consumed.
     if (!slot.synth_mode) {
         control_send_trim_sample(slot.pad, start / 100.0f, end / 100.0f);
+        control_send_set_pad_fade_in(slot.pad, slot.fade_in_ms);
+        control_send_set_pad_fade_out(slot.pad, slot.fade_out_ms);
         ui_show_toast("Trim aplicado al sample", theme_success());
     } else {
         ui_show_toast("Ajustes XTRA guardados", theme_success());
@@ -11292,7 +11321,7 @@ static void xtra_editor_open(int slot_idx) {
     lv_obj_clear_flag(s_xtra_editor_modal, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t* card = lv_obj_create(s_xtra_editor_modal);
-    lv_obj_set_size(card, 900, 516);
+    lv_obj_set_size(card, 900, 566);
     lv_obj_center(card);
     lv_obj_set_style_radius(card, 18, 0);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
@@ -11373,9 +11402,14 @@ static void xtra_editor_open(int slot_idx) {
         lv_obj_set_style_bg_color(*out, lv_color_white(), LV_PART_KNOB);
         lv_obj_add_event_cb(*out, xtra_editor_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     };
-    make_slider(264, 0, 95, slot.trim_start_pct, &s_xtra_editor_start, &s_xtra_editor_start_lbl);
-    make_slider(318, 5, 100, slot.trim_end_pct, &s_xtra_editor_end, &s_xtra_editor_end_lbl);
-    make_slider(372, 40, 2000, slot.gate_ms, &s_xtra_editor_gate, &s_xtra_editor_gate_lbl);
+    make_slider(256, 0, 95, slot.trim_start_pct, &s_xtra_editor_start, &s_xtra_editor_start_lbl);
+    make_slider(300, 5, 100, slot.trim_end_pct, &s_xtra_editor_end, &s_xtra_editor_end_lbl);
+    make_slider(344, 40, 2000, slot.gate_ms, &s_xtra_editor_gate, &s_xtra_editor_gate_lbl);
+    // Fade in/out — click-free ramps around the trim window's own edges
+    // (see control_send_set_pad_fade_in/out); 0ms = off, same convention
+    // as every other macro-style FX in this app.
+    make_slider(388, 0, 255, slot.fade_in_ms, &s_xtra_editor_fade_in, &s_xtra_editor_fade_in_lbl);
+    make_slider(432, 0, 255, slot.fade_out_ms, &s_xtra_editor_fade_out, &s_xtra_editor_fade_out_lbl);
 
     lv_obj_t* mode_btn = piano_make_chip(card, 712, 252, 164, 54,
                                          slot.play_mode == 1 ? "SYNC REPEAT" : "ONE SHOT");
@@ -11387,12 +11421,12 @@ static void xtra_editor_open(int slot_idx) {
     lv_obj_set_style_border_color(preview, theme_success(), 0);
     lv_obj_add_event_cb(preview, xtra_editor_preview_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* apply = piano_make_chip(card, 24, 444, 180, 52, "APPLY / TRIM");
+    lv_obj_t* apply = piano_make_chip(card, 24, 486, 180, 52, "APPLY / TRIM");
     lv_obj_set_style_border_color(apply, xtra_slot_color(slot_idx), 0);
     lv_obj_add_event_cb(apply, xtra_editor_apply_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t* load = piano_make_chip(card, 220, 444, 180, 52, "LOAD NEW WAV");
+    lv_obj_t* load = piano_make_chip(card, 220, 486, 180, 52, "LOAD NEW WAV");
     lv_obj_add_event_cb(load, xtra_editor_load_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t* close = piano_make_chip(card, 708, 444, 168, 52, "CLOSE");
+    lv_obj_t* close = piano_make_chip(card, 708, 486, 168, 52, "CLOSE");
     lv_obj_add_event_cb(close, xtra_editor_close_cb, LV_EVENT_CLICKED, NULL);
     xtra_editor_refresh_values();
 }
@@ -14094,7 +14128,16 @@ static lv_obj_t*  s_pad_trim_start_slider = NULL;
 static lv_obj_t*  s_pad_trim_end_slider   = NULL;
 static lv_obj_t*  s_pad_trim_start_lbl    = NULL;
 static lv_obj_t*  s_pad_trim_end_lbl      = NULL;
+static lv_obj_t*  s_pad_trim_fade_in_slider  = NULL;
+static lv_obj_t*  s_pad_trim_fade_out_slider = NULL;
+static lv_obj_t*  s_pad_trim_fade_in_lbl     = NULL;
+static lv_obj_t*  s_pad_trim_fade_out_lbl    = NULL;
 static int        s_pad_trim_editor_pad   = -1;
+// Fade in/out per main pad (0-255ms, 0=off) — same non-persisted, in-memory
+// treatment as s_pad_trim_start_pct/end_pct above (no SPIFFS file for main-
+// pad trim exists today), sent via CMD_PAD_FADE_IN/OUT alongside CMD_PAD_TRIM.
+static uint8_t s_pad_fade_in_ms[16] = {};
+static uint8_t s_pad_fade_out_ms[16] = {};
 
 static void pad_trim_editor_refresh_values(void) {
     if (s_pad_trim_editor_pad < 0) return;
@@ -14102,8 +14145,20 @@ static void pad_trim_editor_refresh_values(void) {
                                         : s_pad_trim_start_pct[s_pad_trim_editor_pad];
     int end = s_pad_trim_end_slider ? lv_slider_get_value(s_pad_trim_end_slider)
                                     : s_pad_trim_end_pct[s_pad_trim_editor_pad];
+    int fadeIn = s_pad_trim_fade_in_slider ? lv_slider_get_value(s_pad_trim_fade_in_slider)
+                                           : s_pad_fade_in_ms[s_pad_trim_editor_pad];
+    int fadeOut = s_pad_trim_fade_out_slider ? lv_slider_get_value(s_pad_trim_fade_out_slider)
+                                             : s_pad_fade_out_ms[s_pad_trim_editor_pad];
     if (s_pad_trim_start_lbl) lv_label_set_text_fmt(s_pad_trim_start_lbl, "START  %d%%", start);
     if (s_pad_trim_end_lbl) lv_label_set_text_fmt(s_pad_trim_end_lbl, "END  %d%%", end);
+    if (s_pad_trim_fade_in_lbl) {
+        if (fadeIn == 0) lv_label_set_text(s_pad_trim_fade_in_lbl, "FADE IN  OFF");
+        else lv_label_set_text_fmt(s_pad_trim_fade_in_lbl, "FADE IN  %d ms", fadeIn);
+    }
+    if (s_pad_trim_fade_out_lbl) {
+        if (fadeOut == 0) lv_label_set_text(s_pad_trim_fade_out_lbl, "FADE OUT  OFF");
+        else lv_label_set_text_fmt(s_pad_trim_fade_out_lbl, "FADE OUT  %d ms", fadeOut);
+    }
 }
 
 static void pad_trim_slider_cb(lv_event_t* e) {
@@ -14127,6 +14182,10 @@ static void pad_trim_editor_close_cb(lv_event_t* e) {
     s_pad_trim_end_slider = NULL;
     s_pad_trim_start_lbl = NULL;
     s_pad_trim_end_lbl = NULL;
+    s_pad_trim_fade_in_slider = NULL;
+    s_pad_trim_fade_out_slider = NULL;
+    s_pad_trim_fade_in_lbl = NULL;
+    s_pad_trim_fade_out_lbl = NULL;
     s_pad_trim_editor_pad = -1;
 }
 
@@ -14142,10 +14201,16 @@ static void pad_trim_apply_cb(lv_event_t* e) {
     int pad = s_pad_trim_editor_pad;
     int start = s_pad_trim_start_slider ? lv_slider_get_value(s_pad_trim_start_slider) : 0;
     int end = s_pad_trim_end_slider ? lv_slider_get_value(s_pad_trim_end_slider) : 100;
+    int fadeIn = s_pad_trim_fade_in_slider ? lv_slider_get_value(s_pad_trim_fade_in_slider) : 0;
+    int fadeOut = s_pad_trim_fade_out_slider ? lv_slider_get_value(s_pad_trim_fade_out_slider) : 0;
     s_pad_trim_start_pct[pad] = (uint8_t)constrain(start, 0, 95);
     s_pad_trim_end_pct[pad] = (uint8_t)constrain(end, 5, 100);
+    s_pad_fade_in_ms[pad] = (uint8_t)constrain(fadeIn, 0, 255);
+    s_pad_fade_out_ms[pad] = (uint8_t)constrain(fadeOut, 0, 255);
     control_send_trim_sample((uint8_t)pad, s_pad_trim_start_pct[pad] / 100.0f,
                              s_pad_trim_end_pct[pad] / 100.0f);
+    control_send_set_pad_fade_in((uint8_t)pad, s_pad_fade_in_ms[pad]);
+    control_send_set_pad_fade_out((uint8_t)pad, s_pad_fade_out_ms[pad]);
     ui_show_toast("Trim aplicado al pad", theme_success());
 }
 
@@ -14166,7 +14231,7 @@ static void pad_trim_editor_open(int pad) {
     lv_color_t accent = lv_color_hex(theme_presets[ui_theme_index()].track_colors[pad]);
 
     lv_obj_t* card = lv_obj_create(s_pad_trim_modal);
-    lv_obj_set_size(card, 900, 420);
+    lv_obj_set_size(card, 900, 500);
     lv_obj_center(card);
     lv_obj_set_style_radius(card, 18, 0);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
@@ -14234,24 +14299,29 @@ static void pad_trim_editor_open(int pad) {
         lv_obj_set_style_bg_color(*out, lv_color_white(), LV_PART_KNOB);
         lv_obj_add_event_cb(*out, pad_trim_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     };
-    make_slider(244, 0, 95, s_pad_trim_start_pct[pad], &s_pad_trim_start_slider, &s_pad_trim_start_lbl);
-    make_slider(298, 5, 100, s_pad_trim_end_pct[pad], &s_pad_trim_end_slider, &s_pad_trim_end_lbl);
+    make_slider(236, 0, 95, s_pad_trim_start_pct[pad], &s_pad_trim_start_slider, &s_pad_trim_start_lbl);
+    make_slider(280, 5, 100, s_pad_trim_end_pct[pad], &s_pad_trim_end_slider, &s_pad_trim_end_lbl);
+    // Fade in/out — click-free ramps around the trim window's own edges.
+    make_slider(324, 0, 255, s_pad_fade_in_ms[pad], &s_pad_trim_fade_in_slider, &s_pad_trim_fade_in_lbl);
+    make_slider(368, 0, 255, s_pad_fade_out_ms[pad], &s_pad_trim_fade_out_slider, &s_pad_trim_fade_out_lbl);
 
     lv_obj_t* preview = piano_make_chip(card, 712, 232, 164, 54, "PREVIEW");
     lv_obj_set_style_border_color(preview, theme_success(), 0);
     lv_obj_add_event_cb(preview, pad_trim_preview_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* apply = piano_make_chip(card, 24, 344, 200, 52, "APLICAR TRIM");
+    lv_obj_t* apply = piano_make_chip(card, 24, 422, 200, 52, "APLICAR TRIM");
     lv_obj_set_style_border_color(apply, accent, 0);
     lv_obj_add_event_cb(apply, pad_trim_apply_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t* reset = piano_make_chip(card, 240, 344, 160, 52, "RESET");
+    lv_obj_t* reset = piano_make_chip(card, 240, 422, 160, 52, "RESET");
     lv_obj_add_event_cb(reset, [](lv_event_t*) {
         if (s_pad_trim_editor_pad < 0) return;
         if (s_pad_trim_start_slider) lv_slider_set_value(s_pad_trim_start_slider, 0, LV_ANIM_OFF);
         if (s_pad_trim_end_slider) lv_slider_set_value(s_pad_trim_end_slider, 100, LV_ANIM_OFF);
+        if (s_pad_trim_fade_in_slider) lv_slider_set_value(s_pad_trim_fade_in_slider, 0, LV_ANIM_OFF);
+        if (s_pad_trim_fade_out_slider) lv_slider_set_value(s_pad_trim_fade_out_slider, 0, LV_ANIM_OFF);
         pad_trim_editor_refresh_values();
     }, LV_EVENT_CLICKED, NULL);
-    lv_obj_t* close = piano_make_chip(card, 708, 344, 168, 52, "CERRAR");
+    lv_obj_t* close = piano_make_chip(card, 708, 422, 168, 52, "CERRAR");
     lv_obj_add_event_cb(close, pad_trim_editor_close_cb, LV_EVENT_CLICKED, NULL);
 
     pad_trim_editor_refresh_values();

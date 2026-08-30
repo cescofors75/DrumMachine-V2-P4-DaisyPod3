@@ -393,6 +393,8 @@ static inline void DspProfBlockDone() {}
 #define CMD_PAD_TURNTABLISM   0x79
 #define CMD_PAD_CLEAR_FX      0x7A
 #define CMD_PAD_TRIM          0x7B  // [pad(1), startPct(1), endPct(1)] 0-100, non-destructive
+#define CMD_PAD_FADE_IN       0x7C  // [pad(1), ms(1)] 0-255ms ramp from the trim start, 0=off
+#define CMD_PAD_FADE_OUT      0x7D  // [pad(1), ms(1)] 0-255ms ramp into the trim end, 0=off
 
 /* Sidechain */
 #define CMD_SIDECHAIN_SET     0x90
@@ -733,6 +735,12 @@ static uint32_t sampleCapacitySamples[MAX_PADS];
  * for one file can never misapply to a differently-sized one. */
 static float padTrimStartPct[MAX_PADS];
 static float padTrimEndPct[MAX_PADS];
+/* Non-destructive fade in/out around the trim window above, in ms (0-255,
+ * 0=off). Unlike trim these are pure time durations, not fractions of
+ * sampleLength[pad], so they stay valid across a new WAV load and are
+ * never reset by CMD_SAMPLE_END/CMD_SAMPLE_UNLOAD the way trim is. */
+static float padFadeInMs[MAX_PADS];
+static float padFadeOutMs[MAX_PADS];
 /* volatile: the ISR (AudioCallback/TriggerPad) gates every read of
  * sampleStorage/sampleLength/sampleOffsetSamples on this flag. Main-loop
  * loaders (CMD_SAMPLE_END, LoadWavToPad, the QSPI boot loader) __DMB()
@@ -906,6 +914,8 @@ struct Voice {
     uint32_t maxLen;    /* absolute end position (sample index), not a duration */
     uint32_t trimStart; /* absolute start position — non-zero only when the
                          * pad has a trim window set; see padTrimStartPct */
+    uint32_t fadeInLen;  /* samples; 0 = no fade-in ramp */
+    uint32_t fadeOutLen; /* samples; 0 = no fade-out ramp */
     bool     liveSource; /* true when triggered by CMD_TRIGGER_LIVE */
     /* Last routed sample and click-free residual used by voice stealing. */
     float    lastOutL;
@@ -4280,6 +4290,10 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
     /* Guardar límite efectivo en la voz */
     voices[slot].maxLen = len;
     voices[slot].trimStart = trimStart;
+    voices[slot].fadeInLen  = (uint32_t)(clampF(padFadeInMs[pad],  0.0f, 255.0f)
+                                          * 0.001f * (float)SAMPLE_RATE);
+    voices[slot].fadeOutLen = (uint32_t)(clampF(padFadeOutMs[pad], 0.0f, 255.0f)
+                                          * 0.001f * (float)SAMPLE_RATE);
 
     float gain = (velocity / 127.0f)
                * VolumeByteToGain(trkVol)
@@ -5762,6 +5776,26 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 }
             }
             s *= vx.env;
+
+            /* ── Trim-window fade in/out ── independent of the AD envelope
+             * above: ramps around the trim boundaries themselves so a short
+             * or arbitrarily-offset trim window never clicks at either edge,
+             * regardless of the pad's attack/decay settings. Direction-aware:
+             * in reverse playback the audible "start" of the sample is near
+             * endLen and the "end" is near trimStart, so fade-in/out swap
+             * which boundary they ramp against. */
+            if(vx.fadeInLen > 0 || vx.fadeOutLen > 0){
+                uint32_t distFromStart = (idx > vx.trimStart) ? (idx - vx.trimStart) : 0;
+                uint32_t distFromEnd   = (idx < endLen) ? (endLen - idx) : 0;
+                uint32_t fadeInDist  = padReverse[p] ? distFromEnd   : distFromStart;
+                uint32_t fadeOutDist = padReverse[p] ? distFromStart : distFromEnd;
+                float fadeGain = 1.0f;
+                if(vx.fadeInLen > 0)
+                    fadeGain *= clampF((float)fadeInDist / (float)vx.fadeInLen, 0.0f, 1.0f);
+                if(vx.fadeOutLen > 0)
+                    fadeGain *= clampF((float)fadeOutDist / (float)vx.fadeOutLen, 0.0f, 1.0f);
+                s *= fadeGain;
+            }
 
             /* ── Stutter ── */
             if(padStutterOn[p]){
@@ -7679,6 +7713,14 @@ static void ProcessCommand()
             padTrimStartPct[pad] = (float)startPct / 100.0f;
             padTrimEndPct[pad]   = (float)endPct   / 100.0f;
         }
+        break;
+    case CMD_PAD_FADE_IN:
+        /* Same non-destructive treatment as CMD_PAD_TRIM above — only
+         * affects voices triggered after this point. */
+        if(len >= 2 && p[0] < MAX_PADS) padFadeInMs[p[0]] = (float)p[1];
+        break;
+    case CMD_PAD_FADE_OUT:
+        if(len >= 2 && p[0] < MAX_PADS) padFadeOutMs[p[0]] = (float)p[1];
         break;
 
     /* ════════════════════════════════════════════

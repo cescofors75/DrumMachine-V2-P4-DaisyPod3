@@ -2664,6 +2664,23 @@ void control_send_trim_sample(uint8_t pad, float start, float end)
     SendWithRetry(CMD_PAD_TRIM, payload, sizeof(payload));
 }
 
+// Non-destructive, same treatment as control_send_trim_sample above —
+// ramps around the trim window's own edges so a short or offset trim never
+// clicks. ms 0 = no fade.
+void control_send_set_pad_fade_in(uint8_t pad, uint8_t ms)
+{
+    if(pad >= 24) return;
+    const uint8_t payload[2] = {pad, ms};
+    SendWithRetry(CMD_PAD_FADE_IN, payload, sizeof(payload));
+}
+
+void control_send_set_pad_fade_out(uint8_t pad, uint8_t ms)
+{
+    if(pad >= 24) return;
+    const uint8_t payload[2] = {pad, ms};
+    SendWithRetry(CMD_PAD_FADE_OUT, payload, sizeof(payload));
+}
+
 void control_send_melody_rec_note(uint8_t engine, uint8_t note)
 {
     if(melodyRecording)

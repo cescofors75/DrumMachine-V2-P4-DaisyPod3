@@ -181,6 +181,8 @@ typedef struct __attribute__((packed)) {
 // this file never listed them, so don't reuse those two values here either.
 #define CMD_PAD_CLEAR_FX      0x7A  // Clear all pad FX
 #define CMD_PAD_TRIM          0x7B  // Non-destructive trim window: [pad(1), startPct(1), endPct(1)] 0-100
+#define CMD_PAD_FADE_IN       0x7C  // [pad(1), ms(1)] 0-255ms ramp from the trim start, 0=off
+#define CMD_PAD_FADE_OUT      0x7D  // [pad(1), ms(1)] 0-255ms ramp into the trim end, 0=off
 
 // ═══════════════════════════════════════════════════════
 // COMMANDS: PER-PAD LFO (0x80 - 0x8F)
