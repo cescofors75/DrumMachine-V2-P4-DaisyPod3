@@ -14425,17 +14425,20 @@ static void create_sdcard_screen(void) {
     lv_obj_set_style_pad_all(sd_left_panel, 8, 0);
     lv_obj_clear_flag(sd_left_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Title
+    // Title — starts at x=60 (was 8) to leave room for the standard
+    // top-left back button added below, which every other screen has at
+    // the same (8,8) spot; shortened so it still fits before the source
+    // toggle now starting further right for the same reason.
     lv_obj_t* title_lbl = lv_label_create(sd_left_panel);
-    lv_label_set_text(title_lbl, LV_SYMBOL_DRIVE "  SD CARD BROWSER");
+    lv_label_set_text(title_lbl, LV_SYMBOL_DRIVE "  SD CARD");
     lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title_lbl, RED808_CYAN, 0);
-    lv_obj_set_pos(title_lbl, 8, 4);
+    lv_obj_set_pos(title_lbl, 60, 4);
 
     // Source toggle: [P4 SD] [MEM]. Daisy no longer owns storage.
     {
         int btn_w = 70, btn_h = 28;
-        int bx = 240, by = 4;
+        int bx = 290, by = 4;
         sd_src_sd_btn = lv_btn_create(sd_left_panel);
         lv_obj_set_size(sd_src_sd_btn, btn_w, btn_h);
         lv_obj_set_pos(sd_src_sd_btn, bx, by);
@@ -14809,6 +14812,13 @@ static void create_sdcard_screen(void) {
         (void)e;
         ui_navigate_to(2);  // SCREEN_LIVE
     }, LV_EVENT_CLICKED, NULL);
+
+    // Standard top-left back button, same spot as every other screen —
+    // this one only had the big "BACK TO LIVE" button at the bottom of the
+    // right panel before, which is fine as a second, more visible option,
+    // but broke the "back is always top-left" expectation everywhere else.
+    // Added last so it renders above sd_left_panel's corner, not under it.
+    ui_create_header(scr_sdcard);
 }
 
 // =============================================================================
