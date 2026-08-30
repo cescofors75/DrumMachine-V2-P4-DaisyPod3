@@ -1090,9 +1090,16 @@ static uint8_t s_xtra_wave_count[4] = {};
 // over this link, not write to it — so "add more" means copying a folder
 // with up to 4 WAVs somewhere under /data/xtra and pressing RESCAN, not
 // creating one from the UI.
-#define XTRA_PAGE_MAX        9   // DEFAULT + up to 8 discovered pages
-#define XTRA_SCAN_MAX_DEPTH  3   // xtra/A, xtra/A/B, xtra/A/B/C
-#define XTRA_SCAN_MAX_VISITS 24  // folders inspected per RESCAN, across all depths
+// A real commercial sample library (DRUMS/DRUMS - LOOPS/PERCUSSION/*.wav,
+// with siblings like FX & FOLEY, MUSIC, VOCALS each carrying their own
+// LOOPS/ONE SHOTS split and half a dozen category subfolders under each)
+// routinely has 40-100+ folders three levels deep and needs most of them
+// to show up as their own page — the original caps here (9 pages, 24
+// folders visited) were sized for a handful of hand-picked folders, not
+// an actual sample pack, and silently dropped everything past the cap.
+#define XTRA_PAGE_MAX        64  // DEFAULT + up to 63 discovered pages
+#define XTRA_SCAN_MAX_DEPTH  4   // xtra/A, xtra/A/B, xtra/A/B/C, xtra/A/B/C/D
+#define XTRA_SCAN_MAX_VISITS 250 // folders inspected per RESCAN, across all depths
 static char     s_xtra_page_names[XTRA_PAGE_MAX][40] = {};
 static int      s_xtra_page_count = 1;   // DEFAULT always exists
 static int      s_xtra_page_index = 0;
