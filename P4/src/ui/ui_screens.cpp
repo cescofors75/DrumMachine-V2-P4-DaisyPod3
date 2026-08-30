@@ -73,6 +73,8 @@ static std::atomic<bool> s_ui_seq_resync_pending{false};
 static std::atomic<bool> s_ui_step_dots_pending{false};
 static std::atomic<bool> s_ui_fx_random_tick_pending{false};
 static std::atomic<bool> s_ui_mix_random_tick_pending{false};
+static std::atomic<bool> s_ui_matrix_tick_pending{false};
+static std::atomic<uint8_t> s_ui_matrix_tick_idx{0};
 
 void ui_request_sequencer_resync(void) {
     s_ui_seq_resync_pending.store(true, std::memory_order_release);
@@ -86,6 +88,17 @@ void ui_request_fx_random_tick(void) {
 void ui_request_mix_random_tick(void) {
     s_ui_mix_random_tick_pending.store(true, std::memory_order_release);
 }
+void ui_request_matrix_tick(uint8_t idx) {
+    s_ui_matrix_tick_idx.store(idx, std::memory_order_relaxed);
+    s_ui_matrix_tick_pending.store(true, std::memory_order_release);
+}
+
+// Defined near the end of this file (after the filter/mixer/melody preset
+// systems it recalls into); forward-declared here so both the SONG modal's
+// MATRIX launcher button (early in the file) and the bar-clock tick
+// consumer above can reference them.
+static void matrix_apply_column(uint8_t idx);
+static void matrix_modal_show(lv_event_t* e);
 
 // RANDOM SONG's musical-jump reason (see triggerRandomSongJump in
 // control_api.cpp) — single producer (the control task), so a plain
@@ -9119,7 +9132,7 @@ static void seq_song_modal_show(lv_event_t* /*e*/) {
     lv_obj_add_event_cb(seq_song_modal, seq_song_modal_hide, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(seq_song_modal);
-    lv_obj_set_size(card, 640, 264);
+    lv_obj_set_size(card, 640, 312);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_border_width(card, 2, 0);
@@ -9205,9 +9218,22 @@ static void seq_song_modal_show(lv_event_t* /*e*/) {
     lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_14, 0);
     lv_obj_center(toggleLbl);
 
+    // MATRIX — compose an authored song from existing patterns + filter/
+    // mixer/melody presets per column, instead of RANDOM SONG's automatic
+    // jumps above. Its own full-screen grid, opened from here.
+    lv_obj_t* matrixBtn = lv_btn_create(card);
+    lv_obj_set_size(matrixBtn, 608, 40);
+    lv_obj_set_pos(matrixBtn, 0, 194);
+    apply_control_button_style(matrixBtn, RED808_ACCENT2, false, 10);
+    lv_obj_add_event_cb(matrixBtn, matrix_modal_show, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* matrixLbl = lv_label_create(matrixBtn);
+    lv_label_set_text(matrixLbl, "MATRIX — componer cancion");
+    lv_obj_set_style_text_font(matrixLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(matrixLbl);
+
     lv_obj_t* closeBtn = lv_btn_create(card);
     lv_obj_set_size(closeBtn, 608, 32);
-    lv_obj_set_pos(closeBtn, 0, 194);
+    lv_obj_set_pos(closeBtn, 0, 242);
     apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
     lv_obj_add_event_cb(closeBtn, seq_song_modal_hide, LV_EVENT_CLICKED, NULL);
     lv_obj_t* closeLbl = lv_label_create(closeBtn);
@@ -15795,6 +15821,364 @@ static void melody_preset_modal_show(lv_event_t* e) {
     melody_preset_modal_refresh();
 }
 
+// =============================================================================
+// MATRIX — compose an authored song from existing patterns plus filter/
+// mixer/melody presets, one column per song step. Phase 4 of the SONG
+// "MATRIX" plan (see FILTER/MIXER/MELODY PRESETS above for Phases 1-3).
+// This grid only holds the authoring data (persisted to disk); actual
+// playback state (which pattern is queued, current column, bar cadence)
+// lives in control_api.cpp's MatrixStepEntry chain — PLAY compacts this
+// grid's non-empty columns into that chain via control_matrix_upload(),
+// and matrix_apply_column() (called from the bar-clock tick bridge near
+// ui_update_current_screen()) recalls each column's presets as it becomes
+// active, reusing the Phase 1-3 recall functions above unchanged.
+// =============================================================================
+#define MATRIX_UI_STEPS MATRIX_MAX_STEPS
+struct MatrixUiColumn {
+    int8_t pattern;       // -1 = empty (not part of the song)
+    int8_t filterPreset;  // -1 = none, else 0..7
+    int8_t mixerPreset;   // -1 = none, else 0..7
+    int8_t melodyPreset;  // -1 = none, else 0..7
+};
+static MatrixUiColumn s_matrix_cols[MATRIX_UI_STEPS];
+static bool s_matrix_loaded_from_disk = false;
+static const char* MATRIX_SONG_FILE = "/matrix_song.txt";
+
+static lv_obj_t* s_matrix_modal = NULL;
+static lv_obj_t* s_matrix_pattern_lbls[MATRIX_UI_STEPS] = {};
+static lv_obj_t* s_matrix_filter_lbls[MATRIX_UI_STEPS] = {};
+static lv_obj_t* s_matrix_mixer_lbls[MATRIX_UI_STEPS] = {};
+static lv_obj_t* s_matrix_melody_lbls[MATRIX_UI_STEPS] = {};
+static lv_obj_t* s_matrix_status_lbl = NULL;
+static lv_obj_t* s_matrix_play_btn = NULL;
+static lv_obj_t* s_matrix_play_lbl = NULL;
+static lv_obj_t* s_matrix_bars_btns[4] = {};
+
+static void matrix_song_save_to_disk(void) {
+    File f = SPIFFS.open(MATRIX_SONG_FILE, FILE_WRITE);
+    if (!f) return;
+    for (int c = 0; c < MATRIX_UI_STEPS; c++) {
+        const MatrixUiColumn& s = s_matrix_cols[c];
+        f.printf("%d,%d,%d,%d\n", s.pattern, s.filterPreset, s.mixerPreset, s.melodyPreset);
+    }
+    f.close();
+}
+
+static void matrix_song_load_from_disk(void) {
+    for (int c = 0; c < MATRIX_UI_STEPS; c++)
+        s_matrix_cols[c] = MatrixUiColumn{-1, -1, -1, -1};
+    File f = SPIFFS.open(MATRIX_SONG_FILE, FILE_READ);
+    if (!f) return;
+    char line[32];
+    for (int c = 0; c < MATRIX_UI_STEPS; c++) {
+        if (!fs_read_line(f, line, sizeof(line))) break;
+        int pat = -1, filt = -1, mix = -1, mel = -1;
+        sscanf(line, "%d,%d,%d,%d", &pat, &filt, &mix, &mel);
+        s_matrix_cols[c].pattern      = (int8_t)constrain(pat,  -1, Config::MAX_PATTERNS - 1);
+        s_matrix_cols[c].filterPreset = (int8_t)constrain(filt, -1, FILTER_PRESET_COUNT - 1);
+        s_matrix_cols[c].mixerPreset  = (int8_t)constrain(mix,  -1, MIXER_PRESET_COUNT - 1);
+        s_matrix_cols[c].melodyPreset = (int8_t)constrain(mel,  -1, MELODY_PRESET_COUNT - 1);
+    }
+    f.close();
+}
+
+static void matrix_col_refresh(int c) {
+    if (c < 0 || c >= MATRIX_UI_STEPS) return;
+    const MatrixUiColumn& s = s_matrix_cols[c];
+    if (s_matrix_pattern_lbls[c]) {
+        if (s.pattern >= 0) lv_label_set_text_fmt(s_matrix_pattern_lbls[c], "P%02d", s.pattern + 1);
+        else lv_label_set_text(s_matrix_pattern_lbls[c], "--");
+    }
+    if (s_matrix_filter_lbls[c]) {
+        if (s.filterPreset >= 0) lv_label_set_text_fmt(s_matrix_filter_lbls[c], "F%d", s.filterPreset + 1);
+        else lv_label_set_text(s_matrix_filter_lbls[c], "F-");
+    }
+    if (s_matrix_mixer_lbls[c]) {
+        if (s.mixerPreset >= 0) lv_label_set_text_fmt(s_matrix_mixer_lbls[c], "M%d", s.mixerPreset + 1);
+        else lv_label_set_text(s_matrix_mixer_lbls[c], "M-");
+    }
+    if (s_matrix_melody_lbls[c]) {
+        if (s.melodyPreset >= 0) lv_label_set_text_fmt(s_matrix_melody_lbls[c], "N%d", s.melodyPreset + 1);
+        else lv_label_set_text(s_matrix_melody_lbls[c], "N-");
+    }
+}
+
+static void matrix_pattern_cell_cb(lv_event_t* e) {
+    int c = (int)(intptr_t)lv_event_get_user_data(e);
+    if (c < 0 || c >= MATRIX_UI_STEPS) return;
+    if (lv_event_get_code(e) == LV_EVENT_LONG_PRESSED) {
+        s_matrix_cols[c].pattern = -1;
+    } else {
+        int next = s_matrix_cols[c].pattern + 1;
+        if (next >= Config::MAX_PATTERNS) next = 0;
+        s_matrix_cols[c].pattern = (int8_t)next;
+    }
+    matrix_col_refresh(c);
+    matrix_song_save_to_disk();
+}
+
+static void matrix_filter_cell_cb(lv_event_t* e) {
+    int c = (int)(intptr_t)lv_event_get_user_data(e);
+    if (c < 0 || c >= MATRIX_UI_STEPS) return;
+    int next = s_matrix_cols[c].filterPreset + 1;
+    if (next >= FILTER_PRESET_COUNT) next = -1;
+    s_matrix_cols[c].filterPreset = (int8_t)next;
+    matrix_col_refresh(c);
+    matrix_song_save_to_disk();
+}
+
+static void matrix_mixer_cell_cb(lv_event_t* e) {
+    int c = (int)(intptr_t)lv_event_get_user_data(e);
+    if (c < 0 || c >= MATRIX_UI_STEPS) return;
+    int next = s_matrix_cols[c].mixerPreset + 1;
+    if (next >= MIXER_PRESET_COUNT) next = -1;
+    s_matrix_cols[c].mixerPreset = (int8_t)next;
+    matrix_col_refresh(c);
+    matrix_song_save_to_disk();
+}
+
+static void matrix_melody_cell_cb(lv_event_t* e) {
+    int c = (int)(intptr_t)lv_event_get_user_data(e);
+    if (c < 0 || c >= MATRIX_UI_STEPS) return;
+    int next = s_matrix_cols[c].melodyPreset + 1;
+    if (next >= MELODY_PRESET_COUNT) next = -1;
+    s_matrix_cols[c].melodyPreset = (int8_t)next;
+    matrix_col_refresh(c);
+    matrix_song_save_to_disk();
+}
+
+static void matrix_status_refresh(void) {
+    bool active = control_matrix_active();
+    if (s_matrix_status_lbl) {
+        if (active)
+            lv_label_set_text_fmt(s_matrix_status_lbl, "MATRIX: ON  col %d/%d",
+                control_matrix_idx() + 1, control_matrix_count());
+        else
+            lv_label_set_text(s_matrix_status_lbl, "MATRIX: OFF");
+    }
+    if (s_matrix_play_lbl) lv_label_set_text(s_matrix_play_lbl, active ? "STOP" : "PLAY");
+    if (s_matrix_play_btn)
+        lv_obj_set_style_bg_color(s_matrix_play_btn, active ? RED808_ERROR : RED808_SUCCESS, 0);
+}
+
+static void matrix_bars_refresh(void) {
+    static const uint8_t opts[4] = {1, 2, 4, 8};
+    uint8_t bars = control_matrix_bars();
+    for (int i = 0; i < 4; i++) {
+        if (!s_matrix_bars_btns[i]) continue;
+        bool sel = (opts[i] == bars);
+        apply_control_button_style(s_matrix_bars_btns[i], sel ? RED808_ACCENT2 : RED808_BORDER, false, 8);
+    }
+}
+
+static void matrix_bars_cb(lv_event_t* e) {
+    uint8_t bars = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+    control_matrix_set_bars(bars);
+    matrix_bars_refresh();
+}
+
+// Called from the SONG modal's own PLAY, and from the bar-clock tick bridge
+// (see ui_request_matrix_tick / ui_update_current_screen) whenever MATRIX
+// advances to a new column while running unattended — recalls that
+// column's presets through the exact same functions their own modals use.
+static void matrix_apply_column(uint8_t idx) {
+    MatrixStepEntry e{};
+    if (!control_matrix_get_entry(idx, &e)) return;
+    if (e.filterPreset >= 0) filter_preset_recall(e.filterPreset);
+    if (e.mixerPreset  >= 0) mixer_preset_recall(e.mixerPreset);
+    if (e.melodyPreset >= 0) melody_preset_recall(e.melodyPreset);
+    matrix_status_refresh();
+}
+
+static void matrix_play_btn_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (control_matrix_active()) {
+        control_matrix_set_active(false);
+        matrix_status_refresh();
+        ui_show_toast("MATRIX detenido", RED808_WARNING);
+        return;
+    }
+    MatrixStepEntry entries[MATRIX_MAX_STEPS];
+    uint8_t count = 0;
+    for (int c = 0; c < MATRIX_UI_STEPS && count < MATRIX_MAX_STEPS; c++) {
+        if (s_matrix_cols[c].pattern < 0) continue;
+        entries[count].pattern      = (uint8_t)s_matrix_cols[c].pattern;
+        entries[count].filterPreset = s_matrix_cols[c].filterPreset;
+        entries[count].mixerPreset  = s_matrix_cols[c].mixerPreset;
+        entries[count].melodyPreset = s_matrix_cols[c].melodyPreset;
+        count++;
+    }
+    if (count == 0) {
+        ui_show_toast("Elige al menos un patron en la fila 1", RED808_WARNING);
+        return;
+    }
+    if (!control_available()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    control_matrix_upload(entries, count);
+    // The bar-clock only handles columns AFTER the first — apply column 0
+    // immediately so hitting PLAY has an instant effect.
+    if (entries[0].filterPreset >= 0) filter_preset_recall(entries[0].filterPreset);
+    if (entries[0].mixerPreset  >= 0) mixer_preset_recall(entries[0].mixerPreset);
+    if (entries[0].melodyPreset >= 0) melody_preset_recall(entries[0].melodyPreset);
+    control_send_select_pattern(entries[0].pattern);
+    if (!p4.is_playing) control_send_start();
+    control_matrix_set_active(true);
+    matrix_status_refresh();
+    ui_show_toast("MATRIX: reproduciendo", RED808_SUCCESS);
+}
+
+static void matrix_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_matrix_modal) {
+        lv_obj_del(s_matrix_modal);
+        s_matrix_modal = NULL;
+        for (int i = 0; i < MATRIX_UI_STEPS; i++) {
+            s_matrix_pattern_lbls[i] = NULL;
+            s_matrix_filter_lbls[i] = NULL;
+            s_matrix_mixer_lbls[i] = NULL;
+            s_matrix_melody_lbls[i] = NULL;
+        }
+        s_matrix_status_lbl = NULL;
+        s_matrix_play_btn = NULL;
+        s_matrix_play_lbl = NULL;
+        for (int i = 0; i < 4; i++) s_matrix_bars_btns[i] = NULL;
+    }
+}
+
+static void matrix_modal_show(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_matrix_modal) return;
+    if (!s_matrix_loaded_from_disk) {
+        matrix_song_load_from_disk();
+        s_matrix_loaded_from_disk = true;
+    }
+
+    s_matrix_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_matrix_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_matrix_modal, RED808_BG, 0);
+    lv_obj_set_style_bg_opa(s_matrix_modal, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_matrix_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_matrix_modal, 0, 0);
+    lv_obj_clear_flag(s_matrix_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* title = lv_label_create(s_matrix_modal);
+    lv_label_set_text(title, "MATRIX");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_set_pos(title, 12, 6);
+
+    lv_obj_t* hint = lv_label_create(s_matrix_modal);
+    lv_label_set_text(hint, "Fila 1 patron - Fila 2 filtro - Fila 3 mixer - Fila 4 melodia. "
+                             "Toca para ciclar; manten pulsado el patron para vaciar la columna.");
+    lv_obj_set_width(hint, LV_HOR_RES - 24);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(hint, 12, 34);
+
+    constexpr int colW = 58, colGap = 4, x0 = 12;
+    constexpr int rowY[4] = {66, 122, 168, 214};
+    constexpr int rowH[4] = {50, 40, 40, 40};
+    static const uint32_t rowColors[4] = {0x00E5FF, 0xFFE066, 0x7CFF6B, 0xFF1493};
+
+    for (int c = 0; c < MATRIX_UI_STEPS; c++) {
+        int x = x0 + c * (colW + colGap);
+
+        lv_obj_t* pb = lv_btn_create(s_matrix_modal);
+        lv_obj_set_size(pb, colW, rowH[0]);
+        lv_obj_set_pos(pb, x, rowY[0]);
+        apply_control_button_style(pb, lv_color_hex(rowColors[0]), false, 6);
+        lv_obj_add_event_cb(pb, matrix_pattern_cell_cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
+        lv_obj_add_event_cb(pb, matrix_pattern_cell_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)c);
+        lv_obj_t* pl = lv_label_create(pb);
+        s_matrix_pattern_lbls[c] = pl;
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_center(pl);
+
+        lv_obj_t* fb = lv_btn_create(s_matrix_modal);
+        lv_obj_set_size(fb, colW, rowH[1]);
+        lv_obj_set_pos(fb, x, rowY[1]);
+        apply_control_button_style(fb, lv_color_hex(rowColors[1]), false, 6);
+        lv_obj_add_event_cb(fb, matrix_filter_cell_cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
+        lv_obj_t* fl = lv_label_create(fb);
+        s_matrix_filter_lbls[c] = fl;
+        lv_obj_set_style_text_font(fl, &lv_font_montserrat_12, 0);
+        lv_obj_center(fl);
+
+        lv_obj_t* mb = lv_btn_create(s_matrix_modal);
+        lv_obj_set_size(mb, colW, rowH[2]);
+        lv_obj_set_pos(mb, x, rowY[2]);
+        apply_control_button_style(mb, lv_color_hex(rowColors[2]), false, 6);
+        lv_obj_add_event_cb(mb, matrix_mixer_cell_cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
+        lv_obj_t* ml = lv_label_create(mb);
+        s_matrix_mixer_lbls[c] = ml;
+        lv_obj_set_style_text_font(ml, &lv_font_montserrat_12, 0);
+        lv_obj_center(ml);
+
+        lv_obj_t* ndb = lv_btn_create(s_matrix_modal);
+        lv_obj_set_size(ndb, colW, rowH[3]);
+        lv_obj_set_pos(ndb, x, rowY[3]);
+        apply_control_button_style(ndb, lv_color_hex(rowColors[3]), false, 6);
+        lv_obj_add_event_cb(ndb, matrix_melody_cell_cb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
+        lv_obj_t* nl = lv_label_create(ndb);
+        s_matrix_melody_lbls[c] = nl;
+        lv_obj_set_style_text_font(nl, &lv_font_montserrat_12, 0);
+        lv_obj_center(nl);
+
+        matrix_col_refresh(c);
+    }
+
+    lv_obj_t* barsLbl = lv_label_create(s_matrix_modal);
+    lv_label_set_text(barsLbl, "COMPASES:");
+    lv_obj_set_style_text_font(barsLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(barsLbl, RED808_TEXT_DIM, 0);
+    lv_obj_set_pos(barsLbl, 12, 269);
+    {
+        static const uint8_t barOptions[4] = {1, 2, 4, 8};
+        for (int i = 0; i < 4; i++) {
+            lv_obj_t* chip = lv_btn_create(s_matrix_modal);
+            s_matrix_bars_btns[i] = chip;
+            lv_obj_set_size(chip, 48, 30);
+            lv_obj_set_pos(chip, 100 + i * 54, 262);
+            lv_obj_add_event_cb(chip, matrix_bars_cb, LV_EVENT_CLICKED, (void*)(intptr_t)barOptions[i]);
+            lv_obj_t* lbl = lv_label_create(chip);
+            lv_label_set_text_fmt(lbl, "%d", barOptions[i]);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_center(lbl);
+        }
+    }
+    matrix_bars_refresh();
+
+    s_matrix_status_lbl = lv_label_create(s_matrix_modal);
+    lv_label_set_text(s_matrix_status_lbl, "MATRIX: OFF");
+    lv_obj_set_style_text_font(s_matrix_status_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_matrix_status_lbl, RED808_TEXT, 0);
+    lv_obj_set_pos(s_matrix_status_lbl, 340, 270);
+
+    s_matrix_play_btn = lv_btn_create(s_matrix_modal);
+    lv_obj_set_size(s_matrix_play_btn, 120, 40);
+    lv_obj_set_pos(s_matrix_play_btn, LV_HOR_RES - 260, 258);
+    apply_control_button_style(s_matrix_play_btn, RED808_SUCCESS, false, 8);
+    lv_obj_add_event_cb(s_matrix_play_btn, matrix_play_btn_cb, LV_EVENT_CLICKED, NULL);
+    s_matrix_play_lbl = lv_label_create(s_matrix_play_btn);
+    lv_label_set_text(s_matrix_play_lbl, "PLAY");
+    lv_obj_set_style_text_font(s_matrix_play_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(s_matrix_play_lbl);
+
+    lv_obj_t* closeBtn = lv_btn_create(s_matrix_modal);
+    lv_obj_set_size(closeBtn, 120, 40);
+    lv_obj_set_pos(closeBtn, LV_HOR_RES - 132, 258);
+    apply_control_button_style(closeBtn, RED808_BORDER, false, 8);
+    lv_obj_add_event_cb(closeBtn, matrix_modal_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "CERRAR");
+    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(closeLbl);
+
+    matrix_status_refresh();
+}
+
 static void create_piano_screen(void) {
     int W = ui_layout_w();
     int H = ui_layout_h();
@@ -18155,6 +18539,8 @@ void ui_update_current_screen(void) {
         fx_random_apply(control_auto_toast_enabled());
     if (s_ui_mix_random_tick_pending.exchange(false, std::memory_order_acquire))
         mix_random_apply(control_auto_toast_enabled());
+    if (s_ui_matrix_tick_pending.exchange(false, std::memory_order_acquire))
+        matrix_apply_column(s_ui_matrix_tick_idx.load(std::memory_order_relaxed));
     if (s_ui_random_song_toast_pending.exchange(false, std::memory_order_acquire))
         ui_show_toast(s_ui_random_song_toast_msg, RED808_CYAN);
     if (s_ui_variation_toast_pending.exchange(false, std::memory_order_acquire))

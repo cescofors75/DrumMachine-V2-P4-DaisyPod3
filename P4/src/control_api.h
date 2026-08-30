@@ -132,6 +132,31 @@ void control_random_variation_set_bars(uint8_t bars);      // 1/2/4/8
 uint8_t control_random_variation_bars();
 bool control_random_variation_apply_now();   // true if the pattern actually changed
 
+// MATRIX: a sixth bar-clock auto mode, but authored instead of random — a
+// fixed sequence of columns (built in the SONG > MATRIX grid), each one an
+// existing saved pattern plus an optional filter/mixer/melody preset. While
+// active and playing, every N bars it advances to the next column, queues
+// that pattern the same way the manual "Q 1 BAR" control does, and asks the
+// UI to recall that column's presets. Uploading a new chain always starts
+// back at column 0; activating does not itself jump — the MATRIX screen's
+// own PLAY handler applies column 0 immediately, same as RANDOM SONG never
+// force-jumping when merely turned on.
+#define MATRIX_MAX_STEPS 16
+struct MatrixStepEntry {
+    uint8_t pattern;
+    int8_t  filterPreset;   // -1 = none, else 0..7
+    int8_t  mixerPreset;    // -1 = none, else 0..7
+    int8_t  melodyPreset;   // -1 = none, else 0..7
+};
+void control_matrix_upload(const MatrixStepEntry* entries, uint8_t count);
+void control_matrix_set_active(bool active);
+bool control_matrix_active();
+void control_matrix_set_bars(uint8_t bars);      // 1/2/4/8
+uint8_t control_matrix_bars();
+uint8_t control_matrix_count();
+uint8_t control_matrix_idx();
+bool control_matrix_get_entry(uint8_t idx, MatrixStepEntry* out);
+
 bool control_sync_current_pattern();
 bool control_patterns_ready();
 uint8_t control_factory_patterns_found();

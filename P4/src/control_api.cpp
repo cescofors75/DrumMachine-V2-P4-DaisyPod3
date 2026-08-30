@@ -1374,6 +1374,10 @@ BarClock fxClock;
 BarClock mixClock;
 BarClock evolveClock;
 BarClock variationClock;
+BarClock matrixClock;
+MatrixStepEntry matrixChain[MATRIX_MAX_STEPS];
+uint8_t matrixChainCount = 0;
+uint8_t matrixChainIdx = 0;
 uint8_t songStyle = RND_STYLE_TECHNO;
 bool songCurated = false;      // RANDOM SONG: written scene order vs weighted random
 bool autoToastEnabled = true;  // SONG/VARIATIONS/FX/MIX auto-tick toasts, one switch
@@ -1634,6 +1638,20 @@ void triggerRandomSongJump()
     announce(pick, pickReason);
 }
 
+// Advances MATRIX to its next authored column (wrapping back to 0 at the
+// end) and queues that column's pattern the same quantized way RANDOM SONG
+// does. The preset side-effects (filter/mixer/melody) touch LVGL widgets,
+// so they aren't applied here on the control task — ui_request_matrix_tick
+// just flags the new index; ui_update_current_screen() on the LVGL task
+// looks the column back up via control_matrix_get_entry() and recalls it.
+void triggerMatrixAdvance()
+{
+    if(matrixChainCount == 0) return;
+    matrixChainIdx = (uint8_t)((matrixChainIdx + 1) % matrixChainCount);
+    control_send_queue_pattern(matrixChain[matrixChainIdx].pattern);
+    ui_request_matrix_tick(matrixChainIdx);
+}
+
 // One AUTO VARIATIONS pass: applies a random named structural variation
 // (never UNDO — that stays a manual, deliberate action) to the current
 // pattern via the exact same path the VAR popup's buttons use.
@@ -1840,6 +1858,33 @@ void control_random_variation_set_bars(uint8_t bars)
 uint8_t control_random_variation_bars() { return variationClock.bars; }
 bool control_random_variation_apply_now() { return VariationApply(); }
 
+void control_matrix_upload(const MatrixStepEntry* entries, uint8_t count)
+{
+    if(count > MATRIX_MAX_STEPS) count = MATRIX_MAX_STEPS;
+    for(uint8_t i = 0; i < count; ++i) matrixChain[i] = entries[i];
+    matrixChainCount = count;
+    matrixChainIdx = 0;
+}
+void control_matrix_set_active(bool active)
+{
+    matrixClock.active = active;
+    matrixClock.windowOpen = false;
+}
+bool control_matrix_active() { return matrixClock.active; }
+void control_matrix_set_bars(uint8_t bars)
+{
+    matrixClock.bars = bars < 1 ? 1 : (bars > 8 ? 8 : bars);
+}
+uint8_t control_matrix_bars() { return matrixClock.bars; }
+uint8_t control_matrix_count() { return matrixChainCount; }
+uint8_t control_matrix_idx() { return matrixChainIdx; }
+bool control_matrix_get_entry(uint8_t idx, MatrixStepEntry* out)
+{
+    if(!out || idx >= matrixChainCount) return false;
+    *out = matrixChain[idx];
+    return true;
+}
+
 // Called once per control_process() tick — the auto-mode "conductor". Pure
 // control-layer logic for the song jump, EVOLVE and VARIATIONS; FX/mix
 // re-randomization delegates to the same LVGL-side apply functions the
@@ -1854,6 +1899,7 @@ void control_random_auto_tick()
     if(barClockTick(mixClock)) ui_request_mix_random_tick();
     if(barClockTick(evolveClock)) EvolveApply();
     if(barClockTick(variationClock)) VariationApply();
+    if(barClockTick(matrixClock)) triggerMatrixAdvance();
 }
 
 bool control_variation_can_undo()
