@@ -11365,6 +11365,207 @@ static void mix_random_modal_show(lv_event_t* e) {
     auto_modal_show(cfg);
 }
 
+// =============================================================================
+// MIXER PRESETS — 8 savable snapshots of the 16-track volume/mute/solo state.
+// Phase 2 of the SONG "MATRIX" plan (see FILTER PRESETS above for Phase 1
+// and the reasoning). Pan isn't captured: P4 doesn't cache a live pan value
+// anywhere today (only volume/mute/solo round-trip into the p4 struct), and
+// adding that would mean new state plumbing outside this feature's scope.
+// =============================================================================
+#define MIXER_PRESET_COUNT 8
+struct MixerPresetSlot {
+    bool used;
+    char name[16];
+    int volume[16];
+    bool muted[16];
+    bool solo[16];
+};
+static MixerPresetSlot s_mixer_presets[MIXER_PRESET_COUNT] = {};
+static const char* MIXER_PRESETS_FILE = "/mixer_presets.txt";
+
+static lv_obj_t* s_mixer_preset_modal = NULL;
+static lv_obj_t* s_mixer_preset_slot_btns[MIXER_PRESET_COUNT] = {};
+static lv_obj_t* s_mixer_preset_slot_lbls[MIXER_PRESET_COUNT] = {};
+
+// One header line "used,name" per slot, followed by 16 lines "volume,muted,
+// solo" (one per track) — avoids a 50-field sscanf format string.
+static void mixer_presets_save_to_disk(void) {
+    File f = SPIFFS.open(MIXER_PRESETS_FILE, FILE_WRITE);
+    if (!f) return;
+    for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
+        const MixerPresetSlot& s = s_mixer_presets[i];
+        f.printf("%d,%s\n", s.used ? 1 : 0, s.name[0] ? s.name : "-");
+        for (int t = 0; t < 16; t++)
+            f.printf("%d,%d,%d\n", s.volume[t], s.muted[t] ? 1 : 0, s.solo[t] ? 1 : 0);
+    }
+    f.close();
+}
+
+static void mixer_presets_load_from_disk(void) {
+    memset(s_mixer_presets, 0, sizeof(s_mixer_presets));
+    for (int i = 0; i < MIXER_PRESET_COUNT; i++)
+        for (int t = 0; t < 16; t++) s_mixer_presets[i].volume[t] = 100;
+    File f = SPIFFS.open(MIXER_PRESETS_FILE, FILE_READ);
+    if (!f) return;
+    char line[64];
+    for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
+        if (!fs_read_line(f, line, sizeof(line))) break;
+        int used = 0;
+        char name[16] = {};
+        int parsed = sscanf(line, "%d,%15[^\n]", &used, name);
+        MixerPresetSlot& s = s_mixer_presets[i];
+        s.used = (used != 0);
+        if (parsed >= 2) strncpy(s.name, name, sizeof(s.name) - 1);
+        for (int t = 0; t < 16; t++) {
+            if (!fs_read_line(f, line, sizeof(line))) break;
+            int vol = 100, muted = 0, solo = 0;
+            sscanf(line, "%d,%d,%d", &vol, &muted, &solo);
+            s.volume[t] = constrain(vol, 0, 150);
+            s.muted[t] = (muted != 0);
+            s.solo[t] = (solo != 0);
+        }
+    }
+    f.close();
+}
+
+static void mixer_preset_modal_refresh(void) {
+    for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
+        if (!s_mixer_preset_slot_lbls[i]) continue;
+        const MixerPresetSlot& s = s_mixer_presets[i];
+        if (s.used) {
+            lv_label_set_text_fmt(s_mixer_preset_slot_lbls[i], "S%d\n%s", i + 1, s.name[0] ? s.name : "PRESET");
+            lv_obj_set_style_text_color(s_mixer_preset_slot_lbls[i], lv_color_white(), 0);
+        } else {
+            lv_label_set_text_fmt(s_mixer_preset_slot_lbls[i], "S%d\nVACIO", i + 1);
+            lv_obj_set_style_text_color(s_mixer_preset_slot_lbls[i], theme_text_dim(), 0);
+        }
+    }
+}
+
+static void mixer_preset_save_current(int slot) {
+    if (slot < 0 || slot >= MIXER_PRESET_COUNT) return;
+    MixerPresetSlot& s = s_mixer_presets[slot];
+    s.used = true;
+    snprintf(s.name, sizeof(s.name), "MIX %d", slot + 1);
+    for (int t = 0; t < 16; t++) {
+        s.volume[t] = p4.track_volume[t];
+        s.muted[t] = p4.track_muted[t];
+        s.solo[t] = p4.track_solo[t];
+    }
+    mixer_presets_save_to_disk();
+    mixer_preset_modal_refresh();
+    ui_show_toast("Preset de mixer guardado", RED808_SUCCESS);
+}
+
+static void mixer_preset_recall(int slot) {
+    if (slot < 0 || slot >= MIXER_PRESET_COUNT) return;
+    const MixerPresetSlot& s = s_mixer_presets[slot];
+    if (!s.used) {
+        ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
+        return;
+    }
+    if (!control_available()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    // update_volumes_screen() polls p4.track_volume/muted every frame and
+    // repaints sliders/mute buttons on change — no manual slider sync needed
+    // here, same as how RANDOM MIX's own ramped path already relies on it.
+    for (int t = 0; t < 16; t++) {
+        control_send_set_track_volume(t, s.volume[t]);
+        control_send_mute(t, s.muted[t]);
+        control_send_solo(t, s.solo[t]);
+    }
+    ui_show_toast("Preset de mixer cargado", RED808_SUCCESS);
+}
+
+static void mixer_preset_slot_clicked_cb(lv_event_t* e) {
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (lv_event_get_code(e) == LV_EVENT_LONG_PRESSED) mixer_preset_save_current(slot);
+    else mixer_preset_recall(slot);
+}
+
+static void mixer_preset_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_mixer_preset_modal) {
+        lv_obj_del(s_mixer_preset_modal);
+        s_mixer_preset_modal = NULL;
+        for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
+            s_mixer_preset_slot_btns[i] = NULL;
+            s_mixer_preset_slot_lbls[i] = NULL;
+        }
+    }
+}
+
+static void mixer_preset_modal_show(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_mixer_preset_modal) return;
+
+    s_mixer_preset_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_mixer_preset_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_mixer_preset_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_mixer_preset_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_mixer_preset_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_mixer_preset_modal, 0, 0);
+    lv_obj_clear_flag(s_mixer_preset_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_mixer_preset_modal, mixer_preset_modal_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_mixer_preset_modal);
+    lv_obj_set_size(card, 720, 260);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "MIXER PRESETS");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "TOCA = cargar   ·   MANTEN PULSADO = guardar el mixer actual aqui");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 32);
+
+    constexpr int btnW = 80, btnH = 84, gapX = 6, y0 = 68;
+    for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
+        lv_obj_t* btn = lv_btn_create(card);
+        s_mixer_preset_slot_btns[i] = btn;
+        lv_obj_set_size(btn, btnW, btnH);
+        lv_obj_set_pos(btn, 4 + i * (btnW + gapX), y0);
+        apply_control_button_style(btn, RED808_ACCENT2, false, 8);
+        lv_obj_add_event_cb(btn, mixer_preset_slot_clicked_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(btn, mixer_preset_slot_clicked_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)i);
+
+        lv_obj_t* lbl = lv_label_create(btn);
+        s_mixer_preset_slot_lbls[i] = lbl;
+        lv_obj_set_width(lbl, btnW - 8);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(lbl);
+    }
+
+    lv_obj_t* close_btn = lv_btn_create(card);
+    lv_obj_set_size(close_btn, 160, 40);
+    lv_obj_set_pos(close_btn, 280, 172);
+    apply_control_button_style(close_btn, RED808_ERROR, false, 10);
+    lv_obj_add_event_cb(close_btn, mixer_preset_modal_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, "CERRAR");
+    lv_obj_center(close_lbl);
+
+    mixer_preset_modal_refresh();
+}
+
 static void create_volumes_screen(void) {
     scr_volumes = lv_obj_create(NULL);
     apply_screen_theme_bg(scr_volumes);
@@ -11458,12 +11659,28 @@ static void create_volumes_screen(void) {
         mix_random_btn_refresh();
     }
 
+    // MIXER PRESETS — sits in the band freed up below by pushing y_top down
+    // (was 100) rather than fighting for room in the centered MAIN/BPM/
+    // RANDOM MIX row above, which already spans most of the screen width.
+    {
+        lv_obj_t* presets_btn = lv_btn_create(scr_volumes);
+        lv_obj_set_size(presets_btn, 120, 26);
+        lv_obj_set_pos(presets_btn, LCD_H_RES - 130, 74);
+        apply_control_button_style(presets_btn, RED808_CYAN, false, 6);
+        lv_obj_add_event_cb(presets_btn, mixer_preset_modal_show, LV_EVENT_CLICKED, NULL);
+        lv_obj_t* presetsLabel = lv_label_create(presets_btn);
+        lv_label_set_text(presetsLabel, "PRESETS");
+        lv_obj_set_style_text_font(presetsLabel, &lv_font_montserrat_12, 0);
+        lv_obj_center(presetsLabel);
+    }
+    mixer_presets_load_from_disk();
+
     // Single row of 16 strips filling the full display width
     int margin = 10;
     int gap    = 4;
     int total_w = LW - 2 * margin;
     int strip_w = (total_w - 15 * gap) / 16;   // ~56px each
-    int y_top   = 100;
+    int y_top   = 134;
     int y_bottom = LH - 8;
     int strip_h  = y_bottom - y_top;            // ~508px
     int name_h   = 14;
