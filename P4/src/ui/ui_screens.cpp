@@ -736,7 +736,7 @@ static void create_boot_screen(void) {
 
     // Cabecera: identidad arriba a la izquierda, build a la derecha
     lv_obj_t* hdr = lv_label_create(scr_boot);
-    lv_label_set_text(hdr, "BLUESLAVEP4 PERFORMANCE SYSTEM");
+    lv_label_set_text(hdr, "RED808 V2.0 BOOT SYSTEM");
     lv_obj_set_style_text_font(hdr, &lv_font_unscii_16, 0);
     lv_obj_set_style_text_letter_space(hdr, 2, 0);
     lv_obj_set_style_text_color(hdr, boot_phosphor(), 0);
