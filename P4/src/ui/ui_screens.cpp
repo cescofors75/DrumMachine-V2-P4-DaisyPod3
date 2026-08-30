@@ -16812,8 +16812,11 @@ static void create_piano_screen(void) {
                              LV_EVENT_CLICKED, NULL);
     }
 
-    /* v2.7 — REC toggle: sends melodyRecNote to master while active */
-    s_piano_rec_btn = piano_make_chip(scr_piano, 580, row_y, 116, 44, "○ REC");
+    /* v2.7 — REC toggle: sends melodyRecNote to master while active.
+     * Moved from x=580 (was silently overlapping M.PRESETS below it — the
+     * "gap between GATE and GLIDE" it was placed in didn't actually exist)
+     * to the unused strip after BEND, at the row's own right edge. */
+    s_piano_rec_btn = piano_make_chip(scr_piano, 934, row_y, 84, 44, "○ REC");
     s_piano_rec_lbl = lv_obj_get_child(s_piano_rec_btn, 0);
     lv_obj_add_event_cb(s_piano_rec_btn, piano_rec_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(s_piano_rec_btn, LV_OBJ_FLAG_PRESS_LOCK);
@@ -16863,10 +16866,10 @@ static void create_piano_screen(void) {
     lv_obj_set_style_border_color(s_piano_gate_btn, RED808_SUCCESS, 0);
     lv_obj_add_event_cb(s_piano_gate_btn, piano_gate_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    // MELODY PRESETS — sits in the gap between GATE (ends 568) and GLIDE
-    // (starts 730) in this same compact row; no free room elsewhere on screen.
+    // MELODY PRESETS — the slot REC used to sit in (and silently collide
+    // with) before it moved to the row's right edge above.
     {
-        lv_obj_t* mpb = piano_make_chip(scr_piano, 580, row_y, 140, 36, "M.PRESETS");
+        lv_obj_t* mpb = piano_make_chip(scr_piano, 580, row_y, 116, 36, "M.PRESETS");
         lv_obj_set_style_border_color(mpb, RED808_CYAN, 0);
         lv_obj_t* l = lv_obj_get_child(mpb, 0);
         if (l) lv_obj_set_style_text_color(l, RED808_CYAN, 0);
