@@ -624,12 +624,32 @@ void control_process()
     // pattern numbers (1..128). A command initiated by P4 is acknowledged by
     // matching the expected resident slot; it must never be reinterpreted as
     // a logical pattern.
+    //
+    // Bug this guards against: UploadPattern() below sends up to 16 tracks,
+    // each with its own SendWithRetry (worst case ~200ms if the link is
+    // busy) plus per-step CMD_DSQ_SET_STEP_NOTES calls for tracks carrying
+    // melodic data — under real congestion the whole upload can take longer
+    // than the 1500ms this used to wait. When the timeout fired first,
+    // transport.pattern still reported the OLD resident slot (Daisy hadn't
+    // caught up yet) while activeDaisyPattern already pointed at the NEW
+    // one — exactly the mismatch the "physical encoder moved" branch below
+    // looks for, so it fired on the tail of our own still-in-flight select,
+    // computed a bogus delta (typically -1, since resident slots are
+    // allocated sequentially) and silently reverted the just-made pattern
+    // change. Reported as "cambio de 14 a 15 y vuelve al 14, no siempre".
+    // Fix: give the upload comfortably more time to land (worst-case
+    // math above rarely exceeds ~3s even on a congested link), and if it
+    // still never arrives, adopt Daisy's real reported slot as truth
+    // instead of leaving a stale mismatch for that branch to misread.
     if(expectedDaisyPattern != 0xFF && transport.engine_responding)
     {
         if(transport.pattern == expectedDaisyPattern)
             expectedDaisyPattern = 0xFF;
-        else if(millis() - expectedDaisyPatternSinceMs > 1500u)
+        else if(millis() - expectedDaisyPatternSinceMs > 3000u)
+        {
             expectedDaisyPattern = 0xFF;
+            activeDaisyPattern = transport.pattern;
+        }
     }
 
     if(midiSongPrepared && transport.engine_responding
