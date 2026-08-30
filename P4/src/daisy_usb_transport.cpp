@@ -444,6 +444,7 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
                            | (static_cast<uint16_t>(payload[3]) << 8);
         state_.sd_present = payload[8] != 0;
         state_.xtra_sample_mask = payload[9];
+        state_.daisy_cpu_load_pct = payload[1];
         if(header->length >= 46)
         {
             memcpy(state_.kit_name, payload + 14, 31);
@@ -452,6 +453,15 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
         if(header->length >= 76)
             ui_pad_sound_sync_track_engines(
                 reinterpret_cast<const int8_t*>(payload + 60));
+        if(header->length >= 55)
+        {
+            state_.daisy_sdram_used_bytes = static_cast<uint32_t>(payload[47])
+                | (static_cast<uint32_t>(payload[48]) << 8)
+                | (static_cast<uint32_t>(payload[49]) << 16)
+                | (static_cast<uint32_t>(payload[50]) << 24);
+            state_.daisy_cpu_peak_pct = payload[52];
+            state_.daisy_cpu_avg_pct = payload[54];
+        }
         if(header->length >= 80)
         {
             state_.sd_mount_result = payload[76];

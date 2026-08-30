@@ -53,6 +53,13 @@ class DaisyUsbTransport
         uint32_t daisy_sd_revision;
         PodStatePayload pod;
         uint32_t pod_revision;
+        // From StatusResponse (CMD_GET_STATUS) — already sent periodically
+        // by Daisy and already computed there (CpuLoadMeter), just never
+        // parsed on this side before the DASHBOARD's CPU/memory panel.
+        uint8_t daisy_cpu_load_pct;
+        uint8_t daisy_cpu_avg_pct;
+        uint8_t daisy_cpu_peak_pct;
+        uint32_t daisy_sdram_used_bytes;
     };
 
     void begin();

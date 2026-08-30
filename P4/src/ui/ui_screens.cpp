@@ -936,7 +936,89 @@ static lv_obj_t* s_pod_status_modal = NULL;
 static lv_obj_t* s_pod_screensaver_btn = NULL;   // STATUS > preferencia SALVAPANTALLAS
 static lv_obj_t* s_pod_control_map_modal = NULL;
 static lv_obj_t* s_pod_dashboard_modal = NULL;
-static lv_obj_t* s_pod_dashboard_lbls[4] = {};   // 0=sistema 1=i2c/sensores 2=rotary 3=fader
+static lv_obj_t* s_pod_dashboard_lbls[5] = {};   // 0=sistema 1=i2c/sensores 2=rotary 3=fader 4=cpu/memoria
+
+// ── CPU/MEMORIA history + spike log (RAM only, cleared on reboot) ──────────
+// Sampled once a second from ui_update_current_screen()'s always-running
+// tick (not gated to the DASHBOARD being open), so the history has real
+// data to show the first time GRAFICAS is opened instead of starting empty.
+// A "spike" is defined the same way the firmware already tracks a running
+// max: whenever a new all-time-high (Daisy CPU) or all-time-low (free
+// heap/PSRAM) is observed, that is by definition worth logging — no
+// arbitrary threshold to tune per board.
+#define POD_HEALTH_HIST_LEN 60   // ~60s of history at 1 sample/sec
+static uint8_t  s_health_daisy_cpu_hist[POD_HEALTH_HIST_LEN] = {};
+static uint8_t  s_health_p4_heap_hist[POD_HEALTH_HIST_LEN] = {};   // % free of ESP.getHeapSize()
+static uint8_t  s_health_hist_count = 0;   // samples collected so far, caps at LEN
+static uint8_t  s_health_hist_write = 0;   // next write index (ring)
+static uint32_t s_health_last_sample_ms = 0;
+static uint8_t  s_health_daisy_cpu_peak_seen = 0;
+static uint32_t s_health_p4_heap_free_min_seen = 0xFFFFFFFFu;
+static uint32_t s_health_p4_psram_free_min_seen = 0xFFFFFFFFu;
+
+#define POD_SPIKE_LOG_LEN 16
+struct PodSpikeEntry { uint32_t ms; char text[56]; };
+static PodSpikeEntry s_pod_spike_log[POD_SPIKE_LOG_LEN] = {};
+static uint8_t s_pod_spike_log_count = 0;
+static uint8_t s_pod_spike_log_write = 0;   // next write index (ring)
+static lv_obj_t* s_pod_health_graph_modal = NULL;
+static lv_obj_t* s_pod_health_bars_cpu[POD_HEALTH_HIST_LEN] = {};
+static lv_obj_t* s_pod_health_bars_heap[POD_HEALTH_HIST_LEN] = {};
+static lv_obj_t* s_pod_health_spike_list = NULL;
+static uint8_t s_pod_health_spike_seen_count = 0xFF;
+
+// DaisyPod3's global SDRAM sample pool (SAMPLE_POOL_BYTES in main.cpp) —
+// kept here only to show "used / total" in the CPU/MEMORIA panel; must
+// match that constant, not something this side can query.
+#define POD_DAISY_SDRAM_POOL_BYTES (48u * 1024u * 1024u)
+
+static void pod_spike_log_push(const char* text) {
+    PodSpikeEntry& e = s_pod_spike_log[s_pod_spike_log_write];
+    e.ms = millis();
+    strncpy(e.text, text, sizeof(e.text) - 1);
+    e.text[sizeof(e.text) - 1] = '\0';
+    s_pod_spike_log_write = (uint8_t)((s_pod_spike_log_write + 1) % POD_SPIKE_LOG_LEN);
+    if (s_pod_spike_log_count < POD_SPIKE_LOG_LEN) s_pod_spike_log_count++;
+}
+
+static void pod_health_sample_tick(void) {
+    const uint32_t now = millis();
+    if (s_health_last_sample_ms != 0 && now - s_health_last_sample_ms < 1000u) return;
+    s_health_last_sample_ms = now;
+
+    const auto& state = daisyUsb.state();
+    const uint32_t heapFree = ESP.getFreeHeap();
+    const uint32_t heapTotal = ESP.getHeapSize();
+    const uint32_t psramFree = static_cast<uint32_t>(ESP.getFreePsram());
+
+    uint8_t heapFreePct = heapTotal > 0
+        ? (uint8_t)constrain((heapFree * 100u) / heapTotal, 0u, 100u) : 0;
+    s_health_daisy_cpu_hist[s_health_hist_write] = state.daisy_cpu_load_pct;
+    s_health_p4_heap_hist[s_health_hist_write] = heapFreePct;
+    s_health_hist_write = (uint8_t)((s_health_hist_write + 1) % POD_HEALTH_HIST_LEN);
+    if (s_health_hist_count < POD_HEALTH_HIST_LEN) s_health_hist_count++;
+
+    if (state.engine_responding && state.daisy_cpu_peak_pct > s_health_daisy_cpu_peak_seen) {
+        s_health_daisy_cpu_peak_seen = state.daisy_cpu_peak_pct;
+        char msg[56];
+        snprintf(msg, sizeof(msg), "DAISY CPU pico nuevo: %u%%", state.daisy_cpu_peak_pct);
+        pod_spike_log_push(msg);
+    }
+    if (heapFree < s_health_p4_heap_free_min_seen) {
+        s_health_p4_heap_free_min_seen = heapFree;
+        char msg[56];
+        snprintf(msg, sizeof(msg), "P4 HEAP minimo nuevo: %lu KB libres",
+                 static_cast<unsigned long>(heapFree / 1024u));
+        pod_spike_log_push(msg);
+    }
+    if (psramFree < s_health_p4_psram_free_min_seen) {
+        s_health_p4_psram_free_min_seen = psramFree;
+        char msg[56];
+        snprintf(msg, sizeof(msg), "P4 PSRAM minimo nuevo: %lu KB libres",
+                 static_cast<unsigned long>(psramFree / 1024u));
+        pod_spike_log_push(msg);
+    }
+}
 // ── AKAI MPD218 MIDI MAP + LEARN ─────────────────────────────────────
 static lv_obj_t* s_mpd_map_modal = NULL;
 static lv_obj_t* s_mpd_map_summary_label = NULL;
@@ -983,6 +1065,7 @@ static void pod_control_map_modal_close_cb(lv_event_t* e);
 static void pod_control_map_modal_show(void);
 static void pod_dashboard_modal_close_cb(lv_event_t* e);
 static void pod_dashboard_modal_show(void);
+static void pod_health_graph_modal_show(void);
 static void pod_function_modal_close_cb(lv_event_t* e);
 static void mpd_map_modal_close_cb(lv_event_t* e);
 
@@ -5225,8 +5308,11 @@ static void pod_control_map_modal_show(void) {
 // Same underlying data as before (I2C mux/rotary detection, per-rotary
 // values, button press counts, fader ADC), split into four labeled cards
 // instead of one dense monospace paragraph.
+static void pod_health_graph_modal_close_cb(lv_event_t* e);
+
 static void pod_dashboard_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    pod_health_graph_modal_close_cb(NULL);
     if (s_pod_dashboard_modal) lv_obj_del(s_pod_dashboard_modal);
     s_pod_dashboard_modal = NULL;
     memset(s_pod_dashboard_lbls, 0, sizeof(s_pod_dashboard_lbls));
@@ -5299,6 +5385,30 @@ static void pod_dashboard_modal_update(void) {
         lv_obj_set_style_text_color(s_pod_dashboard_lbls[3],
             p4_fader_detected() ? RED808_SUCCESS : RED808_WARNING, 0);
     }
+    if (s_pod_dashboard_lbls[4]) {
+        const uint32_t heapFree = ESP.getFreeHeap();
+        const uint32_t heapTotal = ESP.getHeapSize();
+        const uint32_t psramFree = static_cast<uint32_t>(ESP.getFreePsram());
+        const uint32_t psramTotal = static_cast<uint32_t>(ESP.getPsramSize());
+        const uint32_t sdramPct = (uint32_t)constrain(
+            (state.daisy_sdram_used_bytes * 100ull) / POD_DAISY_SDRAM_POOL_BYTES,
+            0ull, 100ull);
+        lv_label_set_text_fmt(s_pod_dashboard_lbls[4],
+            "DAISY CPU: %u%%  (avg %u%%  pico %u%%)\n"
+            "DAISY SDRAM: %lu/%lu KB (%lu%%)\n"
+            "P4 HEAP: %lu/%lu KB libres\n"
+            "P4 PSRAM: %lu/%lu KB libres",
+            state.daisy_cpu_load_pct, state.daisy_cpu_avg_pct, state.daisy_cpu_peak_pct,
+            static_cast<unsigned long>(state.daisy_sdram_used_bytes / 1024u),
+            static_cast<unsigned long>(POD_DAISY_SDRAM_POOL_BYTES / 1024u),
+            static_cast<unsigned long>(sdramPct),
+            static_cast<unsigned long>(heapFree / 1024u),
+            static_cast<unsigned long>(heapTotal / 1024u),
+            static_cast<unsigned long>(psramFree / 1024u),
+            static_cast<unsigned long>(psramTotal / 1024u));
+        lv_obj_set_style_text_color(s_pod_dashboard_lbls[4],
+            state.daisy_cpu_load_pct >= 90 ? RED808_WARNING : RED808_SUCCESS, 0);
+    }
 }
 
 static void pod_dashboard_modal_show(void) {
@@ -5307,16 +5417,28 @@ static void pod_dashboard_modal_show(void) {
         [](lv_event_t*) { pod_dashboard_modal_close_cb(NULL); },
         "DASHBOARD", RED808_SUCCESS);
 
-    static const char* SECTION_NAMES[4] = {
-        "SISTEMA", "I2C / SENSORES", "ROTARY", "FADER"
+    // Flex row-wrap instead of a fixed 2x2 grid: an odd panel count (5, for
+    // CPU/MEMORIA) just wraps to its own row instead of needing new x/y math,
+    // and it scrolls if a future panel doesn't fit the screen height.
+    lv_obj_t* grid = lv_obj_create(s_pod_dashboard_modal);
+    lv_obj_set_pos(grid, 16, 60);
+    lv_obj_set_size(grid, LCD_H_RES - 32, LCD_V_RES - 76);
+    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(grid, 0, 0);
+    lv_obj_set_style_pad_all(grid, 0, 0);
+    lv_obj_set_style_pad_row(grid, 16, 0);
+    lv_obj_set_style_pad_column(grid, 16, 0);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_scroll_dir(grid, LV_DIR_VER);
+    lv_obj_add_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+
+    static const char* SECTION_NAMES[5] = {
+        "SISTEMA", "I2C / SENSORES", "ROTARY", "FADER", "CPU / MEMORIA"
     };
-    const int panelW = 480, panelH = 200, gap = 16;
-    const int startX = (LCD_H_RES - (panelW * 2 + gap)) / 2, startY = 70;
-    for (int i = 0; i < 4; i++) {
-        int col = i % 2, row = i / 2;
-        lv_obj_t* panel = lv_obj_create(s_pod_dashboard_modal);
+    const int panelW = 480, panelH = 200;
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t* panel = lv_obj_create(grid);
         lv_obj_set_size(panel, panelW, panelH);
-        lv_obj_set_pos(panel, startX + col * (panelW + gap), startY + row * (panelH + gap));
         lv_obj_set_style_bg_color(panel, RED808_SURFACE, 0);
         lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(panel, 1, 0);
@@ -5328,6 +5450,19 @@ static void pod_dashboard_modal_show(void) {
         lv_obj_set_style_text_font(head, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(head, RED808_CYAN, 0);
         lv_obj_set_pos(head, 16, 12);
+        if (i == 4) {
+            lv_obj_t* graphBtn = lv_btn_create(panel);
+            lv_obj_set_size(graphBtn, 130, 32);
+            lv_obj_align(graphBtn, LV_ALIGN_TOP_RIGHT, -12, 8);
+            apply_control_button_style(graphBtn, RED808_CYAN, false, 8);
+            lv_obj_t* graphLbl = lv_label_create(graphBtn);
+            lv_label_set_text(graphLbl, LV_SYMBOL_IMAGE "  GRAFICAS");
+            lv_obj_set_style_text_font(graphLbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(graphLbl);
+            lv_obj_add_event_cb(graphBtn,
+                [](lv_event_t*) { pod_health_graph_modal_show(); },
+                LV_EVENT_CLICKED, NULL);
+        }
         s_pod_dashboard_lbls[i] = lv_label_create(panel);
         lv_obj_set_style_text_font(s_pod_dashboard_lbls[i], &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(s_pod_dashboard_lbls[i], RED808_TEXT, 0);
@@ -5335,6 +5470,136 @@ static void pod_dashboard_modal_show(void) {
     }
 
     pod_dashboard_modal_update();
+}
+
+// ── GRAFICAS — CPU/MEMORIA history + spike log, opened from DASHBOARD ──────
+static void pod_health_graph_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_pod_health_graph_modal) lv_obj_del(s_pod_health_graph_modal);
+    s_pod_health_graph_modal = NULL;
+    memset(s_pod_health_bars_cpu, 0, sizeof(s_pod_health_bars_cpu));
+    memset(s_pod_health_bars_heap, 0, sizeof(s_pod_health_bars_heap));
+    s_pod_health_spike_list = NULL;
+    s_pod_health_spike_seen_count = 0xFF;
+}
+
+// Bars stay bottom-anchored (LV_ALIGN_BOTTOM_LEFT set once at creation);
+// only the height changes here, so LVGL's own align bookkeeping keeps the
+// bottom edge fixed and grows each bar upward — no per-frame repositioning.
+static void pod_health_bars_paint(lv_obj_t* const bars[], const uint8_t hist[], int barMaxH) {
+    for (int i = 0; i < POD_HEALTH_HIST_LEN; i++) {
+        if (!bars[i]) continue;
+        const bool full = s_health_hist_count >= POD_HEALTH_HIST_LEN;
+        const int idx = full ? (s_health_hist_write + i) % POD_HEALTH_HIST_LEN : i;
+        const uint8_t v = (i < s_health_hist_count) ? hist[idx] : 0;
+        int h = (v * barMaxH) / 100;
+        if (h < 2) h = 2;
+        lv_obj_set_height(bars[i], h);
+    }
+}
+
+static void pod_health_spike_list_rebuild(void) {
+    if (!s_pod_health_spike_list) return;
+    lv_obj_clean(s_pod_health_spike_list);
+    if (s_pod_spike_log_count == 0) {
+        lv_obj_t* empty = lv_label_create(s_pod_health_spike_list);
+        lv_label_set_text(empty, "Sin picos registrados todavia.");
+        lv_obj_set_style_text_color(empty, RED808_TEXT_DIM, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        return;
+    }
+    // Newest first: walk the ring buffer backward from the last write.
+    int idx = (s_pod_spike_log_write + POD_SPIKE_LOG_LEN - 1) % POD_SPIKE_LOG_LEN;
+    for (uint8_t n = 0; n < s_pod_spike_log_count; n++) {
+        const PodSpikeEntry& entry = s_pod_spike_log[idx];
+        uint32_t secs = entry.ms / 1000u;
+        lv_obj_t* row = lv_label_create(s_pod_health_spike_list);
+        lv_label_set_text_fmt(row, "[%02lu:%02lu] %s",
+            static_cast<unsigned long>(secs / 60u),
+            static_cast<unsigned long>(secs % 60u), entry.text);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(row, RED808_TEXT, 0);
+        idx = (idx + POD_SPIKE_LOG_LEN - 1) % POD_SPIKE_LOG_LEN;
+    }
+}
+
+static void pod_health_graph_modal_update(void) {
+    if (!s_pod_health_graph_modal) return;
+    static uint32_t lastUpdateMs = 0;
+    const uint32_t now = millis();
+    if (lastUpdateMs != 0 && now - lastUpdateMs < 1000u) return;
+    lastUpdateMs = now;
+    pod_health_bars_paint(s_pod_health_bars_cpu, s_health_daisy_cpu_hist, 95);
+    pod_health_bars_paint(s_pod_health_bars_heap, s_health_p4_heap_hist, 95);
+    if (s_pod_spike_log_count != s_pod_health_spike_seen_count) {
+        s_pod_health_spike_seen_count = s_pod_spike_log_count;
+        pod_health_spike_list_rebuild();
+    }
+}
+
+static void pod_health_graph_modal_show(void) {
+    if (s_pod_health_graph_modal) { pod_health_graph_modal_close_cb(NULL); return; }
+    s_pod_health_graph_modal = pod_overlay_create(
+        [](lv_event_t*) { pod_health_graph_modal_close_cb(NULL); },
+        "GRAFICAS CPU / MEMORIA", RED808_CYAN);
+
+    auto graphSection = [&](int y, const char* title, lv_color_t color,
+                            lv_obj_t** bars) {
+        lv_obj_t* head = lv_label_create(s_pod_health_graph_modal);
+        lv_label_set_text(head, title);
+        lv_obj_set_style_text_font(head, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(head, color, 0);
+        lv_obj_set_pos(head, 16, y);
+
+        lv_obj_t* frame = lv_obj_create(s_pod_health_graph_modal);
+        lv_obj_set_size(frame, 976, 110);
+        lv_obj_set_pos(frame, 16, y + 24);
+        lv_obj_set_style_bg_color(frame, RED808_SURFACE, 0);
+        lv_obj_set_style_bg_opa(frame, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(frame, 1, 0);
+        lv_obj_set_style_border_color(frame, RED808_BORDER, 0);
+        lv_obj_set_style_radius(frame, 8, 0);
+        lv_obj_clear_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
+
+        const int barW = 14, gapW = 2;
+        for (int i = 0; i < POD_HEALTH_HIST_LEN; i++) {
+            lv_obj_t* bar = lv_obj_create(frame);
+            lv_obj_set_size(bar, barW, 2);
+            lv_obj_set_style_bg_color(bar, color, 0);
+            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(bar, 0, 0);
+            lv_obj_set_style_radius(bar, 1, 0);
+            lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 8 + i * (barW + gapW), -4);
+            bars[i] = bar;
+        }
+    };
+
+    graphSection(56, "DAISY CPU % (ultimos 60s)", RED808_CYAN, s_pod_health_bars_cpu);
+    graphSection(206, "P4 HEAP LIBRE % (ultimos 60s)", RED808_SUCCESS, s_pod_health_bars_heap);
+
+    lv_obj_t* logHead = lv_label_create(s_pod_health_graph_modal);
+    lv_label_set_text(logHead, "LOG DE PICOS (nuevos maximos de CPU / minimos de memoria)");
+    lv_obj_set_style_text_font(logHead, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(logHead, RED808_ACCENT, 0);
+    lv_obj_set_pos(logHead, 16, 356);
+
+    s_pod_health_spike_list = lv_obj_create(s_pod_health_graph_modal);
+    lv_obj_set_pos(s_pod_health_spike_list, 16, 384);
+    lv_obj_set_size(s_pod_health_spike_list, 976, LCD_V_RES - 400);
+    lv_obj_set_style_bg_color(s_pod_health_spike_list, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_opa(s_pod_health_spike_list, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_pod_health_spike_list, 1, 0);
+    lv_obj_set_style_border_color(s_pod_health_spike_list, RED808_BORDER, 0);
+    lv_obj_set_style_radius(s_pod_health_spike_list, 8, 0);
+    lv_obj_set_style_pad_all(s_pod_health_spike_list, 8, 0);
+    lv_obj_set_style_pad_row(s_pod_health_spike_list, 4, 0);
+    lv_obj_set_flex_flow(s_pod_health_spike_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(s_pod_health_spike_list, LV_DIR_VER);
+    lv_obj_add_flag(s_pod_health_spike_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_pod_health_spike_seen_count = 0xFF;  // force the first rebuild below
+    pod_health_graph_modal_update();
 }
 
 static void pod_status_modal_close_cb(lv_event_t* e) {
@@ -19990,6 +20255,11 @@ void ui_update_current_screen(void) {
     xtra_param_save_tick();
     xtra_audio_tick();
 
+    // CPU/memory history for the DASHBOARD's GRAFICAS view — sampled here
+    // (not gated to the dashboard being open) so there's already history
+    // the first time someone opens it.
+    pod_health_sample_tick();
+
     // Results from the async SD upload / Daisy unload workers.
     sd_midi_load_consume_result();
     const bool factoryKitOwnsUpload = sd_factory_autoload_tick();
@@ -20275,6 +20545,7 @@ void ui_update_current_screen(void) {
     // hardware values live regardless of the active per-screen updater.
     pod_status_modal_update();
     pod_dashboard_modal_update();
+    pod_health_graph_modal_update();
     // MIDI MAP overlay: LEARN capture handoff + pad/knob glow on MIDI input.
     mpd_map_modal_update();
 
