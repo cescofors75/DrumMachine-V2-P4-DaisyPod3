@@ -16438,13 +16438,13 @@ static void matrix_preset_picker_show(int col, MatrixPickKind kind) {
     int8_t current = -1;
     switch (kind) {
         case MATRIX_PICK_FILTER:
-            titleTxt = "FILTRO"; accent = lv_color_hex(0xFFE066);
+            titleTxt = "FILTRO"; accent = RED808_WARNING;
             current = s_matrix_cols[col].filterPreset; break;
         case MATRIX_PICK_MIXER:
-            titleTxt = "MIXER"; accent = lv_color_hex(0x7CFF6B);
+            titleTxt = "MIXER"; accent = RED808_SUCCESS;
             current = s_matrix_cols[col].mixerPreset; break;
         case MATRIX_PICK_MELODY:
-            titleTxt = "MELODIA"; accent = lv_color_hex(0xFF1493);
+            titleTxt = "MELODIA"; accent = RED808_ACCENT2;
             current = s_matrix_cols[col].melodyPreset; break;
         default: break;
     }
@@ -16621,9 +16621,13 @@ static void matrix_build_grid_page(void) {
 
     constexpr int colW = 118, colGap = 8;
     constexpr int rowH = 108, rowGap = 8;
-    static const uint32_t rowColors[4] = {0x00E5FF, 0xFFE066, 0x7CFF6B, 0xFF1493};
-    static const char* rowIcons[4]     = {LV_SYMBOL_AUDIO, LV_SYMBOL_TINT,
-                                          LV_SYMBOL_VOLUME_MAX, LV_SYMBOL_KEYBOARD};
+    // Theme tokens, not fixed hex — re-read on every call (never `static`)
+    // so switching themes and reopening MATRIX actually picks up the new
+    // palette instead of freezing on whatever theme was active the first
+    // time this page was built.
+    const lv_color_t rowColors[4] = {RED808_CYAN, RED808_WARNING, RED808_SUCCESS, RED808_ACCENT2};
+    static const char* rowIcons[4] = {LV_SYMBOL_AUDIO, LV_SYMBOL_TINT,
+                                      LV_SYMBOL_VOLUME_MAX, LV_SYMBOL_KEYBOARD};
 
     const int pageCount = (MATRIX_UI_STEPS + MATRIX_VIS_COLS - 1) / MATRIX_VIS_COLS;
     if (s_matrix_view_page >= pageCount) s_matrix_view_page = pageCount - 1;
@@ -16645,7 +16649,7 @@ static void matrix_build_grid_page(void) {
             lv_obj_t* btn = lv_btn_create(s_matrix_grid_area);
             lv_obj_set_size(btn, colW, rowH);
             lv_obj_set_pos(btn, x, 18 + r * (rowH + rowGap));
-            apply_control_button_style(btn, lv_color_hex(rowColors[r]), false, 8);
+            apply_control_button_style(btn, rowColors[r], false, 8);
             lv_event_cb_t cb = r == 0 ? matrix_pattern_cell_cb
                               : r == 1 ? matrix_filter_cell_cb
                               : r == 2 ? matrix_mixer_cell_cb
@@ -16655,7 +16659,7 @@ static void matrix_build_grid_page(void) {
             lv_obj_t* icon = lv_label_create(btn);
             lv_label_set_text(icon, rowIcons[r]);
             lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
-            lv_obj_set_style_text_color(icon, lv_color_hex(rowColors[r]), 0);
+            lv_obj_set_style_text_color(icon, rowColors[r], 0);
             lv_obj_align(icon, LV_ALIGN_TOP_LEFT, 6, 6);
 
             lv_obj_t* lbl = lv_label_create(btn);
