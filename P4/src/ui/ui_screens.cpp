@@ -926,9 +926,17 @@ static lv_obj_t*  s_pad_fx_dly_lbl = NULL;
 static lv_obj_t*  s_pad_fx_subtitle_lbl = NULL;
 static uint8_t    s_pad_fx_focus_pad = 0;
 
+// STATUS is a hub (s_pod_status_modal) with two full-screen sub-pages
+// opened on top of it (still on lv_layer_top(), so the hub stays alive
+// underneath and reappears once a sub-page closes itself — no explicit
+// "go back" plumbing needed): CONTROL MAP (hardware + LED assignment)
+// and DASHBOARD (live sensor/connectivity readout). MIDI MAP (MPD218)
+// is its own pre-existing overlay, opened straight from the hub.
 static lv_obj_t* s_pod_status_modal = NULL;
-static lv_obj_t* s_pod_status_label = NULL;
 static lv_obj_t* s_pod_screensaver_btn = NULL;   // STATUS > preferencia SALVAPANTALLAS
+static lv_obj_t* s_pod_control_map_modal = NULL;
+static lv_obj_t* s_pod_dashboard_modal = NULL;
+static lv_obj_t* s_pod_dashboard_lbls[4] = {};   // 0=sistema 1=i2c/sensores 2=rotary 3=fader
 // ── AKAI MPD218 MIDI MAP + LEARN ─────────────────────────────────────
 static lv_obj_t* s_mpd_map_modal = NULL;
 static lv_obj_t* s_mpd_map_summary_label = NULL;
@@ -970,6 +978,10 @@ static lv_obj_t* s_pod_led_color_labels[2] = {};
 static PodConfigPayload s_pod_config = {};
 static uint32_t s_pod_seen_revision = 0;
 static void pod_status_modal_close_cb(lv_event_t* e);
+static void pod_control_map_modal_close_cb(lv_event_t* e);
+static void pod_control_map_modal_show(void);
+static void pod_dashboard_modal_close_cb(lv_event_t* e);
+static void pod_dashboard_modal_show(void);
 static void pod_function_modal_close_cb(lv_event_t* e);
 static void mpd_map_modal_close_cb(lv_event_t* e);
 
@@ -3554,7 +3566,7 @@ static void pod_control_value_refresh(uint8_t row) {
 }
 
 static void pod_status_modal_refresh(void) {
-    if (!s_pod_status_modal) return;
+    if (!s_pod_control_map_modal) return;
     for (uint8_t row = 0; row < POD_CONTROL_ROW_COUNT; row++)
         pod_control_value_refresh(row);
     const uint8_t ledFunctions[2] = {
@@ -4914,8 +4926,12 @@ static void mpd_map_modal_update(void) {
     }
 }
 
+// Config-sync only — runs whenever any of the three STATUS screens is open,
+// regardless of which one, so switching between them never shows stale
+// hardware assignments. Each screen's own widget refresh is self-gated on
+// its own modal pointer.
 static void pod_status_modal_update(void) {
-    if (!s_pod_status_modal) return;
+    if (!s_pod_status_modal && !s_pod_control_map_modal && !s_pod_dashboard_modal) return;
     static uint32_t lastUpdateMs = 0;
     const uint32_t now = millis();
     if (lastUpdateMs != 0 && now - lastUpdateMs < 50) return;
@@ -4928,40 +4944,184 @@ static void pod_status_modal_update(void) {
         s_pod_config.selectorFunction = POD_FUNC_NONE;
         pod_status_modal_refresh();
     }
-    if (s_pod_status_label) {
-        uint8_t loaded = 0;
-        for (uint8_t i = 0; i < 16; i++) if (state.pod.sampleMask & (1u << i)) loaded++;
-        const uint8_t rotaryMask = i2c_rotaries_detected_mask();
-        const uint8_t addressAckMask = i2c_rotaries_address_ack_mask();
-        const uint8_t muxAddress = i2c_rotaries_mux_address();
-        uint8_t rotaryCount = 0;
-        for (uint8_t i = 0; i < 4; i++)
-            if (rotaryMask & (1u << i)) rotaryCount++;
-        const char* kit = p4.kit_name[0] ? p4.kit_name : "RED 808 KARZ";
-        const char* resetReason = "OTHER";
-        switch (esp_reset_reason()) {
-            case ESP_RST_POWERON:  resetReason = "POWERON"; break;
-            case ESP_RST_EXT:      resetReason = "EXTERNAL"; break;
-            case ESP_RST_SW:       resetReason = "SOFTWARE"; break;
-            case ESP_RST_PANIC:    resetReason = "PANIC"; break;
-            case ESP_RST_INT_WDT:  resetReason = "INT_WDT"; break;
-            case ESP_RST_TASK_WDT: resetReason = "TASK_WDT"; break;
-            case ESP_RST_WDT:      resetReason = "WDT"; break;
-            case ESP_RST_DEEPSLEEP: resetReason = "DEEPSLEEP"; break;
-            case ESP_RST_BROWNOUT: resetReason = "BROWNOUT"; break;
-            case ESP_RST_SDIO:     resetReason = "SDIO"; break;
-            default: break;
-        }
-        lv_label_set_text_fmt(s_pod_status_label,
-            "RESET %s | DAISY AUDIO | WAV %u/16 | KIT %s\n"
-            "I2C2 GPIO3/4 | PCA9548A %s | ADDR 0x%02X | ACK CH 0x%02X | 100k\n"
-            "SEN0502 PID OK %u/4 | R1 %u  R2 %u  R3 %u  R4 %u\n"
-            "STEP/CLICK G1 %u G2 %u G3 %u G4 %u | BTN R1 %lu R2 %lu R3 %lu R4 %lu\n"
-            "FADER DIRECT GPIO20 | %s | ADC %u | VALUE %u/1023\n"
-            "FADER LED DATA GPIO45 | RMT %s",
-            resetReason, loaded, kit,
-            muxAddress ? "SIGNATURE OK" : "NO DETECTADO", muxAddress,
-            addressAckMask, rotaryCount,
+}
+
+// A back-button corner matching every real screen's ui_create_header(), for
+// the three STATUS overlays below — they can't call that helper directly
+// (it targets a registered lv_scr_act() screen, not an lv_layer_top()
+// overlay), so this replicates its exact look instead.
+static lv_obj_t* pod_overlay_back_button(lv_obj_t* parent, lv_event_cb_t cb) {
+    lv_obj_t* back = lv_btn_create(parent);
+    lv_obj_set_size(back, 48, 42);
+    lv_obj_set_pos(back, 8, 8);
+    apply_control_button_style(back, RED808_BORDER, false, 8);
+    lv_obj_add_event_cb(back, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* lbl = lv_label_create(back);
+    lv_label_set_text(lbl, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+    lv_obj_center(lbl);
+    return back;
+}
+
+static lv_obj_t* pod_overlay_create(lv_event_cb_t backCb, const char* titleTxt,
+                                    lv_color_t titleColor) {
+    lv_obj_t* modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(modal, RED808_BG, 0);
+    lv_obj_set_style_bg_opa(modal, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(modal, 0, 0);
+    lv_obj_set_style_pad_all(modal, 0, 0);
+    lv_obj_clear_flag(modal, LV_OBJ_FLAG_SCROLLABLE);
+    pod_overlay_back_button(modal, backCb);
+    lv_obj_t* title = lv_label_create(modal);
+    lv_label_set_text(title, titleTxt);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, titleColor, 0);
+    lv_obj_set_pos(title, 70, 14);
+    return modal;
+}
+
+// ── MAPEAR DAISYPOD — hardware control + LED assignment ─────────────────
+static void pod_control_map_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_pod_function_modal) pod_function_modal_close_cb(NULL);
+    if (s_pod_control_map_modal) lv_obj_del(s_pod_control_map_modal);
+    s_pod_control_map_modal = NULL;
+    memset(s_pod_control_value_labels, 0, sizeof(s_pod_control_value_labels));
+    memset(s_pod_led_function_labels, 0, sizeof(s_pod_led_function_labels));
+    memset(s_pod_led_color_labels, 0, sizeof(s_pod_led_color_labels));
+}
+
+static void pod_control_map_modal_show(void) {
+    if (s_pod_control_map_modal) { pod_control_map_modal_close_cb(NULL); return; }
+    if (!daisyUsb.connected()) {
+        ui_show_toast("DaisyPod3 no responde", RED808_WARNING);
+        return;
+    }
+    daisyUsb.send(CMD_POD_GET_STATE);
+    s_pod_control_map_modal = pod_overlay_create(
+        [](lv_event_t*) { pod_control_map_modal_close_cb(NULL); },
+        "MAPEAR DAISYPOD", RED808_ACCENT2);
+
+    for (uint8_t row = 0; row < POD_CONTROL_ROW_COUNT; row++) {
+        const int col = row % 4, line = row / 4;
+        const int x = 20 + col * 246, y = 66 + line * 62;
+        lv_obj_t* label = lv_label_create(s_pod_control_map_modal);
+        lv_label_set_text(label, POD_CONTROL_TITLES[row]);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(label, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(label, x, y);
+        lv_obj_t* selectButton = lv_btn_create(s_pod_control_map_modal);
+        lv_obj_set_size(selectButton, 226, 40);
+        lv_obj_set_pos(selectButton, x, y + 15);
+        apply_control_button_style(selectButton, RED808_ACCENT2, false, 10);
+        lv_obj_set_style_bg_color(selectButton, RED808_SURFACE, 0);
+        s_pod_control_value_labels[row] = lv_label_create(selectButton);
+        lv_obj_set_width(s_pod_control_value_labels[row], 204);
+        lv_obj_set_style_text_align(s_pod_control_value_labels[row],
+                                    LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(s_pod_control_value_labels[row],
+                                   &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_pod_control_value_labels[row],
+                                    RED808_TEXT, 0);
+        lv_obj_center(s_pod_control_value_labels[row]);
+        lv_obj_add_event_cb(selectButton, pod_control_modal_open_cb,
+                            LV_EVENT_CLICKED,
+                            reinterpret_cast<void*>(
+                                static_cast<uintptr_t>(row)));
+    }
+
+    for (uint8_t led = 0; led < 2; led++) {
+        const int y = 260 + led * 64;
+        lv_obj_t* label = lv_label_create(s_pod_control_map_modal);
+        lv_label_set_text_fmt(label, "LED %u", led + 1);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(label, led == 0 ? RED808_CYAN : RED808_ACCENT, 0);
+        lv_obj_set_pos(label, 24, y + 14);
+        lv_obj_t* functionButton = lv_btn_create(s_pod_control_map_modal);
+        lv_obj_set_size(functionButton, 490, 44);
+        lv_obj_set_pos(functionButton, 110, y);
+        apply_control_button_style(functionButton, RED808_INFO, false, 10);
+        s_pod_led_function_labels[led] = lv_label_create(functionButton);
+        lv_obj_set_style_text_font(s_pod_led_function_labels[led], &lv_font_montserrat_16, 0);
+        lv_obj_center(s_pod_led_function_labels[led]);
+        lv_obj_add_event_cb(functionButton, pod_led_function_cycle_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)led);
+        lv_obj_t* colorButton = lv_btn_create(s_pod_control_map_modal);
+        lv_obj_set_size(colorButton, 270, 44);
+        lv_obj_set_pos(colorButton, 620, y);
+        apply_control_button_style(colorButton, RED808_ACCENT, false, 10);
+        s_pod_led_color_labels[led] = lv_label_create(colorButton);
+        lv_obj_set_style_text_font(s_pod_led_color_labels[led], &lv_font_montserrat_16, 0);
+        lv_obj_center(s_pod_led_color_labels[led]);
+        lv_obj_add_event_cb(colorButton, pod_led_color_cycle_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)led);
+    }
+
+    pod_status_modal_refresh();
+}
+
+// ── DASHBOARD — live sensor/connectivity readout, ex-STATUS text blob ───
+// Same underlying data as before (I2C mux/rotary detection, per-rotary
+// values, button press counts, fader ADC), split into four labeled cards
+// instead of one dense monospace paragraph.
+static void pod_dashboard_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_pod_dashboard_modal) lv_obj_del(s_pod_dashboard_modal);
+    s_pod_dashboard_modal = NULL;
+    memset(s_pod_dashboard_lbls, 0, sizeof(s_pod_dashboard_lbls));
+}
+
+static void pod_dashboard_modal_update(void) {
+    if (!s_pod_dashboard_modal) return;
+    static uint32_t lastUpdateMs = 0;
+    const uint32_t now = millis();
+    if (lastUpdateMs != 0 && now - lastUpdateMs < 50) return;
+    lastUpdateMs = now;
+    const auto& state = daisyUsb.state();
+
+    uint8_t loaded = 0;
+    for (uint8_t i = 0; i < 16; i++) if (state.pod.sampleMask & (1u << i)) loaded++;
+    const uint8_t rotaryMask = i2c_rotaries_detected_mask();
+    const uint8_t addressAckMask = i2c_rotaries_address_ack_mask();
+    const uint8_t muxAddress = i2c_rotaries_mux_address();
+    uint8_t rotaryCount = 0;
+    for (uint8_t i = 0; i < 4; i++) if (rotaryMask & (1u << i)) rotaryCount++;
+    const char* kit = p4.kit_name[0] ? p4.kit_name : "RED 808 KARZ";
+    const char* resetReason = "OTHER";
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  resetReason = "POWERON"; break;
+        case ESP_RST_EXT:      resetReason = "EXTERNAL"; break;
+        case ESP_RST_SW:       resetReason = "SOFTWARE"; break;
+        case ESP_RST_PANIC:    resetReason = "PANIC"; break;
+        case ESP_RST_INT_WDT:  resetReason = "INT_WDT"; break;
+        case ESP_RST_TASK_WDT: resetReason = "TASK_WDT"; break;
+        case ESP_RST_WDT:      resetReason = "WDT"; break;
+        case ESP_RST_DEEPSLEEP: resetReason = "DEEPSLEEP"; break;
+        case ESP_RST_BROWNOUT: resetReason = "BROWNOUT"; break;
+        case ESP_RST_SDIO:     resetReason = "SDIO"; break;
+        default: break;
+    }
+
+    if (s_pod_dashboard_lbls[0]) {
+        lv_label_set_text_fmt(s_pod_dashboard_lbls[0],
+            "RESET: %s\nAUDIO: DAISY\nWAV CARGADOS: %u/16\nKIT: %s",
+            resetReason, loaded, kit);
+        lv_obj_set_style_text_color(s_pod_dashboard_lbls[0],
+            loaded > 0 ? RED808_SUCCESS : RED808_WARNING, 0);
+    }
+    if (s_pod_dashboard_lbls[1]) {
+        lv_label_set_text_fmt(s_pod_dashboard_lbls[1],
+            "PCA9548A: %s (0x%02X)\nCANALES ACK: 0x%02X\nSEN0502 OK: %u/4 (100k)",
+            muxAddress ? "OK" : "NO DETECTADO", muxAddress, addressAckMask, rotaryCount);
+        lv_obj_set_style_text_color(s_pod_dashboard_lbls[1],
+            muxAddress ? RED808_SUCCESS : RED808_WARNING, 0);
+    }
+    if (s_pod_dashboard_lbls[2]) {
+        lv_label_set_text_fmt(s_pod_dashboard_lbls[2],
+            "VALOR   R1 %u   R2 %u   R3 %u   R4 %u\n"
+            "STEP    G1 %u   G2 %u   G3 %u   G4 %u\n"
+            "CLICKS  R1 %lu  R2 %lu  R3 %lu  R4 %lu",
             i2c_rotaries_value(0), i2c_rotaries_value(1),
             i2c_rotaries_value(2), i2c_rotaries_value(3),
             i2c_rotaries_gain(0), i2c_rotaries_gain(1),
@@ -4969,26 +5129,62 @@ static void pod_status_modal_update(void) {
             static_cast<unsigned long>(i2c_rotaries_button_press_count(0)),
             static_cast<unsigned long>(i2c_rotaries_button_press_count(1)),
             static_cast<unsigned long>(i2c_rotaries_button_press_count(2)),
-            static_cast<unsigned long>(i2c_rotaries_button_press_count(3)),
-            p4_fader_detected() ? "READY" : "WAIT",
-            p4_fader_raw(), p4_fader_value(),
-            p4_fader_led_driver_ready() ? "READY" : "ERROR");
-        lv_obj_set_style_text_color(s_pod_status_label,
-            loaded > 0 ? RED808_SUCCESS : RED808_WARNING, 0);
+            static_cast<unsigned long>(i2c_rotaries_button_press_count(3)));
     }
+    if (s_pod_dashboard_lbls[3]) {
+        lv_label_set_text_fmt(s_pod_dashboard_lbls[3],
+            "DIRECT GPIO20: %s\nADC RAW: %u\nVALOR: %u/1023\nLED DATA GPIO45: %s",
+            p4_fader_detected() ? "READY" : "WAIT", p4_fader_raw(), p4_fader_value(),
+            p4_fader_led_driver_ready() ? "READY" : "ERROR");
+        lv_obj_set_style_text_color(s_pod_dashboard_lbls[3],
+            p4_fader_detected() ? RED808_SUCCESS : RED808_WARNING, 0);
+    }
+}
+
+static void pod_dashboard_modal_show(void) {
+    if (s_pod_dashboard_modal) { pod_dashboard_modal_close_cb(NULL); return; }
+    s_pod_dashboard_modal = pod_overlay_create(
+        [](lv_event_t*) { pod_dashboard_modal_close_cb(NULL); },
+        "DASHBOARD", RED808_SUCCESS);
+
+    static const char* SECTION_NAMES[4] = {
+        "SISTEMA", "I2C / SENSORES", "ROTARY", "FADER"
+    };
+    const int panelW = 480, panelH = 200, gap = 16;
+    const int startX = (LCD_H_RES - (panelW * 2 + gap)) / 2, startY = 70;
+    for (int i = 0; i < 4; i++) {
+        int col = i % 2, row = i / 2;
+        lv_obj_t* panel = lv_obj_create(s_pod_dashboard_modal);
+        lv_obj_set_size(panel, panelW, panelH);
+        lv_obj_set_pos(panel, startX + col * (panelW + gap), startY + row * (panelH + gap));
+        lv_obj_set_style_bg_color(panel, RED808_SURFACE, 0);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(panel, 1, 0);
+        lv_obj_set_style_border_color(panel, RED808_BORDER, 0);
+        lv_obj_set_style_radius(panel, 12, 0);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* head = lv_label_create(panel);
+        lv_label_set_text(head, SECTION_NAMES[i]);
+        lv_obj_set_style_text_font(head, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(head, RED808_CYAN, 0);
+        lv_obj_set_pos(head, 16, 12);
+        s_pod_dashboard_lbls[i] = lv_label_create(panel);
+        lv_obj_set_style_text_font(s_pod_dashboard_lbls[i], &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(s_pod_dashboard_lbls[i], RED808_TEXT, 0);
+        lv_obj_set_pos(s_pod_dashboard_lbls[i], 16, 44);
+    }
+
+    pod_dashboard_modal_update();
 }
 
 static void pod_status_modal_close_cb(lv_event_t* e) {
     if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
     if (s_mpd_map_modal) mpd_map_modal_close_cb(NULL);
-    if (s_pod_function_modal) pod_function_modal_close_cb(NULL);
+    if (s_pod_dashboard_modal) pod_dashboard_modal_close_cb(NULL);
+    if (s_pod_control_map_modal) pod_control_map_modal_close_cb(NULL);
     if (s_pod_status_modal) lv_obj_del(s_pod_status_modal);
     s_pod_status_modal = NULL;
-    s_pod_status_label = NULL;
     s_pod_screensaver_btn = NULL;
-    memset(s_pod_control_value_labels, 0, sizeof(s_pod_control_value_labels));
-    memset(s_pod_led_function_labels, 0, sizeof(s_pod_led_function_labels));
-    memset(s_pod_led_color_labels, 0, sizeof(s_pod_led_color_labels));
 }
 
 // Preferencia persistida (settings_store.cpp) — no toca nada del hardware,
@@ -5006,6 +5202,8 @@ static void pod_screensaver_toggle_cb(lv_event_t* /*e*/) {
     pod_screensaver_refresh();
 }
 
+// ── STATUS hub — one tap to any of the three destinations above; used to
+// be a single dense "CONTROL MAP" screen with everything crammed in.
 static void pod_status_popup_cb(lv_event_t* e) {
     LV_UNUSED(e);
     if (s_pod_status_modal) { pod_status_modal_close_cb(NULL); return; }
@@ -5021,128 +5219,48 @@ static void pod_status_popup_cb(lv_event_t* e) {
     }
     daisyUsb.send(CMD_POD_GET_STATE);
 
-    s_pod_status_modal = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(s_pod_status_modal, LV_HOR_RES, LV_VER_RES);
-    lv_obj_set_style_bg_color(s_pod_status_modal, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_pod_status_modal, LV_OPA_70, 0);
-    lv_obj_set_style_border_width(s_pod_status_modal, 0, 0);
-    lv_obj_set_style_pad_all(s_pod_status_modal, 0, 0);
-    lv_obj_clear_flag(s_pod_status_modal, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(s_pod_status_modal, pod_status_modal_close_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* card = lv_obj_create(s_pod_status_modal);
-    lv_obj_set_size(card, 960, 550);
-    lv_obj_center(card);
-    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
-    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
-    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_border_width(card, 2, 0);
-    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
-    lv_obj_set_style_radius(card, 18, 0);
-    lv_obj_set_style_pad_all(card, 14, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-
-    lv_obj_t* title = lv_label_create(card);
-    lv_label_set_text(title, "CONTROL MAP  /  DAISYPOD3 + P4 + MIDI");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_t* subtitle = lv_label_create(card);
-    lv_label_set_text(subtitle,
-        "Hardware asignable + mapa completo de 2 controladores MIDI");
-    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
+    s_pod_status_modal = pod_overlay_create(
+        [](lv_event_t*) { pod_status_modal_close_cb(NULL); },
+        "STATUS", RED808_CYAN);
+    lv_obj_t* subtitle = lv_label_create(s_pod_status_modal);
+    lv_label_set_text(subtitle, "DaisyPod3 + P4 + MIDI");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(subtitle, RED808_TEXT_DIM, 0);
-    lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_pos(subtitle, 72, 52);
 
-    for (uint8_t row = 0; row < POD_CONTROL_ROW_COUNT; row++) {
-        const int col = row % 4, line = row / 4;
-        const int x = 10 + col * 230, y = 60 + line * 62;
-        lv_obj_t* label = lv_label_create(card);
-        lv_label_set_text(label, POD_CONTROL_TITLES[row]);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
-        lv_obj_set_style_text_color(label, RED808_TEXT_DIM, 0);
-        lv_obj_set_pos(label, x, y);
-        lv_obj_t* selectButton = lv_btn_create(card);
-        lv_obj_set_size(selectButton, 216, 40);
-        lv_obj_set_pos(selectButton, x, y + 15);
-        apply_control_button_style(selectButton, RED808_ACCENT2, false, 10);
-        lv_obj_set_style_bg_color(selectButton, RED808_SURFACE, 0);
-        s_pod_control_value_labels[row] = lv_label_create(selectButton);
-        lv_obj_set_width(s_pod_control_value_labels[row], 194);
-        lv_obj_set_style_text_align(s_pod_control_value_labels[row],
-                                    LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_font(s_pod_control_value_labels[row],
-                                   &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(s_pod_control_value_labels[row],
-                                    RED808_TEXT, 0);
-        lv_obj_center(s_pod_control_value_labels[row]);
-        lv_obj_add_event_cb(selectButton, pod_control_modal_open_cb,
-                            LV_EVENT_CLICKED,
-                            reinterpret_cast<void*>(
-                                static_cast<uintptr_t>(row)));
+    struct HubEntry { const char* title; const char* subtitle; lv_color_t accent; lv_event_cb_t cb; };
+    const HubEntry entries[3] = {
+        { "MAPEAR DAISYPOD", "Botones, knobs, encoder, fader + LEDs", RED808_ACCENT2,
+          [](lv_event_t*) { pod_control_map_modal_show(); } },
+        { "MAPEAR MPD218", "Mapa MIDI + LEARN de los 2 controladores", RED808_CYAN,
+          mpd_map_modal_open_cb },
+        { "DASHBOARD", "Estado en vivo: sensores, I2C, rotary, fader", RED808_SUCCESS,
+          [](lv_event_t*) { pod_dashboard_modal_show(); } },
+    };
+    const int cardW = 620, cardH = 108, gap = 20, startY = 120;
+    const int cardX = (LCD_H_RES - cardW) / 2;
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t* btn = lv_btn_create(s_pod_status_modal);
+        lv_obj_set_size(btn, cardW, cardH);
+        lv_obj_set_pos(btn, cardX, startY + i * (cardH + gap));
+        apply_control_button_style(btn, entries[i].accent, false, 14);
+        lv_obj_add_event_cb(btn, entries[i].cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t* t = lv_label_create(btn);
+        lv_label_set_text(t, entries[i].title);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_22, 0);
+        lv_obj_set_style_text_color(t, RED808_TEXT, 0);
+        lv_obj_set_pos(t, 24, 18);
+        lv_obj_t* s = lv_label_create(btn);
+        lv_label_set_text(s, entries[i].subtitle);
+        lv_obj_set_style_text_font(s, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(s, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(s, 24, 56);
     }
 
-    for (uint8_t led = 0; led < 2; led++) {
-        const int y = 252 + led * 64;
-        lv_obj_t* label = lv_label_create(card);
-        lv_label_set_text_fmt(label, "LED %u", led + 1);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(label, led == 0 ? RED808_CYAN : RED808_ACCENT, 0);
-        lv_obj_set_pos(label, 24, y + 14);
-        lv_obj_t* functionButton = lv_btn_create(card);
-        lv_obj_set_size(functionButton, 490, 44);
-        lv_obj_set_pos(functionButton, 110, y);
-        apply_control_button_style(functionButton, RED808_INFO, false, 10);
-        s_pod_led_function_labels[led] = lv_label_create(functionButton);
-        lv_obj_set_style_text_font(s_pod_led_function_labels[led], &lv_font_montserrat_16, 0);
-        lv_obj_center(s_pod_led_function_labels[led]);
-        lv_obj_add_event_cb(functionButton, pod_led_function_cycle_cb, LV_EVENT_CLICKED,
-                            (void*)(intptr_t)led);
-        lv_obj_t* colorButton = lv_btn_create(card);
-        lv_obj_set_size(colorButton, 270, 44);
-        lv_obj_set_pos(colorButton, 620, y);
-        apply_control_button_style(colorButton, RED808_ACCENT, false, 10);
-        s_pod_led_color_labels[led] = lv_label_create(colorButton);
-        lv_obj_set_style_text_font(s_pod_led_color_labels[led], &lv_font_montserrat_16, 0);
-        lv_obj_center(s_pod_led_color_labels[led]);
-        lv_obj_add_event_cb(colorButton, pod_led_color_cycle_cb, LV_EVENT_CLICKED,
-                            (void*)(intptr_t)led);
-    }
-
-    s_pod_status_label = lv_label_create(card);
-    lv_obj_set_width(s_pod_status_label, 780);
-    lv_obj_set_style_text_align(s_pod_status_label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_style_text_font(s_pod_status_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(s_pod_status_label, 18, 382);
-
-    lv_obj_t* midiMap = lv_btn_create(card);
-    lv_obj_set_size(midiMap, 100, 42);
-    lv_obj_set_pos(midiMap, 816, 392);
-    apply_control_button_style(midiMap, RED808_CYAN, false, 10);
-    lv_obj_t* midiMapLabel = lv_label_create(midiMap);
-    lv_label_set_text(midiMapLabel, "MIDI MAP\n2 DEVICES");
-    lv_obj_set_width(midiMapLabel, 88);
-    lv_obj_set_style_text_align(midiMapLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(midiMapLabel, &lv_font_montserrat_12, 0);
-    lv_obj_center(midiMapLabel);
-    lv_obj_add_event_cb(midiMap, mpd_map_modal_open_cb,
-                        LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* close = lv_btn_create(card);
-    lv_obj_set_size(close, 100, 42);
-    lv_obj_set_pos(close, 816, 444);
-    apply_control_button_style(close, RED808_WARNING, false, 10);
-    lv_obj_t* closeLabel = lv_label_create(close);
-    lv_label_set_text(closeLabel, "CLOSE");
-    lv_obj_center(closeLabel);
-    lv_obj_add_event_cb(close, [](lv_event_t*) { pod_status_modal_close_cb(NULL); },
-                        LV_EVENT_CLICKED, NULL);
-
-    // Preferencias — hueco libre bajo el status y a la izquierda de MIDI MAP/CLOSE.
-    s_pod_screensaver_btn = lv_btn_create(card);
-    lv_obj_set_size(s_pod_screensaver_btn, 220, 34);
-    lv_obj_set_pos(s_pod_screensaver_btn, 18, 494);
+    // Preferencias — debajo de los 3 destinos.
+    s_pod_screensaver_btn = lv_btn_create(s_pod_status_modal);
+    lv_obj_set_size(s_pod_screensaver_btn, cardW, 40);
+    lv_obj_set_pos(s_pod_screensaver_btn, cardX, startY + 3 * (cardH + gap));
     lv_obj_add_event_cb(s_pod_screensaver_btn, pod_screensaver_toggle_cb,
                         LV_EVENT_CLICKED, NULL);
     lv_obj_t* screensaverLbl = lv_label_create(s_pod_screensaver_btn);
@@ -5150,7 +5268,6 @@ static void pod_status_popup_cb(lv_event_t* e) {
     lv_obj_set_style_text_align(screensaverLbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(screensaverLbl);
 
-    pod_status_modal_refresh();
     pod_status_modal_update();
     pod_screensaver_refresh();
 }
@@ -5355,6 +5472,11 @@ static bool s_pod_encoder_position_ready = false;
 static void pod_apply_navigation_action(uint8_t function, uint8_t selected_pad) {
     switch (function) {
         case POD_FUNC_BACK: {
+            // Sub-screens render on top of the STATUS hub without closing
+            // it — check them first so physical BACK closes whichever is
+            // actually visible instead of the (hidden-behind) hub.
+            if (s_pod_dashboard_modal) { pod_dashboard_modal_close_cb(NULL); return; }
+            if (s_pod_control_map_modal) { pod_control_map_modal_close_cb(NULL); return; }
             if (s_pod_status_modal) { pod_status_modal_close_cb(NULL); return; }
             if (s_pad_inst_modal) { pad_inst_modal_close_cb(NULL); return; }
             if (s_pad_mode_modal) {
@@ -19839,6 +19961,7 @@ void ui_update_current_screen(void) {
     // STATUS is a global overlay and may be opened from any screen. Keep its
     // hardware values live regardless of the active per-screen updater.
     pod_status_modal_update();
+    pod_dashboard_modal_update();
     // MIDI MAP overlay: LEARN capture handoff + pad/knob glow on MIDI input.
     mpd_map_modal_update();
 
