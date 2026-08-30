@@ -6599,7 +6599,15 @@ static lv_obj_t*  fx_leds[FX_CARD_COUNT][FX_LED_COUNT] = {};
 
 // True if any learned MIDI CC maps to this FX LAB knob action. Only the
 // filter-related cards have a matching KnobActionType today.
-static bool fx_card_has_midi_mapping(int cell) {
+// Returns the learned CC number (0-127) for this control, or -1 if it has
+// no mapping OR no MIDI activity has been seen this session yet. DIN MIDI
+// has no plug-detect line, so "connected" is approximated the same way the
+// LIVE/SEQ MIDI activity dots already do (ui_midi_badge_refresh): a learned
+// mapping is a saved setting that outlives any one session, so without this
+// gate the badge would keep showing "MIDI" from a previous session even
+// with nothing plugged in — this only lights up once real traffic arrives.
+static int fx_card_midi_cc_number(int cell) {
+    if (control_midi_activity_revision() == 0) return -1;
     using namespace red808_mpd218;
     uint8_t knobAction;
     switch (cell) {
@@ -6609,16 +6617,16 @@ static bool fx_card_has_midi_mapping(int cell) {
         case FX_CARD_BITS:   knobAction = KNOB_BIT_DEPTH;         break;
         case FX_CARD_SRATE:  knobAction = KNOB_SAMPLE_RATE;       break;
         case FX_CARD_FILTER: knobAction = KNOB_FILTER_TYPE;       break;
-        default: return false;
+        default: return -1;
     }
     const uint8_t count = control_midi_map_count();
     for (uint8_t i = 0; i < count; i++) {
         MidiMapEntry entry;
         if (!control_midi_map_get(i, entry)) continue;
         if (entry.kind == MIDI_MAP_KIND_CC && entry.action == knobAction)
-            return true;
+            return entry.number;
     }
-    return false;
+    return -1;
 }
 static uint32_t s_fx_toggle_last_ms[FX_CARD_COUNT] = {};
 static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX buttons
@@ -7035,10 +7043,15 @@ static void fx_active_header_refresh(void) {
 
     for (int cell = 0; cell < FX_CARD_COUNT; ++cell) {
         if (!fx_midi_badges[cell]) continue;
-        if (fx_card_has_midi_mapping(cell))
+        int cc = fx_card_midi_cc_number(cell);
+        if (cc >= 0) {
             lv_obj_clear_flag(fx_midi_badges[cell], LV_OBJ_FLAG_HIDDEN);
-        else
+            // Shows which CC it's bound to (not just "MIDI") so re-learning
+            // a control onto a different CC is visible on the badge itself.
+            lv_label_set_text_fmt(fx_midi_badges[cell], "CC%d", cc);
+        } else {
             lv_obj_add_flag(fx_midi_badges[cell], LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
