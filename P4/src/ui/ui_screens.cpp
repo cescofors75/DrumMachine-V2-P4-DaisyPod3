@@ -1834,7 +1834,15 @@ static void xtra_pages_request_folders(void) {
     if (daisyUsb.send(CMD_SD_LIST_FOLDERS, &payload, sizeof(payload))) {
         s_xtra_page_req = XTRA_PAGE_REQ_ROOT_FOLDERS;
     } else {
-        ui_show_toast("Daisy USB no disponible", RED808_WARNING);
+        // A transient CDC write failure (link busy right after boot, other
+        // traffic saturating the same USB link) — not "no folders", so don't
+        // let the automatic scan-on-entry/boot call spam a toast about it;
+        // only an explicit RESCAN reports it, same as the other exit paths.
+        s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+        if (s_xtra_scan_toast_on_done) {
+            ui_show_toast("Daisy USB no disponible", RED808_WARNING);
+            s_xtra_scan_toast_on_done = false;
+        }
     }
 }
 
