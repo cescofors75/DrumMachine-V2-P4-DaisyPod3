@@ -5,9 +5,12 @@
 
 namespace {
 constexpr uint32_t POD_STORE_MAGIC = 0x32444F50u; // "POD2"
-// v3 installs the V7 factory map once. Later user assignments keep persisting
-// normally until the wire/config schema is intentionally migrated again.
-constexpr uint16_t POD_STORE_VERSION = 3;
+// v4 moves button2's factory default from CONTROL_CONFIG (opens STATUS) to
+// UNDO — STATUS stays reachable from its own on-screen "STATUS" cell, but
+// undo needed a dedicated physical button for fast recovery while playing
+// live. Later user assignments keep persisting normally until the
+// wire/config schema is intentionally migrated again.
+constexpr uint16_t POD_STORE_VERSION = 4;
 
 struct PodStoreBlob {
     uint32_t magic;
@@ -61,7 +64,7 @@ void pod_config_store_factory_defaults(PodConfigPayload& config)
 {
     config = PodConfigPayload{
         POD_CONFIG_VERSION,
-        POD_FUNC_BACK, POD_FUNC_CONTROL_CONFIG,
+        POD_FUNC_BACK, POD_FUNC_UNDO,
         POD_FUNC_MASTER_VOLUME, POD_FUNC_TEMPO,
         POD_FUNC_PATTERN_NEXT, POD_FUNC_PLAY_TOGGLE,
         POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX,

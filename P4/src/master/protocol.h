@@ -577,6 +577,7 @@ enum PodControlFunction : uint8_t {
     POD_FUNC_BIT_DEPTH,
     POD_FUNC_SAMPLE_RATE,
     POD_FUNC_FILTER_TYPE,
+    POD_FUNC_UNDO,
     POD_FUNC_COUNT
 };
 

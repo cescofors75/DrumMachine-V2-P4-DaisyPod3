@@ -103,6 +103,16 @@ static void matrix_modal_show(lv_event_t* e);
 // a path other than MATRIX's own STOP button (see header_play_cb).
 static void matrix_note_transport_stopped(void);
 
+// ── UNDO — one physical button, whatever you touched last ──────────────
+// The dispatcher's real body lives near the melody preset section (after
+// all three preset structs it needs to restore from are defined) — only
+// it is forward-declared here, since the physical button handler (early
+// in the file) needs to call it long before that point. The individual
+// undo_record_*/undo_arm_* functions each live right next to what they
+// record (step toggle, EVOLVE toggle, preset save) and need no forward
+// declaration of their own — nothing calls them before those points.
+static void ui_perform_undo(void);
+
 // RANDOM SONG's musical-jump reason (see triggerRandomSongJump in
 // control_api.cpp) — single producer (the control task), so a plain
 // buffer guarded by release/acquire on the pending flag is enough: the
@@ -3343,7 +3353,7 @@ static const char* pod_control_function_name(uint8_t function) {
         "DELAY MIX", "REVERB MIX", "BUTTON CONFIG", "DISPLAY BRIGHTNESS",
         "FLANGER DEPTH", "WAVEFOLDER", "CRUSH MACRO", "PHASER DEPTH",
         "FILTER CUTOFF", "FILTER RESONANCE", "DISTORTION", "BIT DEPTH",
-        "SAMPLE RATE", "FILTER TYPE"
+        "SAMPLE RATE", "FILTER TYPE", "UNDO"
     };
     return function < POD_FUNC_COUNT ? names[function] : "NONE";
 }
@@ -3499,7 +3509,7 @@ static void pod_control_function_list(uint8_t row, const uint8_t*& list,
         POD_FUNC_TRIGGER_SELECTED, POD_FUNC_PATTERN_PREV, POD_FUNC_PATTERN_NEXT,
         POD_FUNC_BACK, POD_FUNC_MIXER, POD_FUNC_FX, POD_FUNC_SEQUENCER,
         POD_FUNC_PAD_GRID, POD_FUNC_PAD_SOUNDS, POD_FUNC_XTRA_PADS,
-        POD_FUNC_CONTROL_CONFIG
+        POD_FUNC_CONTROL_CONFIG, POD_FUNC_UNDO
     };
     static const uint8_t absoluteFunctions[] = {
         POD_FUNC_NONE, POD_FUNC_MASTER_VOLUME, POD_FUNC_SEQ_VOLUME,
@@ -5373,6 +5383,7 @@ static void pod_apply_navigation_action(uint8_t function, uint8_t selected_pad) 
             break;
         case POD_FUNC_XTRA_PADS: ui_navigate_to(6); break;
         case POD_FUNC_CONTROL_CONFIG: pod_status_popup_cb(NULL); break;
+        case POD_FUNC_UNDO: ui_perform_undo(); break;
         default: break;
     }
 }
@@ -7714,8 +7725,62 @@ static void filter_preset_modal_refresh(void) {
     }
 }
 
+// ── UNDO core: one shared "what did I touch last" slot ─────────────────
+// Whichever record_* function below runs last wins — no timestamp/counter
+// needed, since each one unconditionally stamps s_undo_kind as the very
+// last thing it does. The physical UNDO button (see ui_perform_undo(),
+// defined once the melody preset struct is also available further down)
+// just looks at s_undo_kind and restores from whichever backup matches.
+enum UndoKind : uint8_t {
+    UNDO_NONE = 0, UNDO_STEP, UNDO_PATTERN,
+    UNDO_FILTER_PRESET, UNDO_MIXER_PRESET, UNDO_MELODY_PRESET
+};
+static UndoKind s_undo_kind = UNDO_NONE;
+
+static int  s_undo_step_pattern = -1;
+static int  s_undo_step_track = -1;
+static int  s_undo_step_step = -1;
+static bool s_undo_step_prev = false;
+
+// Called from seq_step_cb right before it flips a step — a single tap is
+// the most common thing to want to take back while playing live.
+static void undo_record_step(int track, int step, bool prevValue) {
+    s_undo_step_pattern = p4.current_pattern;
+    s_undo_step_track = track;
+    s_undo_step_step = step;
+    s_undo_step_prev = prevValue;
+    s_undo_kind = UNDO_STEP;
+}
+
+// Called after control_apply_sequencer_variation() (VAR modal) already
+// wrote the pre-variation state into its own backup — this just claims
+// that backup as "the most recent undoable thing".
+static void undo_note_pattern_snapshot_taken(void) {
+    s_undo_kind = UNDO_PATTERN;
+}
+
+// Called when EVOLVE is switched on: EVOLVE mutates gradually every bar
+// with no single "last action" of its own, so undo instead means "put the
+// pattern back how it was right before this EVOLVE session started".
+static void undo_arm_evolve_snapshot(void) {
+    control_variation_snapshot_current();
+    undo_note_pattern_snapshot_taken();
+}
+
+static FilterPresetSlot s_undo_filter_backup{};
+static int s_undo_filter_slot = -1;
+// Called right before a preset save overwrites a slot — lets a producer
+// who fat-fingered SAVE over a slot they meant to keep get it back.
+static void undo_record_filter_preset(int slot) {
+    if (slot < 0 || slot >= FILTER_PRESET_COUNT) return;
+    s_undo_filter_slot = slot;
+    s_undo_filter_backup = s_filter_presets[slot];
+    s_undo_kind = UNDO_FILTER_PRESET;
+}
+
 static void filter_preset_save_current(int slot) {
     if (slot < 0 || slot >= FILTER_PRESET_COUNT) return;
+    undo_record_filter_preset(slot);
     FilterPresetSlot& s = s_filter_presets[slot];
     s.used = true;
     snprintf(s.name, sizeof(s.name), "%s", fx_filter_model_name(constrain(p4.filter_type, 0, 15)));
@@ -9215,7 +9280,13 @@ static void seq_evolve_bars_cb(lv_event_t* e) {
 
 static void seq_evolve_toggle_cb(lv_event_t* e) {
     LV_UNUSED(e);
-    control_random_evolve_set_active(!control_random_evolve_active());
+    const bool turningOn = !control_random_evolve_active();
+    // Snapshot the pattern right before EVOLVE starts nudging it, so undo
+    // means "put it back how it was before this EVOLVE session" — EVOLVE
+    // itself mutates gradually every bar with no single "last action" of
+    // its own to reverse otherwise.
+    if (turningOn) undo_arm_evolve_snapshot();
+    control_random_evolve_set_active(turningOn);
     seq_evolve_modal_refresh();
     seq_evolve_btn_refresh();
 }
@@ -9363,6 +9434,11 @@ static void seq_variation_select_cb(lv_event_t* e) {
         ui_show_toast("La variacion no cambia este patron", RED808_WARNING);
         return;
     }
+    // control_apply_sequencer_variation() already wrote the pre-variation
+    // state into its own backup for any non-UNDO pick — just mark it as
+    // the most recent undoable action. Applying UNDO itself is a restore,
+    // not a new snapshot-worthy action, so it doesn't re-arm anything.
+    if (selected != SEQ_VAR_UNDO) undo_note_pattern_snapshot_taken();
 
     const int base = seq_page * 16;
     for (int track = 0; track < 16; ++track)
@@ -9613,7 +9689,10 @@ static void kanban_set_active(int mode, bool v) {
         case KANBAN_SONG:      control_random_song_set_active(v); break;
         case KANBAN_FX:        control_random_fx_set_active(v); break;
         case KANBAN_MIX:       control_random_mix_set_active(v); break;
-        case KANBAN_EVOLVE:    control_random_evolve_set_active(v); break;
+        case KANBAN_EVOLVE:
+            if (v && !control_random_evolve_active()) undo_arm_evolve_snapshot();
+            control_random_evolve_set_active(v);
+            break;
         case KANBAN_VARIATION: control_random_variation_set_active(v); break;
     }
 }
@@ -10158,6 +10237,7 @@ static void seq_step_cb(lv_event_t* e) {
     int step  = data & 0xFF;
     if (track < 16 && step < 16) {
         bool next = !p4.steps[track][step];
+        undo_record_step(track, step, p4.steps[track][step]);
         p4.steps[track][step] = next;
         // Always update the resident P4 pattern so SAVE works offline too;
         // the transport safely drops the packet when Daisy is unavailable.
@@ -11870,8 +11950,19 @@ static void mixer_preset_modal_refresh(void) {
     }
 }
 
+static MixerPresetSlot s_undo_mixer_backup{};
+static int s_undo_mixer_slot = -1;
+// See undo_record_filter_preset()'s comment above — same reasoning.
+static void undo_record_mixer_preset(int slot) {
+    if (slot < 0 || slot >= MIXER_PRESET_COUNT) return;
+    s_undo_mixer_slot = slot;
+    s_undo_mixer_backup = s_mixer_presets[slot];
+    s_undo_kind = UNDO_MIXER_PRESET;
+}
+
 static void mixer_preset_save_current(int slot) {
     if (slot < 0 || slot >= MIXER_PRESET_COUNT) return;
+    undo_record_mixer_preset(slot);
     MixerPresetSlot& s = s_mixer_presets[slot];
     s.used = true;
     snprintf(s.name, sizeof(s.name), "MIX %d", slot + 1);
@@ -16202,8 +16293,19 @@ static void melody_preset_modal_refresh(void) {
     }
 }
 
+static MelodyPresetSlot s_undo_melody_backup{};
+static int s_undo_melody_slot = -1;
+// See undo_record_filter_preset()'s comment above — same reasoning.
+static void undo_record_melody_preset(int slot) {
+    if (slot < 0 || slot >= MELODY_PRESET_COUNT) return;
+    s_undo_melody_slot = slot;
+    s_undo_melody_backup = s_melody_presets[slot];
+    s_undo_kind = UNDO_MELODY_PRESET;
+}
+
 static void melody_preset_save_current(int slot) {
     if (slot < 0 || slot >= MELODY_PRESET_COUNT) return;
+    undo_record_melody_preset(slot);
     MelodyPresetSlot& s = s_melody_presets[slot];
     s.used = true;
     snprintf(s.name, sizeof(s.name), "MEL %d", slot + 1);
@@ -16215,6 +16317,72 @@ static void melody_preset_save_current(int slot) {
     melody_presets_save_to_disk();
     melody_preset_modal_refresh();
     ui_show_toast("Preset de melodia guardado", RED808_SUCCESS);
+}
+
+// The physical UNDO button's dispatcher — reverses whichever of the five
+// undoable kinds was recorded most recently, regardless of which screen
+// that happened on. Single-level: pressing it again once s_undo_kind has
+// been consumed shows "nada que deshacer" rather than stepping further
+// back, matching what every undo_record_*/undo_arm_* call site above
+// actually captures (one snapshot, overwritten by whatever comes next).
+static void ui_perform_undo(void) {
+    switch (s_undo_kind) {
+        case UNDO_STEP: {
+            if (s_undo_step_pattern != p4.current_pattern) {
+                ui_show_toast("Nada que deshacer en este patron", RED808_WARNING);
+                return;
+            }
+            p4.steps[s_undo_step_track][s_undo_step_step] = s_undo_step_prev;
+            control_send_set_step(s_undo_step_track, s_undo_step_step, s_undo_step_prev);
+            int idx = seq_page * 16 + s_undo_step_step;
+            if (idx < 64) seq_raw_grid[s_undo_step_track][idx] = s_undo_step_prev;
+            seq_force_refresh_cells = true;
+            seq_set_pattern_dirty(true);
+            ui_show_toast("Paso deshecho", RED808_SUCCESS);
+            break;
+        }
+        case UNDO_PATTERN: {
+            if (!control_apply_sequencer_variation(SEQ_VAR_UNDO)) {
+                ui_show_toast("Nada que deshacer en este patron", RED808_WARNING);
+                return;
+            }
+            const int base = seq_page * 16;
+            for (int track = 0; track < 16; ++track)
+                for (int step = 0; step < 16; ++step)
+                    if (base + step < 64)
+                        seq_raw_grid[track][base + step] = p4.steps[track][step];
+            seq_force_refresh_cells = true;
+            seq_set_pattern_dirty(true);
+            s_ctrl_pattern_sync_pending.store(true, std::memory_order_release);
+            ui_show_toast("Patron deshecho", RED808_SUCCESS);
+            break;
+        }
+        case UNDO_FILTER_PRESET:
+            if (s_undo_filter_slot < 0) { ui_show_toast("Nada que deshacer", RED808_WARNING); return; }
+            s_filter_presets[s_undo_filter_slot] = s_undo_filter_backup;
+            filter_presets_save_to_disk();
+            filter_preset_modal_refresh();
+            ui_show_toast("Preset de filtro restaurado", RED808_SUCCESS);
+            break;
+        case UNDO_MIXER_PRESET:
+            if (s_undo_mixer_slot < 0) { ui_show_toast("Nada que deshacer", RED808_WARNING); return; }
+            s_mixer_presets[s_undo_mixer_slot] = s_undo_mixer_backup;
+            mixer_presets_save_to_disk();
+            mixer_preset_modal_refresh();
+            ui_show_toast("Preset de mixer restaurado", RED808_SUCCESS);
+            break;
+        case UNDO_MELODY_PRESET:
+            if (s_undo_melody_slot < 0) { ui_show_toast("Nada que deshacer", RED808_WARNING); return; }
+            s_melody_presets[s_undo_melody_slot] = s_undo_melody_backup;
+            melody_presets_save_to_disk();
+            melody_preset_modal_refresh();
+            ui_show_toast("Preset de melodia restaurado", RED808_SUCCESS);
+            break;
+        default:
+            ui_show_toast("Nada que deshacer", RED808_WARNING);
+            return;
+    }
+    s_undo_kind = UNDO_NONE;
 }
 
 // silent=true — see filter_preset_recall's comment above; same reasoning.

@@ -45,6 +45,7 @@ enum SequencerVariation : uint8_t {
 };
 bool control_apply_sequencer_variation(uint8_t variation);
 bool control_variation_can_undo();
+void control_variation_snapshot_current();
 
 // Euclidean-rhythm pattern generator (kept as a standalone utility — not
 // currently wired to any UI control; the sequencer's "random" surface is

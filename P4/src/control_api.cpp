@@ -1902,6 +1902,29 @@ void control_random_auto_tick()
     if(barClockTick(matrixClock)) triggerMatrixAdvance();
 }
 
+// Just the backup half of control_apply_sequencer_variation() below, with
+// no mutation applied — lets a caller "arm" a restore point of its own
+// (EVOLVE does this the moment it's switched on) without needing a named
+// variation to piggyback on.
+void control_variation_snapshot_current()
+{
+    Sequencer& sequencer = SequencerInstance();
+    const int pattern = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+    variationBackup.valid = true;
+    variationBackup.pattern = pattern;
+    for(int track = 0; track < 16; ++track)
+    {
+        for(int step = 0; step < 16; ++step)
+        {
+            variationBackup.active[track][step] = sequencer.getStep(pattern, track, step);
+            variationBackup.velocity[track][step] = sequencer.getStepVelocity(pattern, track, step);
+            variationBackup.probability[track][step] = sequencer.getStepProbability(pattern, track, step);
+            variationBackup.ratchet[track][step] = Clamp<uint8_t>(
+                sequencer.getStepRatchet(pattern, track, step), 1, 4);
+        }
+    }
+}
+
 bool control_variation_can_undo()
 {
     return variationBackup.valid

@@ -1060,6 +1060,7 @@ enum PodControlFunction : uint8_t {
     POD_FUNC_BIT_DEPTH,
     POD_FUNC_SAMPLE_RATE,
     POD_FUNC_FILTER_TYPE,
+    POD_FUNC_UNDO,
     POD_FUNC_COUNT
 };
 
@@ -1151,7 +1152,7 @@ static_assert(sizeof(PodStatePayload) == 66,
 static constexpr uint8_t POD_CONFIG_VERSION = 7;
 static PodConfigPayload podConfig = {
     POD_CONFIG_VERSION,
-    POD_FUNC_BACK, POD_FUNC_CONTROL_CONFIG,
+    POD_FUNC_BACK, POD_FUNC_UNDO,
     POD_FUNC_MASTER_VOLUME, POD_FUNC_TEMPO,
     POD_FUNC_PATTERN_NEXT, POD_FUNC_PLAY_TOGGLE,
     POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX,
