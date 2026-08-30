@@ -2734,7 +2734,19 @@ void local_apply_message(uint8_t type, uint8_t id, uint8_t value)
 {
     if(type == MSG_SYSTEM && id == SYS_PLAY_STATE)
     {
-        if(value) control_send_start(); else control_send_stop();
+        if(value) control_send_start();
+        else
+        {
+            control_send_stop();
+            // A physical transport control (DaisyPod encoder, MPD218 pad,
+            // etc.) can stop playback without going through MATRIX's own
+            // STOP button — keep its active flag from getting stuck "ON"
+            // once nothing is actually advancing. UI-side highlight/status
+            // widgets self-correct next time MATRIX's own refresh points
+            // run (this runs off the LVGL task, so it only touches the
+            // plain control-layer flag here).
+            if(control_matrix_active()) control_matrix_set_active(false);
+        }
     }
     else if(type == MSG_SYSTEM && id == SYS_STEP)
         p4.current_step = value & 15u;

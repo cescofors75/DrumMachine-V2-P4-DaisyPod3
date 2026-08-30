@@ -99,6 +99,9 @@ void ui_request_matrix_tick(uint8_t idx) {
 // consumer above can reference them.
 static void matrix_apply_column(uint8_t idx);
 static void matrix_modal_show(lv_event_t* e);
+// Clears MATRIX's active/highlight state when the transport stops through
+// a path other than MATRIX's own STOP button (see header_play_cb).
+static void matrix_note_transport_stopped(void);
 
 // RANDOM SONG's musical-jump reason (see triggerRandomSongJump in
 // control_api.cpp) — single producer (the control task), so a plain
@@ -528,6 +531,13 @@ static void header_play_cb(lv_event_t* e) {
     local_apply_message(MSG_SYSTEM, SYS_STEP, 0);
     p4.current_step = 0;
     p4.is_playing = next_play;
+    // Pausing from the transport button (rather than MATRIX's own STOP)
+    // used to leave MATRIX's "ON" state stuck, since only its own button
+    // cleared it — the bar-clock silently stopped ticking (it requires
+    // p4.is_playing) but nothing told MATRIX that happened, so resuming
+    // play later restarted its bar count from an arbitrary point instead
+    // of a clean column 0.
+    if (!next_play) matrix_note_transport_stopped();
 }
 
 static void header_pattern_cb(lv_event_t* e) {
@@ -7676,6 +7686,20 @@ static void filter_presets_load_from_disk(void) {
     if (!any_used) filter_presets_apply_factory();
 }
 
+// filter_presets_load_from_disk() used to run only as a side effect of
+// creating the FX LAB screen — fine as long as nothing else reads
+// s_filter_presets first. Now that MATRIX can be opened straight from the
+// sequencer header without ever visiting FX LAB, its preset picker would
+// see every slot as empty (all-zero statics) if the array was never
+// loaded. This guard lets any call site ask for the data on demand
+// without re-reading SPIFFS every time.
+static bool s_filter_presets_loaded = false;
+static void filter_presets_ensure_loaded(void) {
+    if (s_filter_presets_loaded) return;
+    s_filter_presets_loaded = true;
+    filter_presets_load_from_disk();
+}
+
 static void filter_preset_modal_refresh(void) {
     for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
         if (!s_filter_preset_slot_lbls[i]) continue;
@@ -8146,7 +8170,7 @@ static void create_fx_screen(void) {
     lv_obj_set_style_text_font(xy_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(xy_lbl);
 
-    filter_presets_load_from_disk();
+    filter_presets_ensure_loaded();
     fx_apply_layout();
     // Re-applies s_fx_viz_style's visibility to the freshly (re)created
     // arc/bar/led widgets above — needed because that style choice
@@ -11823,6 +11847,15 @@ static void mixer_presets_load_from_disk(void) {
     if (!any_used) mixer_presets_apply_factory();
 }
 
+// See filter_presets_ensure_loaded()'s comment — same reasoning, so MATRIX
+// sees real mixer preset names even if MIXER was never opened this boot.
+static bool s_mixer_presets_loaded = false;
+static void mixer_presets_ensure_loaded(void) {
+    if (s_mixer_presets_loaded) return;
+    s_mixer_presets_loaded = true;
+    mixer_presets_load_from_disk();
+}
+
 static void mixer_preset_modal_refresh(void) {
     for (int i = 0; i < MIXER_PRESET_COUNT; i++) {
         if (!s_mixer_preset_slot_lbls[i]) continue;
@@ -12069,7 +12102,7 @@ static void create_volumes_screen(void) {
         lv_obj_set_style_text_font(presetsLabel, &lv_font_montserrat_12, 0);
         lv_obj_center(presetsLabel);
     }
-    mixer_presets_load_from_disk();
+    mixer_presets_ensure_loaded();
 
     // Single row of 16 strips filling the full display width
     int margin = 10;
@@ -16146,6 +16179,15 @@ static void melody_presets_load_from_disk(void) {
     if (!any_used) melody_presets_apply_factory();
 }
 
+// See filter_presets_ensure_loaded()'s comment — same reasoning, so MATRIX
+// sees real melody preset names even if PIANO was never opened this boot.
+static bool s_melody_presets_loaded = false;
+static void melody_presets_ensure_loaded(void) {
+    if (s_melody_presets_loaded) return;
+    s_melody_presets_loaded = true;
+    melody_presets_load_from_disk();
+}
+
 static void melody_preset_modal_refresh(void) {
     for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
         if (!s_melody_preset_slot_lbls[i]) continue;
@@ -16722,6 +16764,16 @@ static void matrix_highlight_refresh(void) {
     }
 }
 
+static void matrix_note_transport_stopped(void) {
+    if (!control_matrix_active()) return;
+    control_matrix_set_active(false);
+    if (s_matrix_modal) {
+        s_matrix_active_col = -1;
+        matrix_highlight_refresh();
+        matrix_status_refresh();
+    }
+}
+
 // Called from the SONG modal's own PLAY, and from the bar-clock tick bridge
 // (see ui_request_matrix_tick / ui_update_current_screen) whenever MATRIX
 // advances to a new column while running unattended — recalls that
@@ -16741,6 +16793,11 @@ static void matrix_play_btn_cb(lv_event_t* e) {
     LV_UNUSED(e);
     if (control_matrix_active()) {
         control_matrix_set_active(false);
+        // Stopping only the auto-advance left the transport looping the last
+        // column's pattern forever — MATRIX said "OFF" but the music kept
+        // playing, which read as PLAY/STOP "iban por su cuenta". STOP here
+        // now means stop, same as the transport's own STOP.
+        control_send_stop();
         s_matrix_active_col = -1;
         matrix_highlight_refresh();
         matrix_status_refresh();
@@ -16903,6 +16960,12 @@ static void matrix_modal_show(lv_event_t* e) {
         matrix_song_load_from_disk();
         s_matrix_loaded_from_disk = true;
     }
+    // MATRIX can now be opened straight from the sequencer header without
+    // ever visiting FX LAB / MIXER / PIANO — make sure their preset arrays
+    // are populated regardless, or every picker here would show "VACIO".
+    filter_presets_ensure_loaded();
+    mixer_presets_ensure_loaded();
+    melody_presets_ensure_loaded();
     s_matrix_view_page = 0;
 
     s_matrix_modal = lv_obj_create(lv_layer_top());
@@ -17152,7 +17215,7 @@ static void create_piano_screen(void) {
         if (l) lv_obj_set_style_text_color(l, RED808_CYAN, 0);
         lv_obj_add_event_cb(mpb, melody_preset_modal_show, LV_EVENT_CLICKED, NULL);
     }
-    melody_presets_load_from_disk();
+    melody_presets_ensure_loaded();
 
     // v3.0 — visual controls for gesture piano (glide/bend/range)
     s_piano_glide_btn = piano_make_chip(scr_piano, 730, row_y, 98, 36,
