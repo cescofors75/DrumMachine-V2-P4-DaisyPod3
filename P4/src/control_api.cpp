@@ -249,7 +249,7 @@ void LoadPatternToUi(int pattern)
 void SendFilterState()
 {
     GlobalFilterPayload payload = {};
-    payload.filterType = static_cast<uint8_t>(Clamp(p4.filter_type, 0, 14));
+    payload.filterType = static_cast<uint8_t>(Clamp(p4.filter_type, 0, 15)); // 15 = FTYPE_SVF_MORPH
     payload.distMode = 0;
     payload.bitDepth = static_cast<uint8_t>(Clamp(p4.bitcrush_bits, 4, 16));
     payload.cutoff = static_cast<float>(Clamp(p4.cutoff_hz, 20, 20000));
@@ -2258,7 +2258,7 @@ void control_send_set_filter(int type)
 {
     if(i2c_rotaries_owns_function(POD_FUNC_FILTER_TYPE)
        && !i2c_rotaries_is_applying()) return;
-    p4.filter_type = Clamp(type, 0, 14);
+    p4.filter_type = Clamp(type, 0, 15); // 15 = FTYPE_SVF_MORPH
     SendFilterState();
 }
 
