@@ -14770,7 +14770,7 @@ static void create_sdcard_screen(void) {
     sd_left_panel = lv_obj_create(scr_sdcard);
     lv_obj_set_size(sd_left_panel, LEFT_W, PANEL_H);
     lv_obj_set_pos(sd_left_panel, 4, TOP);
-    lv_obj_set_style_bg_color(sd_left_panel, lv_color_hex(0x0D1520), 0);
+    lv_obj_set_style_bg_color(sd_left_panel, RED808_SURFACE, 0);
     lv_obj_set_style_bg_opa(sd_left_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(sd_left_panel, RED808_INFO, 0);
     lv_obj_set_style_border_width(sd_left_panel, 1, 0);
@@ -14796,14 +14796,18 @@ static void create_sdcard_screen(void) {
         lv_obj_set_size(sd_src_sd_btn, btn_w, btn_h);
         lv_obj_set_pos(sd_src_sd_btn, bx, by);
         lv_obj_set_style_bg_color(sd_src_sd_btn,
-            sd_source == 0 ? RED808_CYAN : lv_color_hex(0x1A2A3A), 0);
+            sd_source == 0 ? RED808_CYAN : RED808_PANEL, 0);
         lv_obj_set_style_radius(sd_src_sd_btn, 6, 0);
         lv_obj_set_style_border_width(sd_src_sd_btn, 1, 0);
-        lv_obj_set_style_border_color(sd_src_sd_btn, lv_color_hex(0x334455), 0);
+        lv_obj_set_style_border_color(sd_src_sd_btn, RED808_BORDER, 0);
         lv_obj_t* l1 = lv_label_create(sd_src_sd_btn);
         lv_label_set_text(l1, "P4 SD");
         lv_obj_set_style_text_font(l1, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(l1, lv_color_black(), 0);
+        // Selected state fills the button with the accent, so the label
+        // flips to RED808_BG for contrast (same convention as everywhere
+        // else in the app) instead of a fixed black that went invisible
+        // against a dark unselected background.
+        lv_obj_set_style_text_color(l1, sd_source == 0 ? RED808_BG : RED808_CYAN, 0);
         lv_obj_center(l1);
         lv_obj_add_event_cb(sd_src_sd_btn, sd_source_btn_cb,
                             LV_EVENT_CLICKED, (void*)(intptr_t)0);
@@ -14812,14 +14816,17 @@ static void create_sdcard_screen(void) {
         lv_obj_set_size(sd_src_mem_btn, btn_w, btn_h);
         lv_obj_set_pos(sd_src_mem_btn, bx + btn_w + 6, by);
         lv_obj_set_style_bg_color(sd_src_mem_btn,
-            sd_source == 1 ? RED808_WARNING : lv_color_hex(0x1A2A3A), 0);
+            sd_source == 1 ? RED808_WARNING : RED808_PANEL, 0);
         lv_obj_set_style_radius(sd_src_mem_btn, 6, 0);
         lv_obj_set_style_border_width(sd_src_mem_btn, 1, 0);
-        lv_obj_set_style_border_color(sd_src_mem_btn, lv_color_hex(0x334455), 0);
+        lv_obj_set_style_border_color(sd_src_mem_btn, RED808_BORDER, 0);
         lv_obj_t* l2 = lv_label_create(sd_src_mem_btn);
         lv_label_set_text(l2, "MEM");
         lv_obj_set_style_text_font(l2, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(l2, RED808_WARNING, 0);
+        // Same fix as l1 above — this used to stay RED808_WARNING even
+        // when selected, matching the (also warning-colored) background
+        // and making the label unreadable.
+        lv_obj_set_style_text_color(l2, sd_source == 1 ? RED808_BG : RED808_WARNING, 0);
         lv_obj_center(l2);
         lv_obj_add_event_cb(sd_src_mem_btn, sd_source_btn_cb,
                             LV_EVENT_CLICKED, (void*)(intptr_t)1);
@@ -14857,7 +14864,7 @@ static void create_sdcard_screen(void) {
     sd_right_panel = lv_obj_create(scr_sdcard);
     lv_obj_set_size(sd_right_panel, RIGHT_W, PANEL_H);
     lv_obj_set_pos(sd_right_panel, LEFT_W + GAP, TOP);
-    lv_obj_set_style_bg_color(sd_right_panel, lv_color_hex(0x0D1520), 0);
+    lv_obj_set_style_bg_color(sd_right_panel, RED808_SURFACE, 0);
     lv_obj_set_style_bg_opa(sd_right_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(sd_right_panel, RED808_ACCENT, 0);
     lv_obj_set_style_border_width(sd_right_panel, 1, 0);
@@ -14895,10 +14902,10 @@ static void create_sdcard_screen(void) {
         lv_obj_t* btn = lv_btn_create(sd_wav_section);
         lv_obj_set_size(btn, pad_w, pad_h);
         lv_obj_set_pos(btn, px, py);
-        lv_obj_set_style_bg_color(btn, i == 0 ? RED808_ACCENT : lv_color_hex(0x222233), 0);
+        lv_obj_set_style_bg_color(btn, i == 0 ? RED808_ACCENT : RED808_PANEL, 0);
         lv_obj_set_style_radius(btn, 6, 0);
         lv_obj_set_style_border_width(btn, 1, 0);
-        lv_obj_set_style_border_color(btn, lv_color_hex(0x444466), 0);
+        lv_obj_set_style_border_color(btn, RED808_BORDER, 0);
 
         lv_obj_t* num_lbl = lv_label_create(btn);
         char num_str[12];
@@ -14927,7 +14934,7 @@ static void create_sdcard_screen(void) {
     lv_obj_set_size(sd_preview_btn, RIGHT_W - 24, 48);
     lv_obj_set_pos(sd_preview_btn, 8, 308);
     lv_obj_set_style_bg_color(sd_preview_btn, RED808_SURFACE, 0);
-    lv_obj_set_style_bg_color(sd_preview_btn, lv_color_hex(0x223344), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(sd_preview_btn, RED808_BORDER, LV_STATE_DISABLED);
     lv_obj_set_style_border_color(sd_preview_btn, RED808_CYAN, 0);
     lv_obj_set_style_border_width(sd_preview_btn, 2, 0);
     lv_obj_set_style_radius(sd_preview_btn, 10, 0);
@@ -14935,7 +14942,10 @@ static void create_sdcard_screen(void) {
     sd_preview_lbl = lv_label_create(sd_preview_btn);
     lv_label_set_text(sd_preview_lbl, LV_SYMBOL_PLAY "  PREVIEW PAD");
     lv_obj_set_style_text_font(sd_preview_lbl, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(sd_preview_lbl, lv_color_white(), 0);
+    // Sits on a plain RED808_SURFACE (outlined, not filled) button, not an
+    // always-bright one — RED808_TEXT tracks the theme's own body text
+    // color instead of assuming SURFACE is always dark enough for white.
+    lv_obj_set_style_text_color(sd_preview_lbl, RED808_TEXT, 0);
     lv_obj_center(sd_preview_lbl);
     lv_obj_add_event_cb(sd_preview_btn, sd_preview_btn_cb, LV_EVENT_CLICKED, NULL);
 
@@ -14944,14 +14954,16 @@ static void create_sdcard_screen(void) {
     lv_obj_set_size(sd_load_btn, RIGHT_W - 24, 60);
     lv_obj_set_pos(sd_load_btn, 8, 362);
     lv_obj_set_style_bg_color(sd_load_btn, RED808_ACCENT, 0);
-    lv_obj_set_style_bg_color(sd_load_btn, lv_color_hex(0x882200), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(sd_load_btn, RED808_BORDER, LV_STATE_DISABLED);
     lv_obj_set_style_radius(sd_load_btn, 10, 0);
     lv_obj_add_state(sd_load_btn, LV_STATE_DISABLED);
 
     sd_load_lbl = lv_label_create(sd_load_btn);
     lv_label_set_text(sd_load_lbl, LV_SYMBOL_UPLOAD "  LOAD TO PAD");
     lv_obj_set_style_text_font(sd_load_lbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(sd_load_lbl, lv_color_white(), 0);
+    // Filled with RED808_ACCENT — RED808_BG for contrast, same convention
+    // as everywhere else, instead of an unconditional white.
+    lv_obj_set_style_text_color(sd_load_lbl, RED808_BG, 0);
     lv_obj_center(sd_load_lbl);
     lv_obj_add_event_cb(sd_load_btn, sd_load_btn_cb, LV_EVENT_CLICKED, NULL);
 
@@ -15018,10 +15030,10 @@ static void create_sdcard_screen(void) {
             lv_obj_set_size(btn, mp_btn_w, mp_btn_h);
             lv_obj_set_pos(btn, bx, by);
             lv_obj_set_style_bg_color(btn,
-                slot_id == sd_midi_target_slot ? RED808_ACCENT : lv_color_hex(0x1A2A3A), 0);
+                slot_id == sd_midi_target_slot ? RED808_ACCENT : RED808_PANEL, 0);
             lv_obj_set_style_border_width(btn, 2, 0);
             lv_obj_set_style_border_color(btn,
-                slot_id == sd_midi_target_slot ? RED808_CYAN : lv_color_hex(0x334455), 0);
+                slot_id == sd_midi_target_slot ? RED808_CYAN : RED808_BORDER, 0);
             lv_obj_set_style_radius(btn, 8, 0);
 
             lv_obj_t* bl = lv_label_create(btn);
@@ -15030,7 +15042,7 @@ static void create_sdcard_screen(void) {
             lv_label_set_text(bl, bname);
             lv_obj_set_style_text_font(bl, &lv_font_montserrat_20, 0);
             lv_obj_set_style_text_color(bl,
-                slot_id == sd_midi_target_slot ? lv_color_white() : RED808_TEXT_DIM, 0);
+                slot_id == sd_midi_target_slot ? RED808_BG : RED808_TEXT_DIM, 0);
             lv_obj_center(bl);
 
             sd_midi_pat_btns[i] = btn;
@@ -15055,20 +15067,20 @@ static void create_sdcard_screen(void) {
             lv_obj_set_style_radius(btn, 8, 0);
             lv_obj_set_style_border_width(btn, 2, 0);
             lv_obj_set_style_bg_color(btn,
-                active ? RED808_ACCENT : lv_color_hex(0x1A2A3A), 0);
+                active ? RED808_ACCENT : RED808_PANEL, 0);
             lv_obj_set_style_border_color(btn,
-                active ? RED808_CYAN : lv_color_hex(0x334455), 0);
+                active ? RED808_CYAN : RED808_BORDER, 0);
             lv_obj_t* t = lv_label_create(btn);
             lv_label_set_text(t, title);
             lv_obj_set_style_text_font(t, &lv_font_montserrat_18, 0);
             lv_obj_set_style_text_color(t,
-                active ? lv_color_white() : RED808_TEXT, 0);
+                active ? RED808_BG : RED808_TEXT, 0);
             lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
             lv_obj_t* s = lv_label_create(btn);
             lv_label_set_text(s, subtitle);
             lv_obj_set_style_text_font(s, &lv_font_montserrat_10, 0);
             lv_obj_set_style_text_color(s,
-                active ? lv_color_white() : RED808_TEXT_DIM, 0);
+                active ? RED808_BG : RED808_TEXT_DIM, 0);
             lv_obj_align(s, LV_ALIGN_BOTTOM_MID, 0, -4);
             return btn;
         };
@@ -15089,8 +15101,8 @@ static void create_sdcard_screen(void) {
                 lv_obj_set_style_border_color(sd_midi_mode_pro_btn, RED808_CYAN, 0);
             }
             if (sd_midi_mode_std_btn) {
-                lv_obj_set_style_bg_color(sd_midi_mode_std_btn, lv_color_hex(0x1A2A3A), 0);
-                lv_obj_set_style_border_color(sd_midi_mode_std_btn, lv_color_hex(0x334455), 0);
+                lv_obj_set_style_bg_color(sd_midi_mode_std_btn, RED808_PANEL, 0);
+                lv_obj_set_style_border_color(sd_midi_mode_std_btn, RED808_BORDER, 0);
             }
         }, LV_EVENT_CLICKED, NULL);
         lv_obj_add_event_cb(sd_midi_mode_std_btn, [](lv_event_t*){
@@ -15100,8 +15112,8 @@ static void create_sdcard_screen(void) {
                 lv_obj_set_style_border_color(sd_midi_mode_std_btn, RED808_CYAN, 0);
             }
             if (sd_midi_mode_pro_btn) {
-                lv_obj_set_style_bg_color(sd_midi_mode_pro_btn, lv_color_hex(0x1A2A3A), 0);
-                lv_obj_set_style_border_color(sd_midi_mode_pro_btn, lv_color_hex(0x334455), 0);
+                lv_obj_set_style_bg_color(sd_midi_mode_pro_btn, RED808_PANEL, 0);
+                lv_obj_set_style_border_color(sd_midi_mode_pro_btn, RED808_BORDER, 0);
             }
         }, LV_EVENT_CLICKED, NULL);
     }
@@ -15113,7 +15125,7 @@ static void create_sdcard_screen(void) {
     lv_obj_set_size(sd_midi_load_btn, midi_action_w, 56);
     lv_obj_set_pos(sd_midi_load_btn, 8, 362);
     lv_obj_set_style_bg_color(sd_midi_load_btn, RED808_WARNING, 0);
-    lv_obj_set_style_bg_color(sd_midi_load_btn, lv_color_hex(0x554400), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(sd_midi_load_btn, RED808_BORDER, LV_STATE_DISABLED);
     lv_obj_set_style_radius(sd_midi_load_btn, 10, 0);
     lv_obj_add_state(sd_midi_load_btn, LV_STATE_DISABLED);
     lv_obj_add_event_cb(sd_midi_load_btn, sd_midi_load_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -15121,14 +15133,18 @@ static void create_sdcard_screen(void) {
     lv_obj_t* midi_load_lbl = lv_label_create(sd_midi_load_btn);
     lv_label_set_text(midi_load_lbl, LV_SYMBOL_DOWNLOAD "  PATTERN");
     lv_obj_set_style_text_font(midi_load_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(midi_load_lbl, lv_color_black(), 0);
+    // Always sits on the WARNING-filled button (or its own dimmed disabled
+    // color) — RED808_BG matches the "selected/filled -> BG text" contrast
+    // convention used everywhere else, instead of an unconditional black
+    // that assumed WARNING is always a light color across every theme.
+    lv_obj_set_style_text_color(midi_load_lbl, RED808_BG, 0);
     lv_obj_center(midi_load_lbl);
 
     sd_midi_song_btn = lv_btn_create(sd_midi_section);
     lv_obj_set_size(sd_midi_song_btn, midi_action_w, 56);
     lv_obj_set_pos(sd_midi_song_btn, 8 + midi_action_w + 8, 362);
     lv_obj_set_style_bg_color(sd_midi_song_btn, RED808_CYAN, 0);
-    lv_obj_set_style_bg_color(sd_midi_song_btn, lv_color_hex(0x17343A), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(sd_midi_song_btn, RED808_BORDER, LV_STATE_DISABLED);
     lv_obj_set_style_radius(sd_midi_song_btn, 10, 0);
     lv_obj_add_state(sd_midi_song_btn, LV_STATE_DISABLED);
     lv_obj_add_event_cb(sd_midi_song_btn, sd_midi_song_btn_cb, LV_EVENT_CLICKED, NULL);
