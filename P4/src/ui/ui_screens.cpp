@@ -12330,7 +12330,12 @@ static void create_volumes_screen(void) {
     const int block_w = label_w + slider_w + value_w;   // 288
     const int random_w = 190;
     const int random_h = 44;
-    const int row_content_w = 2 * block_w + 2 * slider_gap + random_w;
+    const int presets_w = 150;
+    // PRESETS now rides in the same centered control row as RANDOM MIX
+    // instead of a separate 120x26 button crammed under the pattern number
+    // in the top-right corner — same height, same visual weight, since
+    // recalling a mixer preset is just as central an action as randomizing.
+    const int row_content_w = 2 * block_w + 3 * slider_gap + random_w + presets_w;
     const int global_x = (LCD_H_RES - row_content_w) / 2;
     struct GlobalCtl { const char* name; int value; int max; lv_obj_t** slider; lv_obj_t** label; };
     GlobalCtl globals[] = {
@@ -12389,18 +12394,20 @@ static void create_volumes_screen(void) {
         mix_random_btn_refresh();
     }
 
-    // MIXER PRESETS — sits in the band freed up below by pushing y_top down
-    // (was 100) rather than fighting for room in the centered MAIN/BPM/
-    // RANDOM MIX row above, which already spans most of the screen width.
+    // MIXER PRESETS — now rides the same centered control row as RANDOM MIX
+    // instead of a separate 120x26 button crammed under the pattern number
+    // in the top-right corner, easy to miss and visually an afterthought
+    // next to how prominent RANDOM MIX was.
     {
+        int px = global_x + 2 * block_w + 2 * slider_gap + random_w + slider_gap;
         lv_obj_t* presets_btn = lv_btn_create(scr_volumes);
-        lv_obj_set_size(presets_btn, 120, 26);
-        lv_obj_set_pos(presets_btn, LCD_H_RES - 130, 74);
-        apply_control_button_style(presets_btn, RED808_CYAN, false, 6);
+        lv_obj_set_size(presets_btn, presets_w, random_h);
+        lv_obj_set_pos(presets_btn, px, global_y + 8);
+        apply_control_button_style(presets_btn, RED808_CYAN, false, 10);
         lv_obj_add_event_cb(presets_btn, mixer_preset_modal_show, LV_EVENT_CLICKED, NULL);
         lv_obj_t* presetsLabel = lv_label_create(presets_btn);
-        lv_label_set_text(presetsLabel, "PRESETS");
-        lv_obj_set_style_text_font(presetsLabel, &lv_font_montserrat_12, 0);
+        lv_label_set_text(presetsLabel, LV_SYMBOL_LIST "  PRESETS");
+        lv_obj_set_style_text_font(presetsLabel, &lv_font_montserrat_14, 0);
         lv_obj_center(presetsLabel);
     }
     mixer_presets_ensure_loaded();
