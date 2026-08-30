@@ -15576,6 +15576,225 @@ static void piano_rebuild_keys(void) {
     }
 }
 
+// =============================================================================
+// MELODY PRESETS — 8 savable snapshots of the piano melody grid (notes +
+// engine + octave + gate). Phase 3 of the SONG "MATRIX" plan (see FILTER
+// PRESETS / MIXER PRESETS above for Phases 1-2). A melody preset is a note
+// sequence independent of any pattern — recalling one only loads it into the
+// piano editor; MATRIX (Phase 4/5) is what will later push a recalled preset
+// onto a track's steps for a given song column, reusing the existing ASSIGN
+// path (control_send_melody_assign) rather than duplicating it here.
+// =============================================================================
+#define MELODY_PRESET_COUNT 8
+struct MelodyPresetSlot {
+    bool used;
+    char name[16];
+    bool grid[16][12];
+    uint8_t notes[16][12];
+    uint8_t engine;
+    uint8_t octave;
+    uint8_t gatePercent;
+};
+static MelodyPresetSlot s_melody_presets[MELODY_PRESET_COUNT] = {};
+static const char* MELODY_PRESETS_FILE = "/melody_presets.txt";
+
+static lv_obj_t* s_melody_preset_modal = NULL;
+static lv_obj_t* s_melody_preset_slot_btns[MELODY_PRESET_COUNT] = {};
+static lv_obj_t* s_melody_preset_slot_lbls[MELODY_PRESET_COUNT] = {};
+
+// One header line "used,name,engine,octave,gate" per slot, followed by 16
+// lines of 12 comma-separated MIDI notes (one per grid column) — grid[on] is
+// derived from notes>0 on load, so it doesn't need its own storage.
+static void melody_presets_save_to_disk(void) {
+    File f = SPIFFS.open(MELODY_PRESETS_FILE, FILE_WRITE);
+    if (!f) return;
+    for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
+        const MelodyPresetSlot& s = s_melody_presets[i];
+        f.printf("%d,%s,%d,%d,%d\n", s.used ? 1 : 0, s.name[0] ? s.name : "-",
+                 s.engine, s.octave, s.gatePercent);
+        for (int c = 0; c < 16; c++) {
+            for (int r = 0; r < 12; r++) f.printf(r ? ",%d" : "%d", s.notes[c][r]);
+            f.printf("\n");
+        }
+    }
+    f.close();
+}
+
+static void melody_presets_load_from_disk(void) {
+    memset(s_melody_presets, 0, sizeof(s_melody_presets));
+    for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
+        s_melody_presets[i].engine = 3;
+        s_melody_presets[i].octave = 4;
+        s_melody_presets[i].gatePercent = 55;
+    }
+    File f = SPIFFS.open(MELODY_PRESETS_FILE, FILE_READ);
+    if (!f) return;
+    char line[160];
+    for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
+        if (!fs_read_line(f, line, sizeof(line))) break;
+        MelodyPresetSlot& s = s_melody_presets[i];
+        int used = 0, engine = 3, octave = 4, gate = 55;
+        char name[16] = {};
+        int parsed = sscanf(line, "%d,%15[^,],%d,%d,%d", &used, name, &engine, &octave, &gate);
+        s.used = (used != 0);
+        if (parsed >= 2) strncpy(s.name, name, sizeof(s.name) - 1);
+        s.engine = (uint8_t)constrain(engine, 0, 255);
+        s.octave = (uint8_t)constrain(octave, 1, 7);
+        s.gatePercent = (uint8_t)constrain(gate, 1, 100);
+        for (int c = 0; c < 16; c++) {
+            if (!fs_read_line(f, line, sizeof(line))) break;
+            int vals[12] = {};
+            int n = sscanf(line, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+                &vals[0], &vals[1], &vals[2], &vals[3], &vals[4], &vals[5],
+                &vals[6], &vals[7], &vals[8], &vals[9], &vals[10], &vals[11]);
+            for (int r = 0; r < (n < 12 ? n : 12); r++) {
+                s.notes[c][r] = (uint8_t)constrain(vals[r], 0, 127);
+                s.grid[c][r] = s.notes[c][r] > 0;
+            }
+        }
+    }
+    f.close();
+}
+
+static void melody_preset_modal_refresh(void) {
+    for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
+        if (!s_melody_preset_slot_lbls[i]) continue;
+        const MelodyPresetSlot& s = s_melody_presets[i];
+        if (s.used) {
+            lv_label_set_text_fmt(s_melody_preset_slot_lbls[i], "S%d\n%s", i + 1, s.name[0] ? s.name : "PRESET");
+            lv_obj_set_style_text_color(s_melody_preset_slot_lbls[i], lv_color_white(), 0);
+        } else {
+            lv_label_set_text_fmt(s_melody_preset_slot_lbls[i], "S%d\nVACIO", i + 1);
+            lv_obj_set_style_text_color(s_melody_preset_slot_lbls[i], theme_text_dim(), 0);
+        }
+    }
+}
+
+static void melody_preset_save_current(int slot) {
+    if (slot < 0 || slot >= MELODY_PRESET_COUNT) return;
+    MelodyPresetSlot& s = s_melody_presets[slot];
+    s.used = true;
+    snprintf(s.name, sizeof(s.name), "MEL %d", slot + 1);
+    memcpy(s.grid, s_piano_rec_grid, sizeof(s.grid));
+    memcpy(s.notes, s_piano_rec_notes, sizeof(s.notes));
+    s.engine = s_piano_rec_has_notes ? s_piano_rec_engine : PIANO_ENGINES[s_piano_engine_idx];
+    s.octave = s_piano_rec_has_notes ? s_piano_rec_octave : (uint8_t)s_piano_octave;
+    s.gatePercent = s_piano_gate_percent.load(std::memory_order_relaxed);
+    melody_presets_save_to_disk();
+    melody_preset_modal_refresh();
+    ui_show_toast("Preset de melodia guardado", RED808_SUCCESS);
+}
+
+static void melody_preset_recall(int slot) {
+    if (slot < 0 || slot >= MELODY_PRESET_COUNT) return;
+    const MelodyPresetSlot& s = s_melody_presets[slot];
+    if (!s.used) {
+        ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
+        return;
+    }
+    memcpy(s_piano_rec_grid, s.grid, sizeof(s_piano_rec_grid));
+    memcpy(s_piano_rec_notes, s.notes, sizeof(s_piano_rec_notes));
+    s_piano_rec_engine = s.engine;
+    s_piano_rec_octave = s.octave;
+    s_piano_rec_has_notes = true;
+    s_piano_gate_percent.store(s.gatePercent, std::memory_order_relaxed);
+    if (s_piano_gate_lbl) lv_label_set_text_fmt(s_piano_gate_lbl, "GATE %u%%", (unsigned)s.gatePercent);
+    for (int i = 0; i < PIANO_ENGINE_COUNT; i++) {
+        if (PIANO_ENGINES[i] == s.engine) { s_piano_engine_idx = i; break; }
+    }
+    piano_refresh_engine_chips();
+    piano_refresh_engine_presets();
+    piano_grid_refresh_all();
+    ui_show_toast("Preset de melodia cargado", RED808_SUCCESS);
+}
+
+static void melody_preset_slot_clicked_cb(lv_event_t* e) {
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (lv_event_get_code(e) == LV_EVENT_LONG_PRESSED) melody_preset_save_current(slot);
+    else melody_preset_recall(slot);
+}
+
+static void melody_preset_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_melody_preset_modal) {
+        lv_obj_del(s_melody_preset_modal);
+        s_melody_preset_modal = NULL;
+        for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
+            s_melody_preset_slot_btns[i] = NULL;
+            s_melody_preset_slot_lbls[i] = NULL;
+        }
+    }
+}
+
+static void melody_preset_modal_show(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_melody_preset_modal) return;
+
+    s_melody_preset_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_melody_preset_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_melody_preset_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_melody_preset_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_melody_preset_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_melody_preset_modal, 0, 0);
+    lv_obj_clear_flag(s_melody_preset_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_melody_preset_modal, melody_preset_modal_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_melody_preset_modal);
+    lv_obj_set_size(card, 720, 260);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "MELODY PRESETS");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "TOCA = cargar en el editor   ·   MANTEN PULSADO = guardar la melodia actual aqui");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 32);
+
+    constexpr int btnW = 80, btnH = 84, gapX = 6, y0 = 68;
+    for (int i = 0; i < MELODY_PRESET_COUNT; i++) {
+        lv_obj_t* btn = lv_btn_create(card);
+        s_melody_preset_slot_btns[i] = btn;
+        lv_obj_set_size(btn, btnW, btnH);
+        lv_obj_set_pos(btn, 4 + i * (btnW + gapX), y0);
+        apply_control_button_style(btn, RED808_ACCENT2, false, 8);
+        lv_obj_add_event_cb(btn, melody_preset_slot_clicked_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(btn, melody_preset_slot_clicked_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)i);
+
+        lv_obj_t* lbl = lv_label_create(btn);
+        s_melody_preset_slot_lbls[i] = lbl;
+        lv_obj_set_width(lbl, btnW - 8);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(lbl);
+    }
+
+    lv_obj_t* close_btn = lv_btn_create(card);
+    lv_obj_set_size(close_btn, 160, 40);
+    lv_obj_set_pos(close_btn, 280, 172);
+    apply_control_button_style(close_btn, RED808_ERROR, false, 10);
+    lv_obj_add_event_cb(close_btn, melody_preset_modal_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, "CERRAR");
+    lv_obj_center(close_lbl);
+
+    melody_preset_modal_refresh();
+}
+
 static void create_piano_screen(void) {
     int W = ui_layout_w();
     int H = ui_layout_h();
@@ -15695,6 +15914,17 @@ static void create_piano_screen(void) {
         (unsigned)s_piano_gate_percent.load(std::memory_order_relaxed));
     lv_obj_set_style_border_color(s_piano_gate_btn, lv_color_hex(0x7CFF6B), 0);
     lv_obj_add_event_cb(s_piano_gate_btn, piano_gate_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // MELODY PRESETS — sits in the gap between GATE (ends 568) and GLIDE
+    // (starts 730) in this same compact row; no free room elsewhere on screen.
+    {
+        lv_obj_t* mpb = piano_make_chip(scr_piano, 580, row_y, 140, 36, "M.PRESETS");
+        lv_obj_set_style_border_color(mpb, RED808_CYAN, 0);
+        lv_obj_t* l = lv_obj_get_child(mpb, 0);
+        if (l) lv_obj_set_style_text_color(l, RED808_CYAN, 0);
+        lv_obj_add_event_cb(mpb, melody_preset_modal_show, LV_EVENT_CLICKED, NULL);
+    }
+    melody_presets_load_from_disk();
 
     // v3.0 — visual controls for gesture piano (glide/bend/range)
     s_piano_glide_btn = piano_make_chip(scr_piano, 730, row_y, 98, 36,
