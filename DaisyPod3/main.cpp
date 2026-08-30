@@ -7954,11 +7954,27 @@ static void ProcessCommand()
     }
 
     case CMD_SD_LIST_FOLDERS: {
-        /* List all subdirectories inside /data */
+        /* List subdirectories inside /data — or, when a payload is given
+         * (added for XTRA sample-pack paging), inside /data/<parent>
+         * instead. Old callers (root kit browser, MIDI file browser) always
+         * send a zero-length payload and keep listing /data exactly as
+         * before this was added. */
         SdKitListResponse resp;   /* reuse: count + names[16][32] */
         memset(&resp, 0, sizeof(resp));
+        char rootPath[96];
+        if(len >= sizeof(SdListFilesPayload)){
+            SdListFilesPayload pl;
+            memcpy(&pl, p, sizeof(pl));
+            pl.folder[31] = 0;
+            if(!JoinPath(rootPath, sizeof(rootPath), SD_DATA_ROOT, pl.folder)){
+                BuildResponse(CMD_SD_LIST_FOLDERS, hdr->sequence, (uint8_t*)&resp, 1);
+                return;
+            }
+        } else {
+            CopyFixedString(rootPath, sizeof(rootPath), SD_DATA_ROOT);
+        }
         DIR dir; FILINFO fno;
-        if(sdPresent && f_opendir(&dir, SD_DATA_ROOT) == FR_OK){
+        if(sdPresent && f_opendir(&dir, rootPath) == FR_OK){
             while(f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0){
                 if((fno.fattrib & AM_DIR) && resp.count < 16){
                     CopyFixedString(resp.kits[resp.count], sizeof(resp.kits[resp.count]), fno.fname);

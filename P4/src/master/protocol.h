@@ -232,7 +232,11 @@ typedef struct __attribute__((packed)) {
 //   La Daisy carga directo a SDRAM — mucho más rápido
 //   que transferir PCM por SPI.
 // ═══════════════════════════════════════════════════════
-#define CMD_SD_LIST_FOLDERS   0xB0  // List root-level folders (kit dirs)
+#define CMD_SD_LIST_FOLDERS   0xB0  // List root-level folders (kit dirs).
+                                     // Zero-length payload = /data root
+                                     // (unchanged). Optional SdListFilesPayload
+                                     // payload lists /data/<folderName> instead
+                                     // — added for XTRA sample-pack paging.
 #define CMD_SD_LIST_FILES     0xB1  // List WAV files in a folder
 #define CMD_SD_FILE_INFO      0xB2  // Get sample info (length, SR, bits)
 #define CMD_SD_LOAD_SAMPLE    0xB3  // Load one WAV from SD → SDRAM pad slot

@@ -1023,6 +1023,27 @@ static int8_t s_xtra_wave_max[4][96] = {};
 static int8_t s_xtra_wave_min[4][96] = {};
 static uint8_t s_xtra_wave_count[4] = {};
 
+// ── XTRA PAGES: one page per subfolder of /data/xtra on Daisy's own SD ─────
+// Page 0 ("DEFAULT") is whatever loose WAVs sit directly in /data/xtra (the
+// folder's original flat layout, kept working exactly as before this was
+// added). Each subfolder found under it becomes one more page; switching
+// pages swaps what's loaded on the 4 backing pads (16-19) for the files
+// found in that folder, in directory order. Building a new page is manual —
+// Daisy can only read its SD card over this link, not write to it — so
+// "add more" means copying a folder with up to 4 WAVs onto the card and
+// pressing RESCAN, not creating one from the UI.
+#define XTRA_PAGE_MAX 9
+static char     s_xtra_page_names[XTRA_PAGE_MAX][32] = {};
+static int      s_xtra_page_count = 1;   // DEFAULT always exists
+static int      s_xtra_page_index = 0;
+static uint32_t s_xtra_seen_folder_rev = 0;
+static uint32_t s_xtra_seen_file_rev = 0;
+enum XtraPageReq { XTRA_PAGE_REQ_NONE = 0, XTRA_PAGE_REQ_FOLDERS, XTRA_PAGE_REQ_FILES };
+static XtraPageReq s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+static lv_obj_t* s_xtra_page_lbl = NULL;
+static lv_obj_t* s_xtra_page_prev_btn = NULL;
+static lv_obj_t* s_xtra_page_next_btn = NULL;
+
 static const uint8_t XTRA_SYNTH_ENGINE_CODES[7] = {0, 1, 2, 3, 4, 5, 6};
 static const char* XTRA_SYNTH_ENGINE_NAMES[7] = {"808", "909", "505", "303", "WT", "SH101", "FM2"};
 static const char* XTRA_PRESET_LABELS[3] = {"A", "B", "C"};
@@ -1584,6 +1605,165 @@ static void xtra_load_state(void) {
     }
     f.close();
     xtra_load_param_state();
+}
+
+static void xtra_page_refresh_label(void) {
+    if (s_xtra_page_lbl) {
+        lv_label_set_text_fmt(s_xtra_page_lbl, "PAGINA %d/%d  ·  %s",
+                              s_xtra_page_index + 1, s_xtra_page_count,
+                              s_xtra_page_names[s_xtra_page_index]);
+    }
+    bool multi = s_xtra_page_count > 1;
+    if (s_xtra_page_prev_btn) {
+        if (multi) lv_obj_clear_state(s_xtra_page_prev_btn, LV_STATE_DISABLED);
+        else lv_obj_add_state(s_xtra_page_prev_btn, LV_STATE_DISABLED);
+    }
+    if (s_xtra_page_next_btn) {
+        if (multi) lv_obj_clear_state(s_xtra_page_next_btn, LV_STATE_DISABLED);
+        else lv_obj_add_state(s_xtra_page_next_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void xtra_page_folder_path(int pageIdx, char* out, size_t outSize) {
+    if (pageIdx <= 0 || pageIdx >= s_xtra_page_count) {
+        strncpy(out, "xtra", outSize - 1);
+    } else {
+        snprintf(out, outSize, "xtra/%s", s_xtra_page_names[pageIdx]);
+    }
+    out[outSize - 1] = '\0';
+}
+
+static void xtra_page_request_files(int pageIdx) {
+    if (pageIdx < 0) pageIdx = 0;
+    if (pageIdx >= s_xtra_page_count) pageIdx = s_xtra_page_count - 1;
+    s_xtra_page_index = pageIdx;
+    xtra_page_refresh_label();
+    if (!ui_control_available()) return;
+    char folder[40];
+    xtra_page_folder_path(pageIdx, folder, sizeof(folder));
+    SdListFilesPayload payload = {};
+    strncpy(payload.folderName, folder, sizeof(payload.folderName) - 1);
+    if (daisyUsb.send(CMD_SD_LIST_FILES, &payload, sizeof(payload))) {
+        s_xtra_page_req = XTRA_PAGE_REQ_FILES;
+    } else {
+        ui_show_toast("Daisy USB no disponible", RED808_WARNING);
+    }
+}
+
+// Requests the list of /data/xtra subfolders from Daisy's own SD card (one
+// page per folder found; page 0 stays the flat /data/xtra root). Called on
+// entry to the XTRAPADS screen and by the RESCAN button — never creates a
+// folder, only discovers what the user already copied onto the card.
+static void xtra_pages_request_folders(void) {
+    strncpy(s_xtra_page_names[0], "DEFAULT", sizeof(s_xtra_page_names[0]) - 1);
+    s_xtra_page_names[0][sizeof(s_xtra_page_names[0]) - 1] = '\0';
+    if (!ui_control_available()) {
+        xtra_page_refresh_label();
+        return;
+    }
+    SdListFilesPayload payload = {};
+    strncpy(payload.folderName, "xtra", sizeof(payload.folderName) - 1);
+    if (daisyUsb.send(CMD_SD_LIST_FOLDERS, &payload, sizeof(payload))) {
+        s_xtra_page_req = XTRA_PAGE_REQ_FOLDERS;
+    } else {
+        ui_show_toast("Daisy USB no disponible", RED808_WARNING);
+    }
+}
+
+static void xtra_page_go(int delta) {
+    if (s_xtra_page_count <= 1) return;
+    int next = s_xtra_page_index + delta;
+    if (next < 0) next = s_xtra_page_count - 1;
+    if (next >= s_xtra_page_count) next = 0;
+    xtra_page_request_files(next);
+}
+
+// Drains the CMD_SD_LIST_FOLDERS / CMD_SD_LIST_FILES responses this screen
+// asked for. Poll-driven (called every frame the XTRAPADS screen is active,
+// see update_performance_screen) rather than event-driven: the daisy_sd_*
+// buffers it reads are a single shared slot also written by the SD CARD
+// screen's own Daisy-SD browser, so this only runs while that other screen
+// isn't the active one — same revision-counter pattern that screen uses.
+static void xtra_pages_poll(void) {
+    if (s_xtra_page_req == XTRA_PAGE_REQ_NONE || !ui_control_available()) return;
+    const auto& state = daisyUsb.state();
+
+    if (s_xtra_page_req == XTRA_PAGE_REQ_FOLDERS) {
+        if (state.daisy_sd_revision == s_xtra_seen_folder_rev) return;
+        s_xtra_seen_folder_rev = state.daisy_sd_revision;
+        s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+
+        int count = state.daisy_sd_folder_count;
+        if (count > XTRA_PAGE_MAX - 1) count = XTRA_PAGE_MAX - 1;
+        s_xtra_page_count = 1;
+        for (int i = 0; i < count; i++) {
+            strncpy(s_xtra_page_names[s_xtra_page_count], state.daisy_sd_folders[i],
+                    sizeof(s_xtra_page_names[0]) - 1);
+            s_xtra_page_names[s_xtra_page_count][sizeof(s_xtra_page_names[0]) - 1] = '\0';
+            s_xtra_page_count++;
+        }
+        if (s_xtra_page_index >= s_xtra_page_count) s_xtra_page_index = 0;
+        xtra_page_request_files(s_xtra_page_index);
+        return;
+    }
+
+    // XTRA_PAGE_REQ_FILES
+    if (state.daisy_sd_revision == s_xtra_seen_file_rev) return;
+    s_xtra_seen_file_rev = state.daisy_sd_revision;
+    s_xtra_page_req = XTRA_PAGE_REQ_NONE;
+
+    char folder[40];
+    xtra_page_folder_path(s_xtra_page_index, folder, sizeof(folder));
+    int count = state.daisy_sd_file_count;
+    if (count > 4) count = 4;
+    for (int slot = 0; slot < 4; slot++) {
+        uint8_t pad = xtra_backing_pad_for_slot(slot);
+        if (slot < count) {
+            SdLoadSamplePayload payload = {};
+            strncpy(payload.folderName, folder, sizeof(payload.folderName) - 1);
+            strncpy(payload.fileName, state.daisy_sd_files[slot], sizeof(payload.fileName) - 1);
+            payload.padIndex = pad;
+            daisyUsb.send(CMD_SD_LOAD_SAMPLE, &payload, sizeof(payload));
+
+            s_xtra_slots[slot].used = true;
+            s_xtra_slots[slot].synth_mode = false;
+            s_xtra_slots[slot].pad = pad;
+            strncpy(s_xtra_slots[slot].name, state.daisy_sd_files[slot],
+                    sizeof(s_xtra_slots[slot].name) - 1);
+            s_xtra_slots[slot].name[sizeof(s_xtra_slots[slot].name) - 1] = '\0';
+            trim_wav_extension(s_xtra_slots[slot].name);
+            s_xtra_slots[slot].trim_start_pct = 0;
+            s_xtra_slots[slot].trim_end_pct = 100;
+            s_xtra_slots[slot].duration_ms = 0;
+            // Loaded straight off Daisy's own SD, never streamed through P4 —
+            // no peak data available, so the waveform card falls back to its
+            // usual deterministic placeholder envelope (wave_count == 0).
+            s_xtra_wave_count[slot] = 0;
+        } else if (s_xtra_slots[slot].used) {
+            control_send_unload_daisy(pad);
+            s_xtra_slots[slot].used = false;
+            s_xtra_slots[slot].name[0] = '\0';
+            s_xtra_wave_count[slot] = 0;
+        }
+    }
+    daisyUsb.send(CMD_SD_STATUS);
+    xtra_save_state();
+    xtra_refresh_panel();
+    xtra_page_refresh_label();
+
+    char toast[56];
+    snprintf(toast, sizeof(toast), "XTRA pagina %d/%d: %s (%d WAV)",
+             s_xtra_page_index + 1, s_xtra_page_count,
+             s_xtra_page_names[s_xtra_page_index], count);
+    ui_show_toast(toast, RED808_SUCCESS);
+}
+
+static void xtra_page_prev_cb(lv_event_t* e) { LV_UNUSED(e); xtra_page_go(-1); }
+static void xtra_page_next_cb(lv_event_t* e) { LV_UNUSED(e); xtra_page_go(1); }
+static void xtra_page_rescan_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    ui_show_toast("Buscando carpetas en /data/xtra...", RED808_CYAN);
+    xtra_pages_request_folders();
 }
 
 static void xtra_refresh_panel(void) {
@@ -15968,6 +16148,48 @@ static void create_performance_screen(void) {
         lv_obj_center(del_lbl);
     }
 
+    // ── Page selector: one page per /data/xtra subfolder on Daisy's SD ──
+    // Page 0 ("DEFAULT") is the flat file list already there today; extra
+    // pages appear automatically once a folder with up to 4 WAVs is copied
+    // onto the card under /data/xtra — RESCAN re-checks without leaving.
+    const int page_row_y = start_y + 2 * (pad_h + 14) + 8;
+
+    s_xtra_page_prev_btn = lv_btn_create(scr_performance);
+    lv_obj_set_size(s_xtra_page_prev_btn, 60, 48);
+    lv_obj_set_pos(s_xtra_page_prev_btn, 20, page_row_y);
+    apply_control_button_style(s_xtra_page_prev_btn, theme_accent2(), false, 8);
+    lv_obj_add_event_cb(s_xtra_page_prev_btn, xtra_page_prev_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* prev_lbl = lv_label_create(s_xtra_page_prev_btn);
+    lv_label_set_text(prev_lbl, LV_SYMBOL_LEFT);
+    lv_obj_center(prev_lbl);
+
+    s_xtra_page_next_btn = lv_btn_create(scr_performance);
+    lv_obj_set_size(s_xtra_page_next_btn, 60, 48);
+    lv_obj_set_pos(s_xtra_page_next_btn, 88, page_row_y);
+    apply_control_button_style(s_xtra_page_next_btn, theme_accent2(), false, 8);
+    lv_obj_add_event_cb(s_xtra_page_next_btn, xtra_page_next_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* next_lbl = lv_label_create(s_xtra_page_next_btn);
+    lv_label_set_text(next_lbl, LV_SYMBOL_RIGHT);
+    lv_obj_center(next_lbl);
+
+    lv_obj_t* rescan_btn = lv_btn_create(scr_performance);
+    lv_obj_set_size(rescan_btn, 168, 48);
+    lv_obj_set_pos(rescan_btn, W - 188, page_row_y);
+    apply_control_button_style(rescan_btn, theme_warning(), false, 8);
+    lv_obj_add_event_cb(rescan_btn, xtra_page_rescan_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* rescan_lbl = lv_label_create(rescan_btn);
+    lv_label_set_text(rescan_lbl, LV_SYMBOL_REFRESH "  CARPETAS");
+    lv_obj_set_style_text_font(rescan_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(rescan_lbl);
+
+    s_xtra_page_lbl = lv_label_create(scr_performance);
+    lv_label_set_text(s_xtra_page_lbl, "PAGINA 1/1  ·  DEFAULT");
+    lv_obj_set_width(s_xtra_page_lbl, W - 188 - 156 - 20);
+    lv_obj_set_style_text_font(s_xtra_page_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_xtra_page_lbl, theme_text(), 0);
+    lv_obj_set_style_text_align(s_xtra_page_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_xtra_page_lbl, 156, page_row_y + 12);
+
     xtra_load_state();
     xtra_refresh_panel();
 }
@@ -16341,6 +16563,9 @@ void ui_navigate_to(int screen_id) {
     };
     int count = sizeof(targets) / sizeof(targets[0]);
     if (screen_id >= 0 && screen_id < count && targets[screen_id]) {
+        if (screen_id == 6) {
+            xtra_pages_request_folders();
+        }
         if (screen_id == 11) {
             if (s_pp_from_xtra && s_pp_xtra_slot >= 0 && s_pp_xtra_slot < 4) {
                 pp_refresh_view();
@@ -17320,4 +17545,5 @@ void ui_update_current_screen(void) {
              p4sd.needs_refresh.exchange(false, std::memory_order_acq_rel)) {
         sd_refresh_ui();
     }
+    else if (active == scr_performance) xtra_pages_poll();
 }
