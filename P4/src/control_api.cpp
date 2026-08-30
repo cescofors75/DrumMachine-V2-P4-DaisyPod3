@@ -2282,6 +2282,13 @@ void control_send_set_filter_resonance(float value)
     fxDirty.store(true, std::memory_order_release);
 }
 
+void control_send_set_filter_morph(float value)
+{
+    value = Clamp(value, 0.0f, 1.0f);
+    daisyUsb.sendFloat(CMD_FILTER_MORPH, value);
+    fxDirty.store(true, std::memory_order_release);
+}
+
 void control_send_set_distortion(float value)
 {
     if(i2c_rotaries_owns_function(POD_FUNC_DISTORTION)

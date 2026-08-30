@@ -534,6 +534,9 @@ enum MasterFxRouteId : uint8_t {
 #define FTYPE_SVF_HP    12   /* State Variable Filter HP */
 #define FTYPE_SVF_BP    13   /* State Variable Filter BP */
 #define FTYPE_COMB      14   /* Comb filter resonator */
+#define FTYPE_SVF_MORPH 15   /* Same Svf as SVF_LP/HP/BP, but continuously
+                              * crossfades LP->BP->HP->Notch via gFilterMorph
+                              * (0..1) instead of picking one fixed output. */
 
 /* Distortion modes */
 #define DMODE_SOFT  0
@@ -1526,6 +1529,11 @@ static float   gFilterQ       = 0.707f;
  * these to match, same as loading a kit shouldn't visibly "glide" in. */
 static float   gFilterCutoffSm = 10000.0f;
 static float   gFilterQSm      = 0.707f;
+/* CMD_FILTER_MORPH target — only meaningful when gFilterType ==
+ * FTYPE_SVF_MORPH. Set directly (not smoothed like cutoff/Q above): it
+ * crossfades between the SVF's own outputs sample-by-sample already, so a
+ * knob sweep is inherently continuous with no coefficient jump to declick. */
+static float   gFilterMorph    = 0.0f;
 static uint8_t gFilterBitDepth= 16;
 static float   gFilterDist    = 0.0f;
 static uint8_t gFilterDistMode= DMODE_SOFT;
@@ -2537,7 +2545,8 @@ static void UpdateGlobalFilterSmoothing()
         masterLadderR.SetFreq(gFilterCutoffSm);
         masterLadderL.SetRes(clampF(gFilterQSm / 28.f, 0.f, 1.f));
         masterLadderR.SetRes(clampF(gFilterQSm / 28.f, 0.f, 1.f));
-    } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
+    } else if((gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP)
+              || gFilterType == FTYPE_SVF_MORPH){
         masterSvfL.SetFreq(gFilterCutoffSm);
         masterSvfR.SetFreq(gFilterCutoffSm);
         masterSvfL.SetRes(clampF(gFilterQSm / 28.f, 0.f, 1.f));
@@ -6125,6 +6134,31 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 if(gFilterType == FTYPE_SVF_LP)      { L = sanitizeF(masterSvfL.Low());  R = sanitizeF(masterSvfR.Low()); }
                 else if(gFilterType == FTYPE_SVF_HP)  { L = sanitizeF(masterSvfL.High()); R = sanitizeF(masterSvfR.High()); }
                 else /* FTYPE_SVF_BP */               { L = sanitizeF(masterSvfL.Band()); R = sanitizeF(masterSvfR.Band()); }
+            } else if(gFilterType == FTYPE_SVF_MORPH){
+                /* Same Svf as SVF_LP/HP/BP above, but instead of picking one
+                 * fixed output, crossfade continuously across LP -> BP -> HP
+                 * -> Notch as gFilterMorph goes 0 -> 1 (three linear
+                 * segments), so a knob sweep morphs smoothly instead of
+                 * hard-switching between fixed models. Notch = dry - Band is
+                 * the standard SVF identity (removing exactly the band a
+                 * bandpass keeps reconstructs the notch) — used instead of
+                 * a Notch() accessor since this DaisySP version's Svf isn't
+                 * vendored in this checkout to confirm it has one; Low/High/
+                 * Band are already relied on above (FTYPE_SVF_LP/HP/BP). */
+                const float dryL = L, dryR = R;
+                masterSvfL.Process(L);
+                masterSvfR.Process(R);
+                float m = clampF(gFilterMorph, 0.f, 1.f) * 3.0f;
+                float lpW = 0.f, bpW = 0.f, hpW = 0.f, nW = 0.f;
+                if(m < 1.0f)      { lpW = 1.0f - m; bpW = m; }
+                else if(m < 2.0f) { bpW = 2.0f - m; hpW = m - 1.0f; }
+                else              { hpW = 3.0f - m; nW  = m - 2.0f; }
+                const float bandL = masterSvfL.Band(), bandR = masterSvfR.Band();
+                const float notchL = dryL - bandL, notchR = dryR - bandR;
+                L = sanitizeF(masterSvfL.Low() * lpW + bandL * bpW
+                            + masterSvfL.High() * hpW + notchL * nW);
+                R = sanitizeF(masterSvfR.Low() * lpW + bandR * bpW
+                            + masterSvfR.High() * hpW + notchR * nW);
             } else if(gFilterType == FTYPE_COMB){
                 /* Comb filter via short delay line with feedback */
                 float combDelay = clampF(1.f / (gFilterCutoff > 20.f ? gFilterCutoff : 20.f) * (float)SAMPLE_RATE, 1.f, 4799.f);
@@ -6896,7 +6930,7 @@ static void ProcessCommand()
                 gSrPrimed = false;
             }
             /* Clamps defensivos: ningún payload puede matar el audio. */
-            if(gFilterType > FTYPE_COMB) gFilterType = FTYPE_NONE;
+            if(gFilterType > FTYPE_SVF_MORPH) gFilterType = FTYPE_NONE;
             if(gFilterDistMode > DMODE_FUZZ) gFilterDistMode = DMODE_SOFT;
             if(gFilterBitDepth < 4 || gFilterBitDepth > 16) gFilterBitDepth = 16;
             if(gFilterDist > 1.0f) gFilterDist *= 0.01f;
@@ -6909,7 +6943,8 @@ static void ProcessCommand()
                 masterLadderR.SetFreq(gFilterCutoff);
                 masterLadderL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
                 masterLadderR.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
-            } else if(gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP){
+            } else if((gFilterType >= FTYPE_SVF_LP && gFilterType <= FTYPE_SVF_BP)
+                      || gFilterType == FTYPE_SVF_MORPH){
                 masterSvfL.SetFreq(gFilterCutoff);
                 masterSvfR.SetFreq(gFilterCutoff);
                 masterSvfL.SetRes(clampF(gFilterQ / 28.f, 0.f, 1.f));
@@ -6951,6 +6986,13 @@ static void ProcessCommand()
            || !PodOwnsFunction(POD_FUNC_FILTER_RESONANCE))){
             memcpy(&gFilterQ, p, 4);
             gFilterQ = (gFilterType == FTYPE_RESONANT) ? clampF(gFilterQ, 0.3f, 40.f) : clampF(gFilterQ, 0.3f, 28.f);
+            podStateRevision++;
+        }
+        break;
+    case CMD_FILTER_MORPH:
+        if(len >= 4){
+            memcpy(&gFilterMorph, p, 4);
+            gFilterMorph = clampF(gFilterMorph, 0.f, 1.f);
             podStateRevision++;
         }
         break;

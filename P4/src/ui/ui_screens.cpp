@@ -6521,9 +6521,13 @@ enum FxCardKind : uint8_t {
     FX_CARD_CHORUS,
     FX_CARD_COMP,
     FX_CARD_AUTOWAH,
+    // Drives gFilterMorph (CMD_FILTER_MORPH) — only audible once the FILTER
+    // model is SVF MORPH (15); touching this card auto-selects that model,
+    // same idea as CUTOFF/RESO auto-engaging LOWPASS.
+    FX_CARD_MORPH,
 };
 
-static constexpr int FX_CARD_COUNT = 16;
+static constexpr int FX_CARD_COUNT = 17;
 static constexpr int FX_VIEW_MODE_COUNT = 3;
 // 16 cards at 3-per-page is 6 pages (was 4, for the old 12-card total) —
 // bumped so the page-dot row still has one dot per page in the densest-page
@@ -6579,7 +6583,7 @@ static uint32_t s_fx_toggle_last_ms[FX_CARD_COUNT] = {};
 static uint32_t s_fx_any_toggle_last_ms = 0;          // global across all FX buttons
 static float    s_fx_arc_anim[FX_CARD_COUNT] = {};    // file-scope for snap access
 static uint32_t s_fx_arc_user_ms[FX_CARD_COUNT] = {}; // last user-touch timestamp
-static uint8_t  s_fx_last_active_u7[FX_CARD_COUNT] = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 64, 64, 64, 64};
+static uint8_t  s_fx_last_active_u7[FX_CARD_COUNT] = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64};
 // True current value of every card, updated on every send (unlike
 // s_fx_last_active_u7 above, which only tracks the last non-neutral value).
 // Used as the ramp start point for the smooth-transition RANDOM mode.
@@ -6589,7 +6593,7 @@ static uint8_t  s_fx_last_active_u7[FX_CARD_COUNT] = {64, 64, 64, 64, 64, 64, 96
 // array directly drives each card's mute/arc display, unlike
 // s_fx_last_active_u7 above which only seeds the value a later re-enable
 // restores.
-static uint8_t  s_fx_current_u7[FX_CARD_COUNT]     = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 0, 0, 0, 0};
+static uint8_t  s_fx_current_u7[FX_CARD_COUNT]     = {64, 64, 64, 64, 64, 64, 96, 64, 64, 64, 64, 64, 0, 0, 0, 0, 0};
 static bool     s_fx_random_smooth = false;   // false = brusca (snap), true = suave (ramp)
 static bool     fx_random_smooth_get(void) { return s_fx_random_smooth; }
 static void     fx_random_smooth_set(bool v) { s_fx_random_smooth = v; }
@@ -6597,28 +6601,28 @@ static void     fx_random_smooth_set(bool v) { s_fx_random_smooth = v; }
 static const char* fx_names[FX_CARD_COUNT] = {
     "FLANGE", "DELAY", "REVERB", "FOLD", "CRUSH", "PHASER",
     "CUTOFF", "RESO", "DRIVE", "BITS", "SRATE", "FILTER",
-    "TREMOLO", "CHORUS", "COMP", "A.WAH"
+    "TREMOLO", "CHORUS", "COMP", "A.WAH", "MORPH"
 };
 
 static const char* fx_filter_model_name(int type) {
     static const char* names[] = {
         "OFF", "LOWPASS", "HIGHPASS", "BANDPASS", "NOTCH",
         "ALLPASS", "PEAK", "LOW SHELF", "HIGH SHELF", "RESONANT",
-        "LADDER", "SVF LP", "SVF HP", "SVF BP", "COMB"
+        "LADDER", "SVF LP", "SVF HP", "SVF BP", "COMB", "SVF MORPH"
     };
-    return names[constrain(type, 0, 14)];
+    return names[constrain(type, 0, 15)];
 }
 
 static const uint32_t fx_colors[FX_CARD_COUNT] = {
     0xC9271B, 0xE86820, 0xF5BC31, 0xF2552F, 0xFF8C2A, 0xF7EAD7,
     0x27B0D0, 0x31D2A1, 0xF2466B, 0xD18A2B, 0x4CA8FF, 0xA17BFF,
-    0x5FD9A0, 0xB07CF0, 0xFF5C8A, 0x8FE0FF
+    0x5FD9A0, 0xB07CF0, 0xFF5C8A, 0x8FE0FF, 0xE0C24C
 };
 
 static const char* fx_src[FX_CARD_COUNT] = {
     "DEPTH", "DRY / WET", "DRY / WET", "INPUT GAIN", "DUAL MACRO", "DEPTH",
     "FREQUENCY", "Q / RESONANCE", "DRIVE", "RESOLUTION", "HOLD RATE", "MODEL",
-    "DEPTH", "DRY / WET", "SQUASH", "SENSITIVITY"
+    "DEPTH", "DRY / WET", "SQUASH", "SENSITIVITY", "LP > BP > HP > NOTCH"
 };
 
 static uint8_t fx_card_owner_function(int cell) {
@@ -6631,7 +6635,7 @@ static uint8_t fx_card_owner_function(int cell) {
         POD_FUNC_PHASER_DEPTH, POD_FUNC_FILTER_CUTOFF,
         POD_FUNC_FILTER_RESONANCE, POD_FUNC_DISTORTION,
         POD_FUNC_BIT_DEPTH, POD_FUNC_SAMPLE_RATE, POD_FUNC_FILTER_TYPE,
-        POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE
+        POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE, POD_FUNC_NONE
     };
     return (cell >= 0 && cell < FX_CARD_COUNT) ? functions[cell] : POD_FUNC_NONE;
 }
@@ -6680,7 +6684,7 @@ static int fx_card_current_value_u7(int cell) {
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
         case FX_CARD_FILTER: {
-            float norm = (float)constrain(p4.filter_type, 0, 14) / 14.0f;
+            float norm = (float)constrain(p4.filter_type, 0, 15) / 15.0f;
             return constrain((int)(norm * 127.0f + 0.5f), 0, 127);
         }
         // No dedicated p4.* field for these — they have no physical knob or
@@ -6690,6 +6694,7 @@ static int fx_card_current_value_u7(int cell) {
         case FX_CARD_CHORUS:
         case FX_CARD_COMP:
         case FX_CARD_AUTOWAH:
+        case FX_CARD_MORPH:
             return s_fx_current_u7[cell];
     }
     return 0;
@@ -6713,6 +6718,7 @@ static bool fx_card_is_muted(int cell) {
         case FX_CARD_CHORUS:
         case FX_CARD_COMP:
         case FX_CARD_AUTOWAH:
+        case FX_CARD_MORPH:
             return s_fx_current_u7[cell] == 0;
     }
     return false;
@@ -6824,7 +6830,7 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
             break;
         }
         case FX_CARD_FILTER: {
-            int type = constrain((int)((float)u7 / 127.0f * 14.0f + 0.5f), 0, 14);
+            int type = constrain((int)((float)u7 / 127.0f * 15.0f + 0.5f), 0, 15);
             p4.filter_type = type;
             if (transmit && control_available()) control_send_set_filter(type);
             break;
@@ -6840,6 +6846,18 @@ static void fx_card_send_value(int cell, int u7, bool transmit = true) {
             break;
         case FX_CARD_AUTOWAH:
             if (transmit && control_available()) control_send_set_autowah_macro((uint8_t)u7);
+            break;
+        case FX_CARD_MORPH:
+            if (transmit && control_available()) {
+                // MORPH is only audible under the SVF MORPH model — moving
+                // this knob always selects it, same idea as CUTOFF/RESO
+                // auto-engaging LOWPASS when the filter was off.
+                if (p4.filter_type != 15) {
+                    p4.filter_type = 15;
+                    control_send_set_filter(15);
+                }
+                control_send_set_filter_morph((float)u7 / 127.0f);
+            }
             break;
     }
     control_mark_fx_screen_dirty();
@@ -7670,7 +7688,7 @@ static void fx_format_display_value(int cell, int u7, bool muted,
             break;
         }
         case FX_CARD_FILTER: {
-            const int type = constrain((int)(normalized * 14.0f + 0.5f), 0, 14);
+            const int type = constrain((int)(normalized * 15.0f + 0.5f), 0, 15);
             snprintf(value, valueSize, "%s", fx_filter_model_name(type));
             break;
         }

@@ -74,6 +74,9 @@ typedef struct __attribute__((packed)) {
 #define CMD_FILTER_DIST_MODE  0x25  // Distortion mode (soft/hard/tube/fuzz)
 #define CMD_FILTER_SR_REDUCE  0x26  // Sample rate reduction
 #define CMD_MASTER_FX_ROUTE   0x27  // Master FX routing: [fxId(1), connected(1)]
+#define CMD_FILTER_MORPH      0x28  // SVF MORPH position, float 0.0(LP)-1.0(Notch)
+                                     // continuous through BP/HP — only meaningful
+                                     // when filterType == FTYPE_SVF_MORPH (15)
 
 // ═══════════════════════════════════════════════════════
 // COMMANDS: MASTER EFFECTS (0x30 - 0x4F)

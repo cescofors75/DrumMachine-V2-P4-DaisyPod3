@@ -194,6 +194,9 @@ void control_send_track_clear_fx(int track);
 void control_send_set_filter(int type);
 void control_send_set_filter_cutoff(int hz);
 void control_send_set_filter_resonance(float value);
+// SVF MORPH position (0.0 = LP, 1.0 = Notch, continuous through BP/HP) —
+// only audible while the filter model is FTYPE_SVF_MORPH (15).
+void control_send_set_filter_morph(float value);
 void control_send_set_distortion(float value);
 void control_send_set_bitcrush(int bits);
 void control_send_set_sample_rate(int rate_hz);
