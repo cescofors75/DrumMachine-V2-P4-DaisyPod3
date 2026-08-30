@@ -686,7 +686,7 @@ void ui_update_header(void) {
 // ── Boot estilo terminal 90s (BIOS/POST) pero moderno ────────────────────────
 // Líneas que van apareciendo tipo consola con estados dinámicos ([....]→ OK)
 // y cursor de bloque parpadeante. Fuente pixel UNSCII_16 (mono retro).
-#define BOOT_TERM_LINES 9
+#define BOOT_TERM_LINES 8
 static lv_obj_t* s_boot_term[BOOT_TERM_LINES] = {};
 static lv_obj_t* s_boot_cursor = NULL;
 static lv_obj_t* s_boot_progress = NULL;
@@ -20284,60 +20284,9 @@ void ui_update_current_screen(void) {
         if (scanFinished) progress = 100;
         if (s_boot_progress) lv_bar_set_value(s_boot_progress, progress, LV_ANIM_ON);
 
-        // Boot /data/xtra inventory: just the first level of folder names
-        // directly under /data/xtra (one plain CMD_SD_LIST_FOLDERS query),
-        // not the full recursive depth-first walk XTRAPADS itself does —
-        // that walk exists to find which nested folder actually holds WAVs
-        // for paging, which the boot line never needed; a single flat query
-        // is simpler, faster, and can't get lost chasing a deep folder with
-        // an odd name. The full recursive scan is unchanged and still runs
-        // normally on-entry to XTRAPADS / on RESCAN.
-        static bool s_bootXtraRequested = false;
-        static uint32_t s_bootXtraSeenRev = 0;
-        static int s_bootXtraFolderCount = -1;  // -1 = no response yet
-        static char s_bootXtraNames[16][32] = {};
-        static uint8_t s_bootXtraRetries = 0;
-        static uint32_t s_bootXtraNextTryMs = 0;
-        // Wait until the factory-kit autoload sequence (sd_factory_autoload_tick,
-        // above) is done with the SD/upload channel — both it and this query
-        // ride the same USB command/response slot (daisy_sd_revision), and
-        // starting ours mid-scan or mid-upload would read back whichever
-        // response happened to land last, corrupting either result.
-        if (protocolReady && !s_bootXtraRequested && elapsed >= 1500u
-            && now >= s_bootXtraNextTryMs
-            && !sd_upload_in_flight() && !sd_midi_load_in_flight()
-            && s_sd_scan_state.load(std::memory_order_acquire) == 0) {
-            SdListFilesPayload payload = {};
-            strncpy(payload.folderName, "xtra", sizeof(payload.folderName) - 1);
-            if (daisyUsb.send(CMD_SD_LIST_FOLDERS, &payload, sizeof(payload))) {
-                s_bootXtraRequested = true;
-                s_bootXtraSeenRev = transport.daisy_sd_revision;
-            }
-        }
-        if (s_bootXtraRequested && s_bootXtraFolderCount < 0
-            && transport.daisy_sd_revision != s_bootXtraSeenRev) {
-            s_bootXtraFolderCount = transport.daisy_sd_folder_count;
-            for (int i = 0; i < s_bootXtraFolderCount && i < 16; i++) {
-                strncpy(s_bootXtraNames[i], transport.daisy_sd_folders[i],
-                        sizeof(s_bootXtraNames[0]) - 1);
-                s_bootXtraNames[i][sizeof(s_bootXtraNames[0]) - 1] = '\0';
-            }
-            // Daisy's SD reader is a Dupont-wired SPI card (see InitSD's own
-            // 3-attempt mount retry) — an occasional first read landing right
-            // after boot can come back empty even though the card is fine and
-            // genuinely has folders under /data/xtra. Retry a couple of times
-            // before the boot line settles on WARN.
-            if (s_bootXtraFolderCount == 0 && s_bootXtraRetries < 2) {
-                s_bootXtraRetries++;
-                s_bootXtraNextTryMs = now + 900u;
-                s_bootXtraRequested = false;
-                s_bootXtraFolderCount = -1;
-            }
-        }
-
         // Cada línea aparece a su tiempo, como un POST de BIOS.
         static const uint32_t revealMs[BOOT_TERM_LINES] =
-            { 100, 350, 600, 850, 1100, 1500, 1900, 2300, 2700 };
+            { 100, 350, 600, 850, 1100, 1500, 1900, 2300 };
         int lastVisible = -1;
         for (int i = 0; i < BOOT_TERM_LINES; i++) {
             if (!s_boot_term[i]) continue;
@@ -20434,36 +20383,6 @@ void ui_update_current_screen(void) {
                     loadedSamples > 0 ? "OK" : "WAIT");
                 setBootLine(7, loadedSamples > 0
                     ? boot_phosphor() : RED808_WARNING, line);
-            }
-
-            if (!s_bootXtraRequested) {
-                setBootLine(8, boot_phosphor_dim(),
-                    "> XTRA /data/xtra INVENTORY .......... WAIT");
-            } else if (s_bootXtraFolderCount < 0) {
-                setBootLine(8, RED808_CYAN,
-                    "> XTRA CONSULTANDO /data/xtra ........ SCAN");
-            } else if (s_bootXtraFolderCount == 0) {
-                setBootLine(8, RED808_WARNING,
-                    "> XTRA /data/xtra SIN CARPETAS ....... WARN");
-            } else {
-                // Comma-joined list of first-level folder names, truncated
-                // with a "+N" tail if it doesn't fit on one boot line.
-                char names[64] = {};
-                int namesLen = 0, shown = 0;
-                for (int i = 0; i < s_bootXtraFolderCount && i < 16; i++) {
-                    int n = snprintf(names + namesLen, sizeof(names) - namesLen,
-                        "%s%s", (shown > 0) ? ", " : "", s_bootXtraNames[i]);
-                    if (n < 0 || namesLen + n >= (int)sizeof(names) - 8) {
-                        snprintf(names + namesLen, sizeof(names) - namesLen,
-                            ", +%d", s_bootXtraFolderCount - shown);
-                        break;
-                    }
-                    namesLen += n;
-                    shown++;
-                }
-                snprintf(line, sizeof(line), "> XTRA (%d): %s",
-                    s_bootXtraFolderCount, names);
-                setBootLine(8, boot_phosphor(), line);
             }
         }
         // Cursor de bloque parpadeante bajo la última línea visible
