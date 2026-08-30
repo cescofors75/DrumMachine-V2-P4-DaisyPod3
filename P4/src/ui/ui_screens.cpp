@@ -7384,6 +7384,225 @@ static void fx_view_cb(lv_event_t* e) {
     fx_apply_layout();
 }
 
+// =============================================================================
+// FILTER PRESETS — 8 savable snapshots of the global filter's full state
+// (model, cutoff, resonance, distortion, bitcrush, sample-rate reduction,
+// SVF MORPH position). First building block for the SONG "MATRIX" the user
+// wants: each column there will pick one of these 8 slots instead of the
+// live FX LAB knobs. Recall just replays the same public setters a user
+// touching each knob by hand would call — no new protocol needed, and it
+// stays correct automatically if those setters' ranges ever change.
+// =============================================================================
+#define FILTER_PRESET_COUNT 8
+struct FilterPresetSlot {
+    bool used;
+    char name[16];
+    int filterType;
+    int cutoffHz;
+    int resonanceX10;
+    int distortionPct;
+    int bitcrushBits;
+    int sampleRateHz;
+    uint8_t morphU7;
+};
+static FilterPresetSlot s_filter_presets[FILTER_PRESET_COUNT] = {};
+static const char* FILTER_PRESETS_FILE = "/filter_presets.txt";
+
+static lv_obj_t* s_filter_preset_modal = NULL;
+static lv_obj_t* s_filter_preset_slot_btns[FILTER_PRESET_COUNT] = {};
+static lv_obj_t* s_filter_preset_slot_lbls[FILTER_PRESET_COUNT] = {};
+
+static void filter_presets_save_to_disk(void) {
+    File f = SPIFFS.open(FILTER_PRESETS_FILE, FILE_WRITE);
+    if (!f) return;
+    for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
+        const FilterPresetSlot& s = s_filter_presets[i];
+        f.printf("%d,%s,%d,%d,%d,%d,%d,%d,%u\n",
+                 s.used ? 1 : 0, s.name[0] ? s.name : "-",
+                 s.filterType, s.cutoffHz, s.resonanceX10,
+                 s.distortionPct, s.bitcrushBits, s.sampleRateHz,
+                 (unsigned)s.morphU7);
+    }
+    f.close();
+}
+
+static void filter_presets_load_from_disk(void) {
+    memset(s_filter_presets, 0, sizeof(s_filter_presets));
+    for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
+        s_filter_presets[i].cutoffHz = 10000;
+        s_filter_presets[i].bitcrushBits = 16;
+    }
+    File f = SPIFFS.open(FILTER_PRESETS_FILE, FILE_READ);
+    if (!f) return;
+    int idx = 0;
+    char line[128];
+    while (idx < FILTER_PRESET_COUNT && fs_read_line(f, line, sizeof(line))) {
+        if (line[0] == '\0') { idx++; continue; }
+        int used = 0, filterType = 0, cutoffHz = 10000, resonanceX10 = 7,
+            distortionPct = 0, bitcrushBits = 16, sampleRateHz = 0;
+        unsigned morphU7 = 0;
+        char name[16] = {};
+        int parsed = sscanf(line, "%d,%15[^,],%d,%d,%d,%d,%d,%d,%u",
+            &used, name, &filterType, &cutoffHz, &resonanceX10,
+            &distortionPct, &bitcrushBits, &sampleRateHz, &morphU7);
+        if (parsed >= 2) {
+            FilterPresetSlot& s = s_filter_presets[idx];
+            s.used = (used != 0);
+            strncpy(s.name, name, sizeof(s.name) - 1);
+            if (parsed >= 3) s.filterType = constrain(filterType, 0, 15);
+            if (parsed >= 4) s.cutoffHz = constrain(cutoffHz, 20, 20000);
+            if (parsed >= 5) s.resonanceX10 = constrain(resonanceX10, 3, 300);
+            if (parsed >= 6) s.distortionPct = constrain(distortionPct, 0, 100);
+            if (parsed >= 7) s.bitcrushBits = constrain(bitcrushBits, 4, 16);
+            if (parsed >= 8) s.sampleRateHz = sampleRateHz <= 0 ? 0 : constrain(sampleRateHz, 1000, 48000);
+            if (parsed >= 9) s.morphU7 = (uint8_t)constrain((int)morphU7, 0, 127);
+        }
+        idx++;
+    }
+    f.close();
+}
+
+static void filter_preset_modal_refresh(void) {
+    for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
+        if (!s_filter_preset_slot_lbls[i]) continue;
+        const FilterPresetSlot& s = s_filter_presets[i];
+        if (s.used) {
+            lv_label_set_text_fmt(s_filter_preset_slot_lbls[i], "S%d\n%s", i + 1, s.name[0] ? s.name : "PRESET");
+            lv_obj_set_style_text_color(s_filter_preset_slot_lbls[i], lv_color_white(), 0);
+        } else {
+            lv_label_set_text_fmt(s_filter_preset_slot_lbls[i], "S%d\nVACIO", i + 1);
+            lv_obj_set_style_text_color(s_filter_preset_slot_lbls[i], theme_text_dim(), 0);
+        }
+    }
+}
+
+static void filter_preset_save_current(int slot) {
+    if (slot < 0 || slot >= FILTER_PRESET_COUNT) return;
+    FilterPresetSlot& s = s_filter_presets[slot];
+    s.used = true;
+    snprintf(s.name, sizeof(s.name), "%s", fx_filter_model_name(constrain(p4.filter_type, 0, 15)));
+    s.filterType = p4.filter_type;
+    s.cutoffHz = p4.cutoff_hz;
+    s.resonanceX10 = p4.resonance_x10;
+    s.distortionPct = p4.distortion_pct;
+    s.bitcrushBits = p4.bitcrush_bits;
+    s.sampleRateHz = p4.sample_rate_hz;
+    s.morphU7 = s_fx_current_u7[FX_CARD_MORPH];
+    filter_presets_save_to_disk();
+    filter_preset_modal_refresh();
+    ui_show_toast("Preset de filtro guardado", RED808_SUCCESS);
+}
+
+static void filter_preset_recall(int slot) {
+    if (slot < 0 || slot >= FILTER_PRESET_COUNT) return;
+    const FilterPresetSlot& s = s_filter_presets[slot];
+    if (!s.used) {
+        ui_show_toast("Slot vacio — manten pulsado para guardar", RED808_WARNING);
+        return;
+    }
+    if (!control_available()) {
+        ui_show_toast("Master no conectado", RED808_WARNING);
+        return;
+    }
+    control_send_set_filter(s.filterType);
+    control_send_set_filter_cutoff(s.cutoffHz);
+    control_send_set_filter_resonance(s.resonanceX10 / 10.0f);
+    control_send_set_distortion(s.distortionPct / 100.0f);
+    control_send_set_bitcrush(s.bitcrushBits);
+    control_send_set_sample_rate(s.sampleRateHz);
+    control_send_set_filter_morph(s.morphU7 / 127.0f);
+    s_fx_current_u7[FX_CARD_MORPH] = s.morphU7;
+    control_mark_fx_screen_dirty();
+    ui_show_toast("Preset de filtro cargado", RED808_SUCCESS);
+}
+
+static void filter_preset_slot_clicked_cb(lv_event_t* e) {
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (lv_event_get_code(e) == LV_EVENT_LONG_PRESSED) filter_preset_save_current(slot);
+    else filter_preset_recall(slot);
+}
+
+static void filter_preset_modal_close_cb(lv_event_t* e) {
+    if (e && lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    if (s_filter_preset_modal) {
+        lv_obj_del(s_filter_preset_modal);
+        s_filter_preset_modal = NULL;
+        for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
+            s_filter_preset_slot_btns[i] = NULL;
+            s_filter_preset_slot_lbls[i] = NULL;
+        }
+    }
+}
+
+static void filter_preset_modal_show(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_filter_preset_modal) return;
+
+    s_filter_preset_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_filter_preset_modal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(s_filter_preset_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_filter_preset_modal, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_filter_preset_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_filter_preset_modal, 0, 0);
+    lv_obj_clear_flag(s_filter_preset_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_filter_preset_modal, filter_preset_modal_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = lv_obj_create(s_filter_preset_modal);
+    lv_obj_set_size(card, 720, 260);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+    lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "FILTER PRESETS");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "TOCA = cargar   ·   MANTEN PULSADO = guardar el filtro actual aqui");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, RED808_TEXT_DIM, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 32);
+
+    constexpr int btnW = 80, btnH = 84, gapX = 6, y0 = 68;
+    for (int i = 0; i < FILTER_PRESET_COUNT; i++) {
+        lv_obj_t* btn = lv_btn_create(card);
+        s_filter_preset_slot_btns[i] = btn;
+        lv_obj_set_size(btn, btnW, btnH);
+        lv_obj_set_pos(btn, 4 + i * (btnW + gapX), y0);
+        apply_control_button_style(btn, RED808_ACCENT2, false, 8);
+        lv_obj_add_event_cb(btn, filter_preset_slot_clicked_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(btn, filter_preset_slot_clicked_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)i);
+
+        lv_obj_t* lbl = lv_label_create(btn);
+        s_filter_preset_slot_lbls[i] = lbl;
+        lv_obj_set_width(lbl, btnW - 8);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(lbl);
+    }
+
+    lv_obj_t* close_btn = lv_btn_create(card);
+    lv_obj_set_size(close_btn, 160, 40);
+    lv_obj_set_pos(close_btn, 280, 172);
+    apply_control_button_style(close_btn, RED808_ERROR, false, 10);
+    lv_obj_add_event_cb(close_btn, filter_preset_modal_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, "CERRAR");
+    lv_obj_center(close_lbl);
+
+    filter_preset_modal_refresh();
+}
+
 static void fx_xy_open_cb(lv_event_t* e) {
     LV_UNUSED(e);
     ui_navigate_to(13);   // FX XY performance pad
@@ -7445,6 +7664,17 @@ static void create_fx_screen(void) {
     lv_obj_center(randomLabel);
     s_fx_random_stop_badge = ui_create_auto_stop_badge(s_fx_random_btn, fx_random_stop_badge_cb);
     fx_random_btn_refresh();
+
+    // ── FILTER PRESETS: 8 savable snapshots of the whole filter section ──
+    lv_obj_t* presets_btn = lv_btn_create(scr_fx);
+    lv_obj_set_size(presets_btn, 96, 36);
+    lv_obj_set_pos(presets_btn, 708, 8);
+    apply_control_button_style(presets_btn, RED808_CYAN, false, 8);
+    lv_obj_add_event_cb(presets_btn, filter_preset_modal_show, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* presetsLabel = lv_label_create(presets_btn);
+    lv_label_set_text(presetsLabel, "PRESETS");
+    lv_obj_set_style_text_font(presetsLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(presetsLabel);
 
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         // Card container
@@ -7632,6 +7862,7 @@ static void create_fx_screen(void) {
     lv_obj_set_style_text_font(xy_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(xy_lbl);
 
+    filter_presets_load_from_disk();
     fx_apply_layout();
 }
 
