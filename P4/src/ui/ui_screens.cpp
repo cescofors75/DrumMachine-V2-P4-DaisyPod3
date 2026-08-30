@@ -19475,10 +19475,18 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
     (void)velocity;
     static bool prev_live_active = true;
 
-    // Si el modal PAD SOUND está abierto, ignora los pads físicos:
-    // la pantalla está cubierta y cualquier toque debe ir a los
-    // botones del modal, no al pad físico que hay debajo.
-    if (s_pad_inst_modal) {
+    // Si hay CUALQUIER modal/overlay a pantalla completa abierto encima de
+    // LIVE, ignora los pads físicos: el bypass de toque directo trabaja por
+    // coordenadas de pantalla, sin pasar por LVGL, así que no sabe que hay
+    // un overlay tapando todo — sin este guard, tocar el botón BACK de
+    // cualquiera de estos modales (que suele estar en la misma esquina que
+    // el pad 0) suena el pad de debajo. Antes solo cubría PAD SOUND; ahora
+    // cubre cualquier overlay de este tipo que pueda abrirse desde LIVE.
+    if (s_pad_inst_modal || s_pod_status_modal || s_pod_control_map_modal
+        || s_pod_dashboard_modal || s_mpd_map_modal || s_mpd_assign_modal
+        || s_pod_function_modal || s_xtra_editor_modal
+        || s_filter_preset_modal || s_mixer_preset_modal
+        || s_melody_preset_modal || s_matrix_modal || s_matrix_picker_modal) {
         for (int p = 0; p < 16; p++) {
             s_pad_held[p] = false;
             s_pad_repeat_next_ms[p] = 0;
@@ -20001,40 +20009,55 @@ void ui_update_current_screen(void) {
         if (scanFinished) progress = 100;
         if (s_boot_progress) lv_bar_set_value(s_boot_progress, progress, LV_ANIM_ON);
 
-        // Kick off the /data/xtra inventory scan the moment Daisy answers —
-        // reuses the exact same walk XTRAPADS itself uses (see
-        // xtra_pages_request_folders / xtra_pages_poll), just triggered here
-        // instead of on-entry to that screen, and polled every frame while
-        // the boot screen is up so it actually progresses (xtra_pages_poll()
-        // otherwise only runs while PERFORMANCE is the active screen).
-        static bool bootXtraScanKicked = false;
-        static uint8_t bootXtraRetries = 0;
-        static uint32_t bootXtraNextTryMs = 0;
+        // Boot /data/xtra inventory: just the first level of folder names
+        // directly under /data/xtra (one plain CMD_SD_LIST_FOLDERS query),
+        // not the full recursive depth-first walk XTRAPADS itself does —
+        // that walk exists to find which nested folder actually holds WAVs
+        // for paging, which the boot line never needed; a single flat query
+        // is simpler, faster, and can't get lost chasing a deep folder with
+        // an odd name. The full recursive scan is unchanged and still runs
+        // normally on-entry to XTRAPADS / on RESCAN.
+        static bool s_bootXtraRequested = false;
+        static uint32_t s_bootXtraSeenRev = 0;
+        static int s_bootXtraFolderCount = -1;  // -1 = no response yet
+        static char s_bootXtraNames[16][32] = {};
+        static uint8_t s_bootXtraRetries = 0;
+        static uint32_t s_bootXtraNextTryMs = 0;
         // Wait until the factory-kit autoload sequence (sd_factory_autoload_tick,
-        // above) is done with the SD/upload channel — both it and this scan
+        // above) is done with the SD/upload channel — both it and this query
         // ride the same USB command/response slot (daisy_sd_revision), and
         // starting ours mid-scan or mid-upload would read back whichever
         // response happened to land last, corrupting either result.
-        if (protocolReady && !bootXtraScanKicked && elapsed >= 1500u
-            && now >= bootXtraNextTryMs
+        if (protocolReady && !s_bootXtraRequested && elapsed >= 1500u
+            && now >= s_bootXtraNextTryMs
             && !sd_upload_in_flight() && !sd_midi_load_in_flight()
             && s_sd_scan_state.load(std::memory_order_acquire) == 0) {
-            bootXtraScanKicked = true;
-            xtra_pages_request_folders();
+            SdListFilesPayload payload = {};
+            strncpy(payload.folderName, "xtra", sizeof(payload.folderName) - 1);
+            if (daisyUsb.send(CMD_SD_LIST_FOLDERS, &payload, sizeof(payload))) {
+                s_bootXtraRequested = true;
+                s_bootXtraSeenRev = transport.daisy_sd_revision;
+            }
         }
-        if (bootXtraScanKicked) xtra_pages_poll();
-        // Daisy's SD reader is a Dupont-wired SPI card (see InitSD's own
-        // 3-attempt mount retry) — an occasional first read landing right
-        // after boot can come back empty even though the card is fine and
-        // genuinely has folders under /data/xtra. Rather than trust a single
-        // zero-folder result this early, retry a couple of times before the
-        // boot line settles on WARN.
-        if (bootXtraScanKicked && s_xtra_page_req == XTRA_PAGE_REQ_NONE
-            && s_xtra_scan_count == 0 && bootXtraRetries < 2
-            && now >= bootXtraNextTryMs) {
-            bootXtraRetries++;
-            bootXtraNextTryMs = now + 900u;
-            bootXtraScanKicked = false;
+        if (s_bootXtraRequested && s_bootXtraFolderCount < 0
+            && transport.daisy_sd_revision != s_bootXtraSeenRev) {
+            s_bootXtraFolderCount = transport.daisy_sd_folder_count;
+            for (int i = 0; i < s_bootXtraFolderCount && i < 16; i++) {
+                strncpy(s_bootXtraNames[i], transport.daisy_sd_folders[i],
+                        sizeof(s_bootXtraNames[0]) - 1);
+                s_bootXtraNames[i][sizeof(s_bootXtraNames[0]) - 1] = '\0';
+            }
+            // Daisy's SD reader is a Dupont-wired SPI card (see InitSD's own
+            // 3-attempt mount retry) — an occasional first read landing right
+            // after boot can come back empty even though the card is fine and
+            // genuinely has folders under /data/xtra. Retry a couple of times
+            // before the boot line settles on WARN.
+            if (s_bootXtraFolderCount == 0 && s_bootXtraRetries < 2) {
+                s_bootXtraRetries++;
+                s_bootXtraNextTryMs = now + 900u;
+                s_bootXtraRequested = false;
+                s_bootXtraFolderCount = -1;
+            }
         }
 
         // Cada línea aparece a su tiempo, como un POST de BIOS.
@@ -20138,21 +20161,33 @@ void ui_update_current_screen(void) {
                     ? boot_phosphor() : RED808_WARNING, line);
             }
 
-            if (!bootXtraScanKicked) {
+            if (!s_bootXtraRequested) {
                 setBootLine(8, boot_phosphor_dim(),
                     "> XTRA /data/xtra INVENTORY .......... WAIT");
-            } else if (s_xtra_page_req != XTRA_PAGE_REQ_NONE) {
-                snprintf(line, sizeof(line),
-                    "> XTRA SCANNING /data/xtra (%d) ....... SCAN",
-                    s_xtra_scan_count);
-                setBootLine(8, RED808_CYAN, line);
-            } else if (s_xtra_scan_count == 0) {
+            } else if (s_bootXtraFolderCount < 0) {
+                setBootLine(8, RED808_CYAN,
+                    "> XTRA CONSULTANDO /data/xtra ........ SCAN");
+            } else if (s_bootXtraFolderCount == 0) {
                 setBootLine(8, RED808_WARNING,
                     "> XTRA /data/xtra SIN CARPETAS ....... WARN");
             } else {
-                snprintf(line, sizeof(line),
-                    "> XTRA %d CARPETAS / %d WAV ........... OK",
-                    s_xtra_scan_count, s_xtra_scan_total_wavs);
+                // Comma-joined list of first-level folder names, truncated
+                // with a "+N" tail if it doesn't fit on one boot line.
+                char names[64] = {};
+                int namesLen = 0, shown = 0;
+                for (int i = 0; i < s_bootXtraFolderCount && i < 16; i++) {
+                    int n = snprintf(names + namesLen, sizeof(names) - namesLen,
+                        "%s%s", (shown > 0) ? ", " : "", s_bootXtraNames[i]);
+                    if (n < 0 || namesLen + n >= (int)sizeof(names) - 8) {
+                        snprintf(names + namesLen, sizeof(names) - namesLen,
+                            ", +%d", s_bootXtraFolderCount - shown);
+                        break;
+                    }
+                    namesLen += n;
+                    shown++;
+                }
+                snprintf(line, sizeof(line), "> XTRA (%d): %s",
+                    s_bootXtraFolderCount, names);
                 setBootLine(8, boot_phosphor(), line);
             }
         }
