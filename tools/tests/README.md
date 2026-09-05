@@ -14,6 +14,8 @@ with compilers that define NDEBUG in optimized builds.
 - `audio_regression.cpp`: production timing/packing/hash helpers, transaction
   validation (missing tracks, old token, corrupt checksum), all three native
   drum kit outputs, preservation of aggregate signal, and 909/505 PCM outputs.
+- `drum_idle_regression.cpp`: idle silence, procedural and PCM voice lifecycles,
+  final samples, hat choke, sample replacement and limiter recovery for all kits.
 - `storage_regression.cpp`: includes the **production pattern_store.cpp** with
   an in-memory filesystem and small opaque pattern payload. Injects interrupted
   writes at every byte boundary, open failure and corruption; checks that failed

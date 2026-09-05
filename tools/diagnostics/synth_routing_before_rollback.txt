@@ -1,0 +1,190 @@
+        /* ── SYNTH ENGINES — process + cadena FX per-track ── */
+        /* Lambda: aplica filtro/dist/EQ/echo/flanger/comp/vol/pan del track t  */
+        /* al sample s y lo suma a busL/busR. Si t<0 -> bus directo sin FX.     */
+        float synthTrackInput[MAX_PADS] = {};
+        auto synthTobus = [&](float s, int8_t t) {
+            if(t < 0 || t >= MAX_PADS) { busL += s; busR += s; }
+            else synthTrackInput[t] += s;
+        };
+        auto renderSynthTrack = [&](float s, int8_t t){
+            if(t < 0 || t >= MAX_PADS){ busL += s; busR += s; return; }
+            if(trkFxRouted[t]){
+            /* filtro */
+            if(trkFilterType[t]){
+                s = sanitizeF(trkFilter[t].Process(s));
+                if(trkFilterType[t] == FTYPE_RESONANT){
+                    s = sanitizeF(trkFilter2[t].Process(s));
+                    s = SoftLimit(s * 1.4f) * 0.714f;
+                    s *= ResonantMakeupGain(trkFilterQ[t]);
+                }
+            }
+            /* dist + bitcrush */
+            s = ApplyDist(s, trkDistDrive[t], trkDistMode[t]);
+            s = BitCrush(s, trkBitDepth[t]);
+            /* EQ 3 bandas */
+            if(trkEqLowDb[t])  s = sanitizeF(trkEqLow[t].Process(s));
+            if(trkEqMidDb[t])  s = sanitizeF(trkEqMid[t].Process(s));
+            if(trkEqHighDb[t]) s = sanitizeF(trkEqHigh[t].Process(s));
+            /* echo */
+            if(!fxShed && trkEchoActive[t]){
+                uint32_t d = (uint32_t)trkEchoDelay[t];
+                if(d == 0)
+                    d = 1;
+                if(d >= TRACK_ECHO_SIZE)
+                    d = TRACK_ECHO_SIZE - 1;
+                uint32_t rpe = (trkEchoWp[t] + TRACK_ECHO_SIZE - d) % TRACK_ECHO_SIZE;
+                float delayed = trkEchoBuf[t][rpe];
+                trkEchoBuf[t][trkEchoWp[t]] = clampF(s + delayed*trkEchoFb[t], -1.f, 1.f);
+                s = s*(1.f - trkEchoMix[t]) + delayed*trkEchoMix[t];
+                trkEchoWp[t] = (trkEchoWp[t] + 1) % TRACK_ECHO_SIZE;
+            }
+            /* flanger */
+            if(!fxShed && trkFlgActive[t]){
+                float wet = sanitizeF(trkFlanger[t].Process(s));
+                s = s*(1.f - trkFlgMix[t]) + wet*trkFlgMix[t];
+            }
+            /* compressor */
+            if(!fxShed && trkCompActive[t]){
+                float absS = fabsf(s);
+                if(absS > trkCompEnv[t]) trkCompEnv[t] += (absS - trkCompEnv[t]) * 0.25f;
+                else                     trkCompEnv[t] -= (trkCompEnv[t] - absS) * 0.03f;
+                if(trkCompEnv[t] > trkCompThresh[t] && trkCompEnv[t] > 0.001f){
+                    float g = trkCompThresh[t] / trkCompEnv[t];
+                    g = fast_powf(g, trkCompExp[t]);
+                    if(g < 0.125f) g = 0.125f;
+                    s *= g;
+                }
+            }
+            } /* end trkFxRouted */
+            /* mute / solo */
+            bool muted = trackMute[t];
+            if(anySolo && !trackSolo[t]) muted = true;
+            if(muted) return;
+            /* LFO gain / pan */
+            float lfoGain = 1.0f;
+            if(trkLfoActive[t] && trkLfoTarget[t] == LFO_TGT_GAIN)
+                lfoGain = clampF(1.0f + 0.8f * lfoVal[t], 0.0f, 2.0f);
+            float panTrk = trackPanF[t];
+            if(trkLfoActive[t] && trkLfoTarget[t] == LFO_TGT_PAN)
+                panTrk = clampF(panTrk + 0.9f * lfoVal[t], -1.0f, 1.0f);
+            /* vol + pan -> bus */
+            float outS = s * EffectiveTrackGain(t) * lfoGain;
+            float pL = (1.f - panTrk) * 0.5f;
+            float pR = (1.f + panTrk) * 0.5f;
+            busL += outS * pL;
+            busR += outS * pR;
+            /* sends (stereo) — only if master FX engaged */
+            float sndL = outS * pL, sndR = outS * pR;
+            if(revEng){
+                reverbBusL += sndL * EffectiveReverbSend(t);
+                reverbBusR += sndR * EffectiveReverbSend(t);
+            }
+            if(delEng){
+                delayBusL  += sndL * trackDelaySend[t];
+                delayBusR  += sndR * trackDelaySend[t];
+            }
+            if(choEng){
+                chorusBusL += sndL * trackChorusSend[t];
+                chorusBusR += sndR * trackChorusSend[t];
+            }
+            /* peak */
+            float pk = fabsf(outS);
+            if(pk > trackPeak[t]) trackPeak[t] = pk;
+        };
+
+        auto drumToBus = [&](auto& kit, uint8_t engine, const uint8_t* mapping) {
+            if(!kit.IsActive()) {
+                kit.Process();
+                return;
+            }
+            float outputs[16];
+            kit.Process(outputs);
+            for(uint8_t track = 0; track < 16; ++track) {
+                const uint8_t inst = mapping[track];
+                if(outputs[inst] == 0.f) continue;
+                const float gain = drumSeqSource[engine][inst] ? seqVolume : liveVolume;
+                synthTobus(sanitizeF(outputs[inst]) * kDrumBusHeadroom * gain, track);
+            }
+        };
+        if(renderSynthMask & (1 << SYNTH_ENGINE_808)) {
+            DSP_PROF_SCOPE(SYNTH_808);
+            drumToBus(synth808, SYNTH_ENGINE_808, padTo808);
+            DSP_PROF_END(SYNTH_808);
+        }
+        if(renderSynthMask & (1 << SYNTH_ENGINE_909)) {
+            DSP_PROF_SCOPE(SYNTH_909);
+            drumToBus(synth909, SYNTH_ENGINE_909, padTo909);
+            DSP_PROF_END(SYNTH_909);
+        }
+        if(kEnableSynth505 && (renderSynthMask & (1 << SYNTH_ENGINE_505))) {
+            DSP_PROF_SCOPE(SYNTH_505);
+            drumToBus(synth505, SYNTH_ENGINE_505, padTo505);
+            DSP_PROF_END(SYNTH_505);
+        }
+        if ((renderSynthMask & (1 << SYNTH_ENGINE_303)) && acid303.IsActive()){
+            /* v2.5: −4dB headroom en synths melódicos para no saturar el bus */
+            DSP_PROF_SCOPE(SYNTH_303);
+            float s = sanitizeF(acid303.Process()) * 0.63f;
+            DSP_PROF_END(SYNTH_303);
+            DSP_PROF_SCOPE(SYNTH_ROUTING);
+            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_303] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_303] >= 0 ? melodicOwner[SYNTH_ENGINE_303] : engTrk[SYNTH_ENGINE_303]);
+            DSP_PROF_END(SYNTH_ROUTING);
+        }
+        if ((renderSynthMask & (1 << SYNTH_ENGINE_WTOSC)) && wtOsc.IsActive()){
+            DSP_PROF_SCOPE(SYNTH_WT);
+            float s = sanitizeF(wtOsc.Process()) * 0.63f;
+            DSP_PROF_END(SYNTH_WT);
+            DSP_PROF_SCOPE(SYNTH_ROUTING);
+            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_WTOSC] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_WTOSC] >= 0 ? melodicOwner[SYNTH_ENGINE_WTOSC] : engTrk[SYNTH_ENGINE_WTOSC]);
+            DSP_PROF_END(SYNTH_ROUTING);
+        }
+        if ((renderSynthMask & (1 << SYNTH_ENGINE_SH101)) && synthSH101.IsActive()){  /* I1 */
+            DSP_PROF_SCOPE(SYNTH_SH101);
+            float s = sanitizeF(synthSH101.Process()) * 0.63f;
+            DSP_PROF_END(SYNTH_SH101);
+            DSP_PROF_SCOPE(SYNTH_ROUTING);
+            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_SH101] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_SH101] >= 0 ? melodicOwner[SYNTH_ENGINE_SH101] : engTrk[SYNTH_ENGINE_SH101]);
+            DSP_PROF_END(SYNTH_ROUTING);
+        }
+        if ((renderSynthMask & (1 << SYNTH_ENGINE_FM2OP)) && synthFM2Op.IsActive()){  /* I2 */
+            DSP_PROF_SCOPE(SYNTH_FM2OP);
+            float s = sanitizeF(synthFM2Op.Process()) * 0.63f;
+            DSP_PROF_END(SYNTH_FM2OP);
+            DSP_PROF_SCOPE(SYNTH_ROUTING);
+            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_FM2OP] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_FM2OP] >= 0 ? melodicOwner[SYNTH_ENGINE_FM2OP] : engTrk[SYNTH_ENGINE_FM2OP]);
+            DSP_PROF_END(SYNTH_ROUTING);
+        }
+        if (renderSynthMask & (1 << SYNTH_ENGINE_PHYS)){
+            DSP_PROF_SCOPE(SYNTH_PHYS);
+            float s = 0;
+            if(physModalActive)  s += sanitizeF(physModal.Process())  * physModalGain;
+            if(physStringActive) s += sanitizeF(physString.Process()) * physStringGain;
+            DSP_PROF_END(SYNTH_PHYS);
+            DSP_PROF_SCOPE(SYNTH_ROUTING);
+            synthTobus(sanitizeF(s) * (melodicSeqSource[SYNTH_ENGINE_PHYS] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_PHYS] >= 0 ? melodicOwner[SYNTH_ENGINE_PHYS] : engTrk[SYNTH_ENGINE_PHYS]);
+            DSP_PROF_END(SYNTH_ROUTING);
+        }
+        if (renderSynthMask & (1 << SYNTH_ENGINE_NOISE)){
+            if(noisePartActive){
+                DSP_PROF_SCOPE(SYNTH_NOISE);
+                float s = sanitizeF(noisePart.Process()) * noisePartGain;
+                DSP_PROF_END(SYNTH_NOISE);
+                DSP_PROF_SCOPE(SYNTH_ROUTING);
+                synthTobus(sanitizeF(s) * (melodicSeqSource[SYNTH_ENGINE_NOISE] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_NOISE] >= 0 ? melodicOwner[SYNTH_ENGINE_NOISE] : engTrk[SYNTH_ENGINE_NOISE]);
+                DSP_PROF_END(SYNTH_ROUTING);
+            }
+        }
+
+        DSP_PROF_SCOPE(SYNTH_ROUTING);
+        for(uint8_t t = 0; t < DSQ_TRACKS; ++t)
+            if(synthTrackInput[t] != 0.f || (dsqTrackEngine[t] >= 0 && trkFxRouted[t]
+               && (trkEchoActive[t] || trkFlgActive[t]
+                   || (trkCompActive[t] && trkCompEnv[t] > 1e-9f)
+                   || fabsf(trkFilter[t].z1) + fabsf(trkFilter[t].z2) > 1e-9f
+                   || fabsf(trkFilter2[t].z1) + fabsf(trkFilter2[t].z2) > 1e-9f
+                   || fabsf(trkEqLow[t].z1) + fabsf(trkEqLow[t].z2) > 1e-9f
+                   || fabsf(trkEqMid[t].z1) + fabsf(trkEqMid[t].z2) > 1e-9f
+                   || fabsf(trkEqHigh[t].z1) + fabsf(trkEqHigh[t].z2) > 1e-9f)))
+                renderSynthTrack(synthTrackInput[t], t);
+        DSP_PROF_END(SYNTH_ROUTING);
+

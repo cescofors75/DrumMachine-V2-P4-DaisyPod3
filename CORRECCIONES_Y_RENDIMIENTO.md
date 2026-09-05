@@ -1,5 +1,7 @@
 # Correcciones y rendimiento — 2026-09-05
 
+Revisión posterior por saturación al cambiar de patrón: [incidencia y validación pendiente en placa](INCIDENCIA_CAMBIO_PATRON.md).
+
 Implementadas las correcciones de los diez hallazgos de la auditoría, más el
 disparo duplicado de pads encontrado durante la revisión. Ambos firmwares
 compilan y generan binarios. No se han flasheado las placas ni medido CPU,

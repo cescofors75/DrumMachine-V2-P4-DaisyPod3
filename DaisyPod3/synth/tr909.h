@@ -1126,11 +1126,13 @@ public:
         }
         masterVol_  = 0.92f;
         limitState_ = 0.0f;
+        hasActiveVoices_ = false;
     }
 
     void Trigger(uint8_t inst, float velocity = 1.0f) {
         velocity = Clamp(velocity, 0.0f, 1.0f);
         if (inst >= INST_COUNT) return;
+        hasActiveVoices_ = true;
         if (inst == INST_HIHAT_C) {
             hihatO.Choke();
             if (pcm_[INST_HIHAT_O].active)
@@ -1166,12 +1168,23 @@ public:
         }
     }
 
+    // Use Kit::Trigger(); keep calling Process() during idle for limiter release.
+    bool IsActive() const { return hasActiveVoices_; }
+
     float Process(float* outputs = nullptr) {
+        if (!hasActiveVoices_) {
+            if (outputs) memset(outputs, 0, sizeof(float) * INST_COUNT);
+            limitState_ *= 0.9985f;
+            return 0.0f;
+        }
+        hasActiveVoices_ = false;
         float mix = 0.0f;
         float channels[INST_COUNT] = {};
 
         auto add = [&](uint8_t id, auto& inst) {
             if (inst.IsActive()) {
+                // Keep the final sample even if Process() deactivates the voice.
+                hasActiveVoices_ = true;
                 float sample = inst.Process();
                 if (!chanMute_[id]) channels[id] += sample * chanVol_[id];
             }
@@ -1202,6 +1215,7 @@ public:
                 slot.active = false;
                 continue;
             }
+            hasActiveVoices_ = true; // Includes PCM end/choke's final sample.
             float frac = slot.pos - (float)idx;
             float s0 = slot.data[idx] / 32768.0f;
             float s1 = (idx + 1u < slot.length) ? slot.data[idx + 1u] / 32768.0f : 0.0f;
@@ -1248,7 +1262,8 @@ public:
     }
 
     void ClearPcmSample(uint8_t inst) {
-        if (inst < INST_COUNT) pcm_[inst] = PcmSlot{};
+        if (inst >= INST_COUNT) return;
+        pcm_[inst] = PcmSlot{};
     }
 
     void ClearPcmSamples() {
@@ -1306,6 +1321,7 @@ private:
     float  sr_          = 48000.0f;
     float  masterVol_   = 0.92f;
     float  limitState_  = 0.0f;
+    bool   hasActiveVoices_ = false;
     float  chanVol_[INST_COUNT]  = {};
     bool   chanMute_[INST_COUNT] = {};
     PcmSlot pcm_[INST_COUNT];

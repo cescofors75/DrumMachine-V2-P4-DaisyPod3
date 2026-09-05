@@ -9,4 +9,5 @@ Import("env")
 
 if sys.platform == "win32":
     command = '"{}" -m esptool'.format(sys.executable)
-    env.Replace(OBJCOPY=command, ERASETOOL=command)
+    # UPLOADCMD expands $UPLOADER unquoted, so the same string works there.
+    env.Replace(OBJCOPY=command, ERASETOOL=command, UPLOADER=command)

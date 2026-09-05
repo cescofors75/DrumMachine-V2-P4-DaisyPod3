@@ -15,7 +15,7 @@ compiler = [args.compiler]
 if Path(args.compiler).stem.lower() == "zig":
     compiler.append("c++")
 with tempfile.TemporaryDirectory(prefix="drum-audit-tests-") as output:
-    for test in ("audio_regression", "storage_regression"):
+    for test in ("audio_regression", "storage_regression", "drum_idle_regression"):
         executable = Path(output) / (test + ".exe")
         subprocess.run(compiler + ["-std=c++17", "-O2", "-Itools/tests/stubs",
             "tools/tests/" + test + ".cpp", "-o", str(executable)], cwd=root, check=True)

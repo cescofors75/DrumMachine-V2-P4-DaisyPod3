@@ -435,7 +435,7 @@ static inline void DspProfBlockDone() {}
 #define CMD_PING              0xEE
 #define CMD_RESET             0xEF
 
-#define RED808_PROTOCOL_VERSION       0x0204u
+#define RED808_PROTOCOL_VERSION       0x0205u
 #define RED808_CAP_EXTENDED_PONG      0x0001u
 #define RED808_CAP_USB_RX_DIAGNOSTICS 0x0002u
 #define RED808_CAP_MIDI_MONITOR       0x0004u
@@ -591,7 +591,8 @@ struct __attribute__((packed)) CpuLoadResponse {
  * para evitar problemas de D-cache cuando la CPU lee datos que llegan
  * por el periférico SPI.                                              */
 static uint8_t DMA_BUFFER_MEM_SECTION rxBuf[RX_BUF_SIZE];
-static uint8_t DMA_BUFFER_MEM_SECTION txBuf[TX_BUF_SIZE];
+static uint8_t DMA_BUFFER_MEM_SECTION usbTxBuffers[2][TX_BUF_SIZE];
+static uint8_t* txBuf = usbTxBuffers[0];
 static volatile bool  waitingPayload  = false;
 static volatile bool  pendingResponse = false;
 static uint16_t       pendingTxLen    = 0;
@@ -988,6 +989,7 @@ static DsqStepFull (*dsqSteps[DSQ_PATTERNS])[DSQ_MAX_STEPS];
 static DsqStepFull (*dsqStaging)[DSQ_MAX_STEPS];
 static PatternTransferCheck patternTransfer;
 static uint16_t patternCommitSequence = 0;
+static volatile int8_t requestedPattern = -1; // consumed only at an audio block boundary
 static volatile uint8_t patternCommitState = 0; // 1: audio swap pending, 2: ack pending
 static bool drumSeqSource[3][16] = {};
 static bool melodicSeqSource[SYNTH_ENGINE_COUNT] = {};
@@ -2347,6 +2349,20 @@ static const uint8_t padTo303Midi[16] = {
 
 /* Bitmask: qué engines están activos */
 static constexpr float kDrumBusHeadroom = 0.70f;  // evita clipping al mezclar 808/909/505
+// Main-loop preset setters must not overlap ISR processing/triggering of
+// the same engine (in particular PCM pointer/length and filter coefficients).
+static volatile uint16_t synthPresetBusyMask = 0;
+struct SynthPresetUpdate {
+    uint16_t bit;
+    explicit SynthPresetUpdate(uint8_t engine) : bit(uint16_t(1u << engine)) {
+        synthPresetBusyMask |= bit;
+        __DMB();
+    }
+    ~SynthPresetUpdate() {
+        __DMB();
+        synthPresetBusyMask &= ~bit;
+    }
+};
 static uint16_t synthActiveMask = 0x01FF;  /* all 9 engines active */
 static uint8_t pianoSelectedEngine = SYNTH_ENGINE_303;
 
@@ -3203,22 +3219,22 @@ static void RunStartup808SelfTest(uint32_t nowMs)
 
         uint8_t st = synthJamStep & 15u;
         if(isTechno){
-            if((st % 4u) == 0u) synth808.kick.Trigger(0.92f);
-            if(st == 4u || st == 12u) synth909.snare.Trigger(0.82f);
-            if((st % 2u) == 1u) synth505.hihatC.Trigger(0.48f);
-            if(st == 7u || st == 15u) synth505.clap.Trigger(0.64f);
-            if(st == 10u) synth909.ride.Trigger(0.52f);
+            if((st % 4u) == 0u) synth808.Trigger(TR808::INST_KICK, 0.92f);
+            if(st == 4u || st == 12u) synth909.Trigger(TR909::INST_SNARE, 0.82f);
+            if((st % 2u) == 1u) synth505.Trigger(TR505::INST_HIHAT_C, 0.48f);
+            if(st == 7u || st == 15u) synth505.Trigger(TR505::INST_CLAP, 0.64f);
+            if(st == 10u) synth909.Trigger(TR909::INST_RIDE, 0.52f);
         } else if(isElectro){
-            if(st == 0u || st == 6u || st == 8u || st == 14u) synth909.kick.Trigger(0.90f);
-            if(st == 4u || st == 12u) synth505.snare.Trigger(0.72f);
-            if((st % 4u) == 2u) synth909.hihatO.Trigger(0.52f);
-            if((st % 2u) == 1u) synth505.hihatC.Trigger(0.40f);
-            if(st == 11u) synth505.cowbell.Trigger(0.58f);
+            if(st == 0u || st == 6u || st == 8u || st == 14u) synth909.Trigger(TR909::INST_KICK, 0.90f);
+            if(st == 4u || st == 12u) synth505.Trigger(TR505::INST_SNARE, 0.72f);
+            if((st % 4u) == 2u) synth909.Trigger(TR909::INST_HIHAT_O, 0.52f);
+            if((st % 2u) == 1u) synth505.Trigger(TR505::INST_HIHAT_C, 0.40f);
+            if(st == 11u) synth505.Trigger(TR505::INST_COWBELL, 0.58f);
         } else {
-            if(st == 0u || st == 8u) synth808.kick.Trigger(0.66f);
-            if(st == 4u || st == 12u) synth808.clap.Trigger(0.48f);
-            if((st % 8u) == 6u) synth909.crash.Trigger(0.36f);
-            if((st % 4u) == 2u) synth505.hihatO.Trigger(0.34f);
+            if(st == 0u || st == 8u) synth808.Trigger(TR808::INST_KICK, 0.66f);
+            if(st == 4u || st == 12u) synth808.Trigger(TR808::INST_CLAP, 0.48f);
+            if((st % 8u) == 6u) synth909.Trigger(TR909::INST_CRASH, 0.36f);
+            if((st % 4u) == 2u) synth505.Trigger(TR505::INST_HIHAT_O, 0.34f);
         }
 
         float u = (styleSteps <= 1)
@@ -3810,6 +3826,8 @@ static void ApplyPhysPreset(uint8_t presetId)
 
 static void ApplySynthPreset(uint8_t engine, uint8_t presetId)
 {
+    if(engine >= SYNTH_ENGINE_COUNT) return;
+    SynthPresetUpdate update(engine);
     const bool pcm909Preset = (engine == SYNTH_ENGINE_909 && presetId == 5);
     const bool pcm505Preset = (engine == SYNTH_ENGINE_505 && presetId == 5);
     uint8_t preset = (presetId < 5) ? presetId : 0;
@@ -4607,6 +4625,8 @@ static void AudioCmdDrainAndApply()
     {
         __DMB(); /* pairs with the producer's __DMB() before it publishes head */
         const AudioCmd cmd = audioCmdRing[audioCmdTail];
+        // Keep queued notes until the preset is completely published.
+        if(synthPresetBusyMask != 0) break;
         audioCmdTail = (audioCmdTail + 1u) & (AUDIO_CMD_RING_SIZE - 1u);
         switch(cmd.type)
         {
@@ -5436,14 +5456,9 @@ static void DsqTriggerTrackNow(uint8_t track, DsqStepFull& s, uint8_t velocity, 
 
 static void DsqApplyStepLocks(uint8_t track, const DsqStepFull& step)
 {
+    // Coefficients are smoothed once per block. Rebuilding them here both
+    // snaps resonant filters and puts sin/cos work on simultaneous ratchets.
     stepLocks[track] = step;
-    if(trkFilterType[track] && trkFxRouted[track]) {
-        const float cut = EffectiveCutoff(track);
-        trkFilterCutSm[track] = cut;
-        trkFilter[track].SetType(trkFilterType[track], cut, trkFilterQ[track], float(SAMPLE_RATE));
-        if(trkFilterType[track] == FTYPE_RESONANT)
-            trkFilter2[track].SetType(FTYPE_RESONANT, cut, trkFilterQ[track], float(SAMPLE_RATE));
-    }
 }
 
 static void DsqProcessPendingTriggers()
@@ -5451,6 +5466,9 @@ static void DsqProcessPendingTriggers()
     for(uint8_t phase = 0; phase < 2; ++phase) for(uint8_t track = 0; track < DSQ_TRACKS; ++track) {
         PendingTrigger& pending = pendingTriggers[phase][track];
         if(!pending.active) continue;
+        const int8_t engine = dsqTrackEngine[track];
+        if(engine >= 0 && engine < SYNTH_ENGINE_COUNT
+           && (synthPresetBusyMask & (1u << engine))) continue;
         if(pending.countdown > 0) { --pending.countdown; continue; }
         DsqApplyStepLocks(track, pending.snapshot);
         if(pending.velocity > 0)
@@ -5538,6 +5556,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
      * never starved while one of those states is active. */
     if(patternCommitState == 1) {
         __DMB();
+        if(patternTransfer.slot == dseq.currentPattern)
+            DsqReleaseAllHeldNotes();
         auto* old = dsqSteps[patternTransfer.slot];
         dsqSteps[patternTransfer.slot] = dsqStaging;
         dsqStaging = old;
@@ -5545,6 +5565,17 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         dseq.patternLength = 16;
         __DMB();
         patternCommitState = 2;
+    }
+    if(requestedPattern >= 0) {
+        const uint8_t pattern = uint8_t(requestedPattern);
+        requestedPattern = -1;
+        DsqReleaseAllHeldNotes();
+        dseq.currentPattern = pattern;
+        dseq.queuedPattern = -1;
+        dseq.performanceReturnPattern = -1;
+        dseq.queuedPatternBars = 0;
+        dseq.performanceBarsRemaining = 0;
+        dseq.performancePatternActive = false;
     }
     AudioCmdDrainAndApply();
 
@@ -5595,6 +5626,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         audioFxShed = false;
     const bool fxShed = audioFxShed;
 
+    const uint16_t renderSynthMask = synthActiveMask & ~synthPresetBusyMask;
     /* ═ Pre-calcular: primer track que usa cada motor de síntesis ═ */
     int8_t engTrk[SYNTH_ENGINE_COUNT];
     for(int _ei = 0; _ei < SYNTH_ENGINE_COUNT; _ei++) engTrk[_ei] = -1;
@@ -5639,6 +5671,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 /* Advance the song before firing step zero of the next cycle.
                  * Previously the old pattern fired step 0 and only then changed
                  * pattern, producing a one-step hybrid at every transition. */
+                const uint8_t previousPattern = dseq.currentPattern;
                 const bool patternWrapped = previousStep >= 0 && dseq.currentStep == 0;
                 if(patternWrapped){
                     if(dseq.performancePatternActive && dseq.performanceReturnPattern >= 0){
@@ -5681,6 +5714,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                         }
                     }
                 }
+                if(dseq.currentPattern != previousPattern)
+                    DsqReleaseAllHeldNotes();
                 // Natural song end stops on the bar boundary. Do not fire
                 // step zero of the final scene once songPlaying has cleared.
                 if(dseq.playing) DsqFireStep();
@@ -6027,12 +6062,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         /* ── SYNTH ENGINES — process + cadena FX per-track ── */
         /* Lambda: aplica filtro/dist/EQ/echo/flanger/comp/vol/pan del track t  */
         /* al sample s y lo suma a busL/busR. Si t<0 -> bus directo sin FX.     */
-        float synthTrackInput[MAX_PADS] = {};
-        auto synthTobus = [&](float s, int8_t t) {
-            if(t < 0 || t >= MAX_PADS) { busL += s; busR += s; }
-            else synthTrackInput[t] += s;
-        };
-        auto renderSynthTrack = [&](float s, int8_t t){
+        auto synthTobus = [&](float s, int8_t t){
             if(t < 0 || t >= MAX_PADS){ busL += s; busR += s; return; }
             if(trkFxRouted[t]){
             /* filtro */
@@ -6094,7 +6124,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             if(trkLfoActive[t] && trkLfoTarget[t] == LFO_TGT_PAN)
                 panTrk = clampF(panTrk + 0.9f * lfoVal[t], -1.0f, 1.0f);
             /* vol + pan -> bus */
-            float outS = s * EffectiveTrackGain(t) * lfoGain;
+            float outS = s * trackGain[t] * lfoGain;
             float pL = (1.f - panTrk) * 0.5f;
             float pR = (1.f + panTrk) * 0.5f;
             busL += outS * pL;
@@ -6102,8 +6132,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             /* sends (stereo) — only if master FX engaged */
             float sndL = outS * pL, sndR = outS * pR;
             if(revEng){
-                reverbBusL += sndL * EffectiveReverbSend(t);
-                reverbBusR += sndR * EffectiveReverbSend(t);
+                reverbBusL += sndL * trackReverbSend[t];
+                reverbBusR += sndR * trackReverbSend[t];
             }
             if(delEng){
                 delayBusL  += sndL * trackDelaySend[t];
@@ -6118,89 +6148,83 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             if(pk > trackPeak[t]) trackPeak[t] = pk;
         };
 
-        auto drumToBus = [&](auto& kit, uint8_t engine, const uint8_t* mapping) {
-            float outputs[16];
-            kit.Process(outputs);
-            for(uint8_t track = 0; track < 16; ++track) {
-                const uint8_t inst = mapping[track];
-                const float gain = drumSeqSource[engine][inst] ? seqVolume : liveVolume;
-                synthTobus(sanitizeF(outputs[inst]) * kDrumBusHeadroom * gain, track);
-            }
-        };
-        if(synthActiveMask & (1 << SYNTH_ENGINE_808)) {
+        if (renderSynthMask & (1 << SYNTH_ENGINE_808)){
             DSP_PROF_SCOPE(SYNTH_808);
-            drumToBus(synth808, SYNTH_ENGINE_808, padTo808);
+            float s = sanitizeF(synth808.Process()) * kDrumBusHeadroom;
             DSP_PROF_END(SYNTH_808);
+            DSP_PROF_SCOPE(SYNTH_ROUTING);
+            synthTobus(s, engTrk[SYNTH_ENGINE_808]);
+            DSP_PROF_END(SYNTH_ROUTING);
         }
-        if(synthActiveMask & (1 << SYNTH_ENGINE_909)) {
+        if (renderSynthMask & (1 << SYNTH_ENGINE_909)){
             DSP_PROF_SCOPE(SYNTH_909);
-            drumToBus(synth909, SYNTH_ENGINE_909, padTo909);
+            float s = sanitizeF(synth909.Process()) * kDrumBusHeadroom;
             DSP_PROF_END(SYNTH_909);
+            DSP_PROF_SCOPE(SYNTH_ROUTING);
+            synthTobus(s, engTrk[SYNTH_ENGINE_909]);
+            DSP_PROF_END(SYNTH_ROUTING);
         }
-        if(kEnableSynth505 && (synthActiveMask & (1 << SYNTH_ENGINE_505))) {
+        if (kEnableSynth505 && (renderSynthMask & (1 << SYNTH_ENGINE_505))){
             DSP_PROF_SCOPE(SYNTH_505);
-            drumToBus(synth505, SYNTH_ENGINE_505, padTo505);
+            float s = sanitizeF(synth505.Process()) * kDrumBusHeadroom;
             DSP_PROF_END(SYNTH_505);
+            DSP_PROF_SCOPE(SYNTH_ROUTING);
+            synthTobus(s, engTrk[SYNTH_ENGINE_505]);
+            DSP_PROF_END(SYNTH_ROUTING);
         }
-        if ((synthActiveMask & (1 << SYNTH_ENGINE_303)) && acid303.IsActive()){
+        if ((renderSynthMask & (1 << SYNTH_ENGINE_303)) && acid303.IsActive()){
             /* v2.5: −4dB headroom en synths melódicos para no saturar el bus */
             DSP_PROF_SCOPE(SYNTH_303);
             float s = sanitizeF(acid303.Process()) * 0.63f;
             DSP_PROF_END(SYNTH_303);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_303] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_303] >= 0 ? melodicOwner[SYNTH_ENGINE_303] : engTrk[SYNTH_ENGINE_303]);
+            synthTobus(s, engTrk[SYNTH_ENGINE_303]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
-        if ((synthActiveMask & (1 << SYNTH_ENGINE_WTOSC)) && wtOsc.IsActive()){
+        if ((renderSynthMask & (1 << SYNTH_ENGINE_WTOSC)) && wtOsc.IsActive()){
             DSP_PROF_SCOPE(SYNTH_WT);
             float s = sanitizeF(wtOsc.Process()) * 0.63f;
             DSP_PROF_END(SYNTH_WT);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_WTOSC] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_WTOSC] >= 0 ? melodicOwner[SYNTH_ENGINE_WTOSC] : engTrk[SYNTH_ENGINE_WTOSC]);
+            synthTobus(s, engTrk[SYNTH_ENGINE_WTOSC]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
-        if ((synthActiveMask & (1 << SYNTH_ENGINE_SH101)) && synthSH101.IsActive()){  /* I1 */
+        if ((renderSynthMask & (1 << SYNTH_ENGINE_SH101)) && synthSH101.IsActive()){  /* I1 */
             DSP_PROF_SCOPE(SYNTH_SH101);
             float s = sanitizeF(synthSH101.Process()) * 0.63f;
             DSP_PROF_END(SYNTH_SH101);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_SH101] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_SH101] >= 0 ? melodicOwner[SYNTH_ENGINE_SH101] : engTrk[SYNTH_ENGINE_SH101]);
+            synthTobus(s, engTrk[SYNTH_ENGINE_SH101]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
-        if ((synthActiveMask & (1 << SYNTH_ENGINE_FM2OP)) && synthFM2Op.IsActive()){  /* I2 */
+        if ((renderSynthMask & (1 << SYNTH_ENGINE_FM2OP)) && synthFM2Op.IsActive()){  /* I2 */
             DSP_PROF_SCOPE(SYNTH_FM2OP);
             float s = sanitizeF(synthFM2Op.Process()) * 0.63f;
             DSP_PROF_END(SYNTH_FM2OP);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_FM2OP] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_FM2OP] >= 0 ? melodicOwner[SYNTH_ENGINE_FM2OP] : engTrk[SYNTH_ENGINE_FM2OP]);
+            synthTobus(s, engTrk[SYNTH_ENGINE_FM2OP]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
-        if (synthActiveMask & (1 << SYNTH_ENGINE_PHYS)){
+        if (renderSynthMask & (1 << SYNTH_ENGINE_PHYS)){
             DSP_PROF_SCOPE(SYNTH_PHYS);
             float s = 0;
             if(physModalActive)  s += sanitizeF(physModal.Process())  * physModalGain;
             if(physStringActive) s += sanitizeF(physString.Process()) * physStringGain;
             DSP_PROF_END(SYNTH_PHYS);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(sanitizeF(s) * (melodicSeqSource[SYNTH_ENGINE_PHYS] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_PHYS] >= 0 ? melodicOwner[SYNTH_ENGINE_PHYS] : engTrk[SYNTH_ENGINE_PHYS]);
+            synthTobus(sanitizeF(s), engTrk[SYNTH_ENGINE_PHYS]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
-        if (synthActiveMask & (1 << SYNTH_ENGINE_NOISE)){
+        if (renderSynthMask & (1 << SYNTH_ENGINE_NOISE)){
             if(noisePartActive){
                 DSP_PROF_SCOPE(SYNTH_NOISE);
                 float s = sanitizeF(noisePart.Process()) * noisePartGain;
                 DSP_PROF_END(SYNTH_NOISE);
                 DSP_PROF_SCOPE(SYNTH_ROUTING);
-                synthTobus(sanitizeF(s) * (melodicSeqSource[SYNTH_ENGINE_NOISE] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_NOISE] >= 0 ? melodicOwner[SYNTH_ENGINE_NOISE] : engTrk[SYNTH_ENGINE_NOISE]);
+                synthTobus(sanitizeF(s), engTrk[SYNTH_ENGINE_NOISE]);
                 DSP_PROF_END(SYNTH_ROUTING);
             }
         }
-
-        // One FX pass per track, even if several kits contributed. Advancing
-        // the same filter/delay three times per sample changes its frequency.
-        for(uint8_t t = 0; t < DSQ_TRACKS; ++t)
-            if(dsqTrackEngine[t] >= 0 || synthTrackInput[t] != 0.f)
-                renderSynthTrack(synthTrackInput[t], t);
 
         /* ── Startup section cue (formante retro-robótico) ── */
         if(startupAnnounceActive)
@@ -9190,15 +9214,20 @@ static void ProcessCommand()
     /* ════════════════════════════════════════════════════════
      *  DAISY SEQUENCER (0xD0-0xD8)
      * ════════════════════════════════════════════════════════ */
-    case CMD_PATTERN_BEGIN:
-        if(len == 3 && p[0] < DSQ_PATTERNS && patternCommitState == 0) {
+    case CMD_PATTERN_BEGIN: {
+        const bool accepted = len == 3 && p[0] < DSQ_PATTERNS && patternCommitState == 0;
+        if(accepted) {
             patternTransfer.begin(p[0], uint16_t(p[1]) | (uint16_t(p[2]) << 8));
             memset(dsqStaging, 0, sizeof(DsqPattern));
         }
-        break;
-    case CMD_PATTERN_TRACK:
-        if(len == 4 + 16 * sizeof(PatternWireStep) && patternCommitState == 0
-           && patternTransfer.track(p[0], uint16_t(p[1]) | (uint16_t(p[2]) << 8), p[3], p + 4, len - 4)) {
+        const uint8_t ack[4] = {uint8_t(len ? p[0] : 0xFF), uint8_t(len > 1 ? p[1] : 0), uint8_t(len > 2 ? p[2] : 0), uint8_t(accepted)};
+        BuildResponse(CMD_PATTERN_BEGIN, hdr->sequence, ack, sizeof(ack));
+        return;
+    }
+    case CMD_PATTERN_TRACK: {
+        const bool accepted = len == 4 + 16 * sizeof(PatternWireStep) && patternCommitState == 0
+            && patternTransfer.track(p[0], uint16_t(p[1]) | (uint16_t(p[2]) << 8), p[3], p + 4, len - 4);
+        if(accepted) {
             const auto* in = reinterpret_cast<const PatternWireStep*>(p + 4);
             for(uint8_t i = 0; i < 16; ++i) {
                 auto& dst = dsqStaging[p[3]][i];
@@ -9217,7 +9246,10 @@ static void ProcessCommand()
                 dst.volume = in[i].volume;
             }
         }
-        break;
+        const uint8_t ack[4] = {uint8_t(len ? p[0] : 0xFF), uint8_t(len > 1 ? p[1] : 0), uint8_t(len > 2 ? p[2] : 0), uint8_t(accepted)};
+        BuildResponse(CMD_PATTERN_TRACK, hdr->sequence, ack, sizeof(ack));
+        return;
+    }
     case CMD_PATTERN_COMMIT: {
         uint32_t hash = 0;
         if(len == 7) memcpy(&hash, p + 3, 4);
@@ -9308,14 +9340,7 @@ static void ProcessCommand()
         break;
 
     case CMD_DSQ_SELECT_PATTERN:
-        if(len >= 1){
-            dseq.currentPattern = p[0] % DSQ_PATTERNS;
-            dseq.queuedPattern = -1;
-            dseq.performanceReturnPattern = -1;
-            dseq.queuedPatternBars = 0;
-            dseq.performanceBarsRemaining = 0;
-            dseq.performancePatternActive = false;
-        }
+        if(len >= 1) requestedPattern = int8_t(p[0] % DSQ_PATTERNS);
         break;
 
     case CMD_DSQ_QUEUE_PATTERN:
@@ -10635,6 +10660,8 @@ static void ProcessDaisyUsb()
         if(hw.usb_handle.TransmitInternal(txBuf, pendingTxLen)
            == UsbHandle::Result::OK)
         {
+            // USB retains the submitted buffer until the IN transfer completes.
+            txBuf = txBuf == usbTxBuffers[0] ? usbTxBuffers[1] : usbTxBuffers[0];
             pendingResponse = false;
             pendingTxLen = 0;
         }

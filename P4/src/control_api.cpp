@@ -277,6 +277,25 @@ bool SendWithRetry(uint8_t command, const void* payload, uint16_t length)
     return false;
 }
 
+bool SendPatternWithAck(uint8_t command, const void* payload, uint16_t length)
+{
+    bool sent = false;
+    for(int attempt = 0; attempt < 200 && control_available(); ++attempt) {
+        if(daisyUsb.sendPatternPacket(command, payload, length)) { sent = true; break; }
+        daisyUsb.process();
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if(!sent) return false;
+    const uint32_t started = millis();
+    while(millis() - started < 2000u && control_available()) {
+        daisyUsb.process();
+        ui_process_pad_queue();
+        if(daisyUsb.patternAckReceived()) return daisyUsb.patternAckAccepted();
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return false;
+}
+
 bool UploadPattern(uint8_t destination, int logicalPattern)
 {
     patternSyncState.store(1);
@@ -288,7 +307,7 @@ bool UploadPattern(uint8_t destination, int logicalPattern)
     if(++token == 0) ++token; // zero is the "no acknowledgement" sentinel
     const uint16_t id = token;
     const uint8_t begin[3] = {destination, uint8_t(id), uint8_t(id >> 8)};
-    if(!SendWithRetry(CMD_PATTERN_BEGIN, begin, sizeof(begin))) return false;
+    if(!SendPatternWithAck(CMD_PATTERN_BEGIN, begin, sizeof(begin))) return false;
     uint32_t hash = 2166136261u;
     StepUploadData snapshot[16] = {};
     for(uint8_t track = 0; track < 16; ++track) {
@@ -311,28 +330,12 @@ bool UploadPattern(uint8_t destination, int logicalPattern)
             out[step].volume = in.volume;
         }
         hash = PatternHash(packet + 4, sizeof(packet) - 4, hash);
-        if(!SendWithRetry(CMD_PATTERN_TRACK, packet, sizeof(packet))) return false;
-        daisyUsb.process();
-        ui_process_pad_queue();
-        ui_process_control_queue();
-        taskYIELD();
+        if(!SendPatternWithAck(CMD_PATTERN_TRACK, packet, sizeof(packet))) return false;
     }
     uint8_t commit[7] = {destination, uint8_t(id), uint8_t(id >> 8)};
     memcpy(commit + 3, &hash, 4);
-    daisyUsb.clearPatternAck();
-    if(!SendWithRetry(CMD_PATTERN_COMMIT, commit, sizeof(commit))) return false;
-    const uint32_t started = millis();
-    while(millis() - started < 2000u && control_available()) {
-        daisyUsb.process();
-        ui_process_pad_queue();
-        ui_process_control_queue();
-        if(daisyUsb.patternAckToken() == id) {
-            completion.ok = daisyUsb.patternAckAccepted();
-            return completion.ok;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    return false;
+    completion.ok = SendPatternWithAck(CMD_PATTERN_COMMIT, commit, sizeof(commit));
+    return completion.ok;
 }
 
 bool UploadPreparedMidiSong()
@@ -387,8 +390,19 @@ void ApplyPatternPerformance(int logicalPattern)
     BuiltinPatternSoundProfile sound{};
     if(getBuiltinPatternSoundProfile(logicalPattern, sound))
     {
+        uint16_t usedEngines = 0;
+        for(uint8_t track = 0; track < 16; ++track) {
+            const int8_t engine = sound.engines[track];
+            if(engine >= 0 && engine < BUILTIN_ENGINE_COUNT)
+                usedEngines |= uint16_t(1u << engine);
+            else if(engine == -1)
+                // Daisy falls back to 909/505 when a sampler pad is empty.
+                // Include both potential sources without relying on stale telemetry.
+                usedEngines |= uint16_t(1u << (track <= 8 ? 1 : 2));
+        }
         for(uint8_t engine = 0; engine < BUILTIN_ENGINE_COUNT; ++engine)
-            daisyUsb.synthPreset(engine, sound.presets[engine]);
+            if(usedEngines & (1u << engine))
+                daisyUsb.synthPreset(engine, sound.presets[engine]);
         for(uint8_t track = 0; track < 16; ++track)
         {
             daisyUsb.setTrackEngine(track, sound.engines[track]);
@@ -451,9 +465,16 @@ void SendCurrentState()
         else daisyUsb.stop();
         return;
     }
-    activeDaisyPattern = DefaultDaisyPattern(p4.current_pattern);
-    if(!UploadPattern(activeDaisyPattern, p4.current_pattern)) { pendingSelectUpload.store(p4.current_pattern); return; }
-    ApplyPatternPerformance(p4.current_pattern);
+    const int logicalPattern = p4.current_pattern;
+    const uint8_t destination = DefaultDaisyPattern(logicalPattern);
+    if(!UploadPattern(destination, logicalPattern)) {
+        int empty = -1;
+        pendingSelectUpload.compare_exchange_strong(empty, logicalPattern);
+        return;
+    }
+    if(pendingSelectUpload.load() >= 0 || p4.current_pattern != logicalPattern) return;
+    activeDaisyPattern = destination;
+    ApplyPatternPerformance(logicalPattern);
     expectedDaisyPattern = activeDaisyPattern;
     expectedDaisyPatternSinceMs = millis();
     daisyUsb.selectPattern(activeDaisyPattern);
@@ -490,12 +511,14 @@ void ProcessPendingPatternWork()
     const int sel = pendingSelectUpload.exchange(-1, std::memory_order_acq_rel);
     if(sel >= 0)
     {
+        pendingUploadLogicalPattern = -1;
         const uint8_t destination = DefaultDaisyPattern(sel);
         if(!UploadPattern(destination, sel)) {
             int empty = -1;
             pendingSelectUpload.compare_exchange_strong(empty, sel);
             return;
         }
+        if(pendingSelectUpload.load() >= 0 || p4.current_pattern != sel) return;
         activeDaisyPattern = destination;
         ApplyPatternPerformance(sel);
         expectedDaisyPattern = activeDaisyPattern;
@@ -506,16 +529,27 @@ void ProcessPendingPatternWork()
     const int queued = pendingQueueUpload.exchange(-1, std::memory_order_acq_rel);
     if(queued >= 0)
     {
-        queuedLogicalPattern = queued;
-        queuedDaisyPattern = static_cast<uint8_t>((activeDaisyPattern + 1u) % 20u);
-        if(!UploadPattern(queuedDaisyPattern, queuedLogicalPattern)) {
+        const uint8_t destination = static_cast<uint8_t>((activeDaisyPattern + 1u) % 20u);
+        if(!UploadPattern(destination, queued)) {
+            if(!pendingQueueCancel.load() && pendingSelectUpload.load() < 0) {
+                int empty = -1;
+                pendingQueueUpload.compare_exchange_strong(empty, queued);
+            }
+            return;
+        }
+        if(pendingQueueCancel.load() || pendingSelectUpload.load() >= 0
+           || pendingQueueUpload.load() >= 0) return;
+        const uint8_t queue[2] = {destination, 0};
+        if(!SendWithRetry(CMD_DSQ_QUEUE_PATTERN, queue, sizeof(queue))) {
             int empty = -1;
             pendingQueueUpload.compare_exchange_strong(empty, queued);
             return;
         }
-        daisyUsb.queuePattern(queuedDaisyPattern);
+        queuedLogicalPattern = queued;
+        queuedDaisyPattern = destination;
     }
 
+    if(pendingSelectUpload.load() >= 0 || pendingQueueCancel.load()) return;
     if(pendingCurrentPatternSync.exchange(false, std::memory_order_acq_rel)) {
         const bool ok = midiSongPrepared ? UploadPreparedMidiSong()
             : UploadPattern(activeDaisyPattern, Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1));
@@ -678,7 +712,8 @@ void control_process()
             ui_request_sequencer_resync();
         }
     }
-    else if(transport.engine_responding && queuedLogicalPattern >= 0
+     else if(transport.engine_responding && !pendingQueueCancel.load()
+         && pendingSelectUpload.load() < 0 && queuedLogicalPattern >= 0
        && transport.pattern == queuedDaisyPattern)
     {
         activeDaisyPattern = queuedDaisyPattern;
@@ -692,6 +727,7 @@ void control_process()
         expectedDaisyPattern = 0xFF;
     }
     else if(!midiSongPrepared && transport.engine_responding && engineWasConnected
+            && pendingSelectUpload.load() < 0 && !pendingQueueCancel.load()
             && queuedLogicalPattern < 0
             && expectedDaisyPattern == 0xFF
             && transport.pattern != activeDaisyPattern)
@@ -715,6 +751,7 @@ void control_process()
         pendingUploadDaisySlot = activeDaisyPattern;
         pendingUploadSinceMs = millis();
     }
+    if(pendingSelectUpload.load() >= 0) pendingUploadLogicalPattern = -1;
     if(pendingUploadLogicalPattern >= 0
        && millis() - pendingUploadSinceMs >= kPatternUploadDebounceMs)
     {

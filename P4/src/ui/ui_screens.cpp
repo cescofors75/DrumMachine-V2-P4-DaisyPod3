@@ -20414,14 +20414,18 @@ void ui_update_current_screen(void) {
                         "> LNK  USB ENUMERATED / PING ......... SYNC");
                 } else {
                     snprintf(line, sizeof(line),
-                        "> LNK  PROTOCOL %u.%u (NEED 2.3) ..... ERROR",
+                        "> LNK  PROTOCOL %u.%u (NEED %u.%u) ... ERROR",
                         static_cast<unsigned>(transport.protocol_version >> 8),
-                        static_cast<unsigned>(transport.protocol_version & 0xFFu));
+                        static_cast<unsigned>(transport.protocol_version & 0xFFu),
+                        static_cast<unsigned>(RED808_PROTOCOL_VERSION >> 8),
+                        static_cast<unsigned>(RED808_PROTOCOL_VERSION & 0xFFu));
                     setBootLine(7, RED808_ERROR, line);
                 }
             } else {
                 snprintf(line, sizeof(line),
-                    "> LNK  DAISY P2.3 / WAV %u/16 ......... %s",
+                    "> LNK  DAISY P%u.%u / WAV %u/16 ....... %s",
+                    static_cast<unsigned>(transport.protocol_version >> 8),
+                    static_cast<unsigned>(transport.protocol_version & 0xFFu),
                     static_cast<unsigned>(loadedSamples),
                     loadedSamples > 0 ? "OK" : "WAIT");
                 setBootLine(7, loadedSamples > 0

@@ -92,6 +92,54 @@ int main() {
         assert(!transfer.ready(5, 99, hash));
     }
     std::puts("Transfer: complete upload, each missing track, stale token, bad checksum PASS");
+    PatternAckTracker ack;
+    uint8_t reply[4] = {4, 99, 0, 1};
+    ack.expect(CMD_PATTERN_TRACK, 42, 4, 99);
+    ack.observe(CMD_PATTERN_BEGIN, 42, reply, sizeof(reply));
+    assert(!ack.received);
+    ack.observe(CMD_PATTERN_TRACK, 41, reply, sizeof(reply));
+    assert(!ack.received);
+    ack.observe(CMD_PATTERN_TRACK, 42, reply, 3);
+    assert(!ack.received);
+    reply[0] = 5;
+    ack.observe(CMD_PATTERN_TRACK, 42, reply, sizeof(reply));
+    assert(!ack.received);
+    reply[0] = 4; reply[1] = 98;
+    ack.observe(CMD_PATTERN_TRACK, 42, reply, sizeof(reply));
+    assert(!ack.received);
+    reply[1] = 99;
+    ack.observe(CMD_PATTERN_TRACK, 42, reply, sizeof(reply));
+    assert(ack.received && ack.accepted);
+    ack.expect(CMD_PATTERN_TRACK, 43, 4, 99);
+    assert(!ack.received && !ack.accepted);
+    ack.observe(CMD_PATTERN_TRACK, 42, reply, sizeof(reply));
+    assert(!ack.received); // Previous track shares the token but not the sequence.
+    reply[3] = 0;
+    ack.observe(CMD_PATTERN_TRACK, 43, reply, sizeof(reply));
+    assert(ack.received && !ack.accepted);
+    for(uint16_t sequence : {uint16_t(65535), uint16_t(0)}) {
+        ack.expect(CMD_PATTERN_COMMIT, sequence, 4, 99);
+        reply[3] = 1;
+        ack.observe(CMD_PATTERN_COMMIT, sequence, reply, sizeof(reply));
+        assert(ack.received && ack.accepted);
+    }
+    constexpr size_t rxCapacity = 4095;
+    constexpr size_t trackPacketBytes = 8 + 4 + 16 * sizeof(PatternWireStep);
+    assert(11 + 16 * trackPacketBytes + 15 > rxCapacity);
+    PatternTransferCheck paced;
+    paced.begin(4, 99);
+    uint32_t pacedHash = 2166136261u;
+    for(uint8_t track = 0; track < 16; ++track) {
+        assert(trackPacketBytes <= rxCapacity);
+        wire[0].velocity = track;
+        pacedHash = PatternHash(wire, sizeof(wire), pacedHash);
+        ack.expect(CMD_PATTERN_TRACK, track, 4, 99);
+        reply[3] = paced.track(4, 99, track, wire, sizeof(wire));
+        ack.observe(CMD_PATTERN_TRACK, track, reply, sizeof(reply));
+        assert(ack.received && ack.accepted);
+    }
+    assert(paced.ready(4, 99, pacedHash));
+    std::puts("Transfer: paced upload, ACK correlation, NACK, sequence wrap PASS");
     std::printf("Timing: %u combinations PASS; division packing and checksum PASS\n", cases);
     checkKit<TR808::Kit>("808");
     checkKit<TR909::Kit>("909");

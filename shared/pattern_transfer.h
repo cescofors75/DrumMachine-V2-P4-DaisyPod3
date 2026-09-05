@@ -6,6 +6,21 @@
 #define CMD_PATTERN_BEGIN  0xF5
 #define CMD_PATTERN_TRACK  0xF6
 #define CMD_PATTERN_COMMIT 0xF7
+struct PatternAckTracker {
+    uint8_t command = 0, slot = 0xFF;
+    uint16_t sequence = 0, token = 0;
+    bool received = false, accepted = false;
+    void expect(uint8_t cmd, uint16_t seq, uint8_t destination, uint16_t id) {
+        command = cmd; sequence = seq; slot = destination; token = id;
+        received = accepted = false;
+    }
+    void observe(uint8_t cmd, uint16_t seq, const uint8_t* payload, size_t size) {
+        if(size != 4 || cmd != command || seq != sequence || payload[0] != slot
+           || (uint16_t(payload[1]) | (uint16_t(payload[2]) << 8)) != token) return;
+        received = true;
+        accepted = payload[3] == 1;
+    }
+};
 struct __attribute__((packed)) PatternWireStep {
     uint8_t active, velocity, division, probability, flags;
     uint8_t notes[4];

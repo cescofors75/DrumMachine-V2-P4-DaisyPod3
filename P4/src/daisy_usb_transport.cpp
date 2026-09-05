@@ -102,6 +102,18 @@ bool DaisyUsbTransport::sendQuery(uint8_t command, const void* payload,
     return true;
 }
 
+bool DaisyUsbTransport::sendPatternPacket(uint8_t command, const void* payload,
+                                          uint16_t length)
+{
+    if(payload == nullptr || length < 3) return false;
+    uint16_t sequence = 0;
+    if(!sendPacket(command, payload, length, &sequence)) return false;
+    const auto* bytes = static_cast<const uint8_t*>(payload);
+    pattern_ack_.expect(command, sequence, bytes[0],
+        uint16_t(bytes[1]) | (uint16_t(bytes[2]) << 8));
+    return true;
+}
+
 bool DaisyUsbTransport::sendU8(uint8_t command, uint8_t value)
 {
     return send(command, &value, sizeof(value));
@@ -416,9 +428,9 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
         }
     }
 
-    if(header->cmd == CMD_PATTERN_COMMIT && header->length == 4) {
-        pattern_ack_token_ = uint16_t(payload[1]) | (uint16_t(payload[2]) << 8);
-        pattern_ack_accepted_ = payload[3] != 0;
+    if(header->cmd == CMD_PATTERN_BEGIN || header->cmd == CMD_PATTERN_TRACK
+       || header->cmd == CMD_PATTERN_COMMIT) {
+        pattern_ack_.observe(header->cmd, header->sequence, payload, header->length);
     }
     else if(header->cmd == CMD_PING && header->length >= 8)
     {
