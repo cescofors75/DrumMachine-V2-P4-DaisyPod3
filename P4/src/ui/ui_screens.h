@@ -4,6 +4,7 @@
 #pragma once
 
 #include <lvgl.h>
+void ui_note_control_activity();
 
 // Screen objects
 extern lv_obj_t* scr_boot;

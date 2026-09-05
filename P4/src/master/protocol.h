@@ -483,7 +483,7 @@ typedef struct __attribute__((packed)) {
 
 // Extended PONG is additive: legacy receivers may keep reading only the first
 // 8 bytes (echo + uptime), while V2 peers also negotiate diagnostics here.
-#define RED808_PROTOCOL_VERSION       0x0203u
+#define RED808_PROTOCOL_VERSION       0x0204u
 #define RED808_CAP_EXTENDED_PONG      0x0001u
 #define RED808_CAP_USB_RX_DIAGNOSTICS 0x0002u
 #define RED808_CAP_MIDI_MONITOR       0x0004u

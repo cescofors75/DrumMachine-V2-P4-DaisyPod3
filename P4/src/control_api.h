@@ -315,3 +315,5 @@ void local_push_pattern(int pattern, const bool steps[16][16]);
 bool local_restore_pattern(uint8_t slot);
 void local_stage_pattern(uint8_t slot, const bool steps[16][16]);
 void local_lock_tempo(uint32_t duration_ms);
+// 0 idle, 1 pending/uploading, 2 confirmed by Daisy, 3 failed (retry pending).
+uint8_t control_pattern_sync_state();

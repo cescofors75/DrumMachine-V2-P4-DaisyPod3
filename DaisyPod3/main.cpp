@@ -22,6 +22,8 @@
 #include "ff_gen_drv.h"
 #include "../shared/red808_protocol_codes.h"
 #include "mpd218_mapping.h"
+#include "../shared/pattern_transfer.h"
+#include "../shared/step_timing.h"
 #include <string.h>
 #include <math.h>
 #include <new>
@@ -433,7 +435,7 @@ static inline void DspProfBlockDone() {}
 #define CMD_PING              0xEE
 #define CMD_RESET             0xEF
 
-#define RED808_PROTOCOL_VERSION       0x0203u
+#define RED808_PROTOCOL_VERSION       0x0204u
 #define RED808_CAP_EXTENDED_PONG      0x0001u
 #define RED808_CAP_USB_RX_DIAGNOSTICS 0x0002u
 #define RED808_CAP_MIDI_MONITOR       0x0004u
@@ -980,7 +982,17 @@ struct DsqStepFull {
 };
 
 /* Resident patterns live in SDRAM; richer steps preserve melodic expression. */
-DSY_SDRAM_BSS static DsqStepFull dsqSteps[DSQ_PATTERNS][DSQ_TRACKS][DSQ_MAX_STEPS];
+using DsqPattern = DsqStepFull[DSQ_TRACKS][DSQ_MAX_STEPS];
+DSY_SDRAM_BSS static DsqPattern dsqStorage[DSQ_PATTERNS + 1];
+static DsqStepFull (*dsqSteps[DSQ_PATTERNS])[DSQ_MAX_STEPS];
+static DsqStepFull (*dsqStaging)[DSQ_MAX_STEPS];
+static PatternTransferCheck patternTransfer;
+static uint16_t patternCommitSequence = 0;
+static volatile uint8_t patternCommitState = 0; // 1: audio swap pending, 2: ack pending
+static bool drumSeqSource[3][16] = {};
+static bool melodicSeqSource[SYNTH_ENGINE_COUNT] = {};
+static int8_t melodicOwner[SYNTH_ENGINE_COUNT] = {-1,-1,-1,-1,-1,-1,-1,-1,-1};
+static DsqStepFull stepLocks[DSQ_TRACKS] = {};
 static uint32_t dsqLoadedPatternMask = 0;
 
 struct DaisySeqState {
@@ -1017,8 +1029,10 @@ struct PendingTrigger {
     uint8_t repeatsRemaining;
     uint32_t countdown;
     uint32_t interval;
+    uint32_t duration;
+    DsqStepFull snapshot;
 };
-static PendingTrigger pendingTriggers[DSQ_TRACKS];
+static PendingTrigger pendingTriggers[2][DSQ_TRACKS];
 
 struct DsqHeldNotes {
     bool active;
@@ -1248,7 +1262,9 @@ static void DsqInit() {
      * tener basura (=true) con volume/cutoffHz/reverbSend=0, haciendo que
      * DsqFireStep ponga trackGain[t]=0 al disparar el primer step y
      * silenciando todos los live pads permanentemente. */
-    memset(dsqSteps, 0, sizeof(dsqSteps));
+    memset(dsqStorage, 0, sizeof(dsqStorage));
+    for(uint8_t p = 0; p < DSQ_PATTERNS; ++p) dsqSteps[p] = dsqStorage[p];
+    dsqStaging = dsqStorage[DSQ_PATTERNS];
     dsqLoadedPatternMask = 0;
     memset(&dseq, 0, sizeof(dseq));
     memset(dsqTrackSwing, 0, sizeof(dsqTrackSwing));   /* E4 */
@@ -2534,15 +2550,31 @@ static void UpdatePadFilterSmoothing()
     }
 }
 
+// Base controls are never overwritten by automation. Effective values live
+// only until the next step (including a rest), and work for every sound engine.
+static inline float VolumeByteToGain(uint8_t volumePct);
+static float EffectiveTrackGain(uint8_t t) {
+    return t < DSQ_TRACKS && stepLocks[t].volEn
+        ? VolumeByteToGain(stepLocks[t].volume) : trackGain[t];
+}
+static float EffectiveReverbSend(uint8_t t) {
+    return t < DSQ_TRACKS && stepLocks[t].reverbEn
+        ? clampF(stepLocks[t].reverbSend / 100.f, 0.f, 1.f) : trackReverbSend[t];
+}
+static float EffectiveCutoff(uint8_t t) {
+    return t < DSQ_TRACKS && stepLocks[t].cutoffEn
+        ? clampF(float(stepLocks[t].cutoffHz), 20.f, 20000.f) : trkFilterCut[t];
+}
+
 static void UpdateTrackFilterSmoothing()
 {
     const float kRate = 0.25f;
     for(uint8_t t = 0; t < MAX_PADS; t++){
         if(!trkFilterType[t]) continue;
         if(trkLfoActive[t] && trkLfoTarget[t] == LFO_TGT_FILTER) continue;
-        if(trkFilterCutSm[t] == trkFilterCut[t] && trkFilterQSm[t] == trkFilterQ[t])
+        if(trkFilterCutSm[t] == EffectiveCutoff(t) && trkFilterQSm[t] == trkFilterQ[t])
             continue;
-        SmoothFilterParam(trkFilterCutSm[t], trkFilterCut[t], kRate, 0.5f);
+        SmoothFilterParam(trkFilterCutSm[t], EffectiveCutoff(t), kRate, 0.5f);
         SmoothFilterParam(trkFilterQSm[t],   trkFilterQ[t],   kRate, 0.002f);
         trkFilter[t].SetType(trkFilterType[t], trkFilterCutSm[t], trkFilterQSm[t],
                               (float)SAMPLE_RATE, trkFilterGain[t]);
@@ -4303,7 +4335,7 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
 
     float gain = (velocity / 127.0f)
                * VolumeByteToGain(trkVol)
-               * trackGain[pad]
+               * (liveSource ? trackGain[pad] : EffectiveTrackGain(pad))
                * clampF(sourceVolume, 0.0f, 1.5f);
     float panF = trackPanF[pad] + (pan / 100.0f);
     panF = clampF(panF, -1.0f, 1.0f);
@@ -4455,6 +4487,7 @@ static void AudioCmdApplyTriggerPad(const AudioCmd& c)
 static void AudioCmdApplySynthTrigger(const AudioCmd& c)
 {
     const float vel = c.velocity / 127.0f;
+    if(c.engine < 3 && c.instrument < 16) drumSeqSource[c.engine][c.instrument] = false;
     switch(c.engine)
     {
         case SYNTH_ENGINE_808: synth808.Trigger(c.instrument, vel); break;
@@ -4493,6 +4526,7 @@ static void AudioCmdApplyNoteOn(const AudioCmd& c)
         ReleaseAllSynthEngines();
         pianoSelectedEngine = c.engine;
     }
+    if(c.engine < SYNTH_ENGINE_COUNT) { melodicSeqSource[c.engine] = false; melodicOwner[c.engine] = -1; }
     const float vel01 = c.velocity / 127.0f;
     switch(c.engine)
     {
@@ -4536,6 +4570,7 @@ static void AudioCmdApplyPhysNoise(const AudioCmd& c)
      * same "reader observes an inconsistent mid-update state" risk as
      * TriggerPad — just spread across a few calls instead of one struct. */
     const float freq = 440.f * powf(2.f, (c.note - 69) / 12.f);
+    if(c.engine < SYNTH_ENGINE_COUNT) { melodicSeqSource[c.engine] = false; melodicOwner[c.engine] = -1; }
     const float vel01 = c.velocity / 127.0f;
     if(c.engine == SYNTH_ENGINE_PHYS)
     {
@@ -4973,6 +5008,11 @@ static void DsqReleaseHeldNotes(uint8_t track)
 {
     if(track >= DSQ_TRACKS || !dsqHeldNotes[track].active) return;
     DsqHeldNotes& held = dsqHeldNotes[track];
+    if(held.engine >= 3 && held.engine < SYNTH_ENGINE_COUNT
+       && melodicOwner[held.engine] >= 0 && melodicOwner[held.engine] != track) {
+        memset(&held, 0, sizeof(held));
+        return;
+    }
     switch(held.engine){
         case SYNTH_ENGINE_303:   acid303.NoteOff(); break;
         case SYNTH_ENGINE_WTOSC:
@@ -5053,7 +5093,9 @@ static void ShowcaseSoftHats(uint8_t pattern, uint8_t base, uint8_t velocity)
 static __attribute__((noinline, optimize("O1"))) void BuildStartupShowcaseProgram()
 {
     if(!kStartupShowcaseDemo) return;
-    memset(dsqSteps, 0, sizeof(dsqSteps));
+    memset(dsqStorage, 0, sizeof(dsqStorage));
+    for(uint8_t p = 0; p < DSQ_PATTERNS; ++p) dsqSteps[p] = dsqStorage[p];
+    dsqStaging = dsqStorage[DSQ_PATTERNS];
     memset(dsqTrackEngine, (uint8_t)0xFF, sizeof(dsqTrackEngine));
 
     /* Samples remain the body of the kit. CY and CB are quiet 909/808 colour;
@@ -5306,9 +5348,10 @@ static void DsqReleaseAllHeldNotes()
 {
     for(uint8_t track = 0; track < DSQ_TRACKS; track++) DsqReleaseHeldNotes(track);
     memset(pendingTriggers, 0, sizeof(pendingTriggers));
+    memset(stepLocks, 0, sizeof(stepLocks));
 }
 
-static void DsqTriggerTrackNow(uint8_t track, DsqStepFull& s, uint8_t velocity)
+static void DsqTriggerTrackNow(uint8_t track, DsqStepFull& s, uint8_t velocity, uint32_t duration)
 {
     if(track >= DSQ_TRACKS || dseq.trackMuted[track]) return;
     int8_t eng = dsqTrackEngine[track];
@@ -5318,22 +5361,16 @@ static void DsqTriggerTrackNow(uint8_t track, DsqStepFull& s, uint8_t velocity)
     const uint8_t div = s.noteLenDiv ? s.noteLenDiv : 1;
     const float vel = velocity / 127.0f;
     if(!isSynth){
-        uint32_t maxS = (div > 1) ? (dseq.samplesPerStep / div) : 0;
-        if(s.cutoffEn && trkFilterType[track] && trkFxRouted[track]){
-            /* Per-step parameter lock: a deliberately instant stab, not a
-             * sweep — snap the smoothing shadow too so
-             * UpdateTrackFilterSmoothing() doesn't blur it into a glide. */
-            float f = clampF((float)s.cutoffHz, 20.f, 20000.f);
-            trkFilter[track].SetType(trkFilterType[track], f, trkFilterQ[track], (float)SAMPLE_RATE);
-            if(trkFilterType[track] == FTYPE_RESONANT)
-                trkFilter2[track].SetType(FTYPE_RESONANT, f, trkFilterQ[track], (float)SAMPLE_RATE);
-            trkFilterCut[track] = f;
-            trkFilterCutSm[track] = f;
-        }
-        if(s.reverbEn) trackReverbSend[track] = clampF(s.reverbSend / 100.0f, 0.f, 1.f);
-        if(s.volEn) trackGain[track] = VolumeByteToGain(s.volume);
+        uint32_t maxS = (div > 1) ? (duration / div) : 0;
         TriggerPad(track, velocity, 100, 0, maxS, seqVolume);
         return;
+    }
+    if(eng < 3) {
+        const uint8_t inst = eng == 0 ? padTo808[track] : eng == 1 ? padTo909[track] : padTo505[track];
+        drumSeqSource[eng][inst] = true;
+    } else {
+        melodicSeqSource[eng] = true;
+        melodicOwner[eng] = track;
     }
 
     if(eng == SYNTH_ENGINE_808){ synth808.Trigger(padTo808[track], vel); return; }
@@ -5392,24 +5429,36 @@ static void DsqTriggerTrackNow(uint8_t track, DsqStepFull& s, uint8_t velocity)
     held.active = true;
     held.engine = eng;
     memcpy(held.notes, notes, sizeof(held.notes));
-    uint32_t gate = dseq.samplesPerStep / div;
-    if(slide) gate = dseq.samplesPerStep + 2;
+    uint32_t gate = duration / div;
+    if(slide) gate = duration + 2;
     held.samplesRemaining = gate > 8 ? gate : 8;
+}
+
+static void DsqApplyStepLocks(uint8_t track, const DsqStepFull& step)
+{
+    stepLocks[track] = step;
+    if(trkFilterType[track] && trkFxRouted[track]) {
+        const float cut = EffectiveCutoff(track);
+        trkFilterCutSm[track] = cut;
+        trkFilter[track].SetType(trkFilterType[track], cut, trkFilterQ[track], float(SAMPLE_RATE));
+        if(trkFilterType[track] == FTYPE_RESONANT)
+            trkFilter2[track].SetType(FTYPE_RESONANT, cut, trkFilterQ[track], float(SAMPLE_RATE));
+    }
 }
 
 static void DsqProcessPendingTriggers()
 {
-    for(uint8_t track = 0; track < DSQ_TRACKS; track++){
-        PendingTrigger& pending = pendingTriggers[track];
+    for(uint8_t phase = 0; phase < 2; ++phase) for(uint8_t track = 0; track < DSQ_TRACKS; ++track) {
+        PendingTrigger& pending = pendingTriggers[phase][track];
         if(!pending.active) continue;
-        if(pending.countdown > 0){ pending.countdown--; continue; }
-        DsqStepFull& s = dsqSteps[pending.pattern][track][pending.step];
-        DsqTriggerTrackNow(track, s, pending.velocity);
-        if(pending.repeatsRemaining > 0) pending.repeatsRemaining--;
-        if(pending.repeatsRemaining == 0){ pending.active = false; continue; }
-        pending.velocity = (uint8_t)((pending.velocity * 88u) / 100u);
+        if(pending.countdown > 0) { --pending.countdown; continue; }
+        DsqApplyStepLocks(track, pending.snapshot);
+        if(pending.velocity > 0)
+            DsqTriggerTrackNow(track, pending.snapshot, pending.velocity, pending.duration);
+        if(--pending.repeatsRemaining == 0) { pending.active = false; continue; }
+        pending.velocity = uint8_t((pending.velocity * 88u) / 100u);
         if(pending.velocity == 0) pending.velocity = 1;
-        pending.countdown = pending.interval;
+        pending.countdown = pending.interval - 1;
     }
 }
 
@@ -5427,51 +5476,42 @@ static void DsqProcessHeldNotes()
  * ratchets and timing humanization then remain sample-accurate. */
 static void DsqFireStep()
 {
+    // Schedule a whole pair from its common boundary. Each track can move
+    // its offbeat independently without changing the song clock or losing
+    // ratchets at the transport's (possibly earlier) odd-step boundary.
+    if(dseq.currentStep & 1) return;
     const uint8_t pat = dseq.currentPattern;
-    const uint8_t slen = dseq.patternLength;
-    const uint8_t step = (uint8_t)((dseq.currentStep % (int)slen + (int)slen) % (int)slen);
-    for(uint8_t track = 0; track < DSQ_TRACKS; track++){
-        pendingTriggers[track].active = false;
-        if(dseq.trackMuted[track]) continue;
-        DsqStepFull& s = dsqSteps[pat][track][step];
-        if(!s.active || s.velocity == 0 || s.probability == 0) continue;
-        if(s.probability < 100 && (uint8_t)(FastRand() % 100) >= s.probability) continue;
-
-        int velocity = s.velocity;
-        if(dseq.humanizeVelAmt > 0){
-            int range = (velocity * dseq.humanizeVelAmt) / 100;
-            int span = range * 2 + 1;
-            velocity += span > 1 ? (int)(FastRand() % (uint32_t)span) - range : 0;
-            if(velocity < 1) velocity = 1;
-            if(velocity > 127) velocity = 127;
-        }
-
-        uint32_t delay = 0;
-        if(dseq.humanizeTimingMs > 0){
-            uint32_t maxDelay = (uint32_t)dseq.humanizeTimingMs * SAMPLE_RATE / 1000u;
-            if(track <= 1) maxDelay /= 4u; /* kick/snare stay anchored */
-            if(maxDelay > 0) delay = FastRand() % (maxDelay + 1u);
-        }
-        const uint8_t ratchets = (s.ratchet >= 1 && s.ratchet <= 4) ? s.ratchet : 1;
-        PendingTrigger& pending = pendingTriggers[track];
-        pending.active = true;
-        pending.pattern = pat;
-        pending.track = track;
-        pending.step = step;
-        pending.velocity = (uint8_t)velocity;
-        pending.repeatsRemaining = ratchets;
-        pending.interval = dseq.samplesPerStep / ratchets;
-        if(pending.interval < 8) pending.interval = 8;
-        pending.countdown = delay;
-        if(delay == 0){
-            DsqTriggerTrackNow(track, s, pending.velocity);
-            pending.repeatsRemaining--;
-            if(pending.repeatsRemaining == 0) pending.active = false;
-            else {
-                pending.velocity = (uint8_t)((pending.velocity * 88u) / 100u);
-                if(pending.velocity == 0) pending.velocity = 1;
-                pending.countdown = pending.interval;
+    const uint32_t base = dseq.samplesPerStep;
+    for(uint8_t track = 0; track < DSQ_TRACKS; ++track) {
+        const uint8_t swing = dsqTrackSwing[track] ? dsqTrackSwing[track] : dseq.swingAmount;
+        const uint32_t offset = SwingOffset(base, swing);
+        for(uint8_t phase = 0; phase < 2; ++phase) {
+            PendingTrigger& pending = pendingTriggers[phase][track];
+            const uint8_t step = uint8_t((dseq.currentStep + phase) % dseq.patternLength);
+            pending.snapshot = dsqSteps[pat][track][step];
+            auto& state = pending.snapshot;
+            int velocity = state.velocity;
+            const bool hit = state.active && velocity > 0 && !dseq.trackMuted[track]
+                && state.probability > 0
+                && (state.probability >= 100 || FastRand() % 100u < state.probability);
+            if(hit && dseq.humanizeVelAmt > 0) {
+                const int range = velocity * dseq.humanizeVelAmt / 100;
+                velocity += int(FastRand() % uint32_t(range * 2 + 1)) - range;
+                velocity = velocity < 1 ? 1 : velocity > 127 ? 127 : velocity;
             }
+            uint32_t delay = 0;
+            if(hit && dseq.humanizeTimingMs) {
+                uint32_t maxDelay = uint32_t(dseq.humanizeTimingMs) * SAMPLE_RATE / 1000u;
+                if(track <= 1) maxDelay /= 4u;
+                delay = FastRand() % (maxDelay + 1u);
+            }
+            pending.duration = phase ? base - offset : base + offset;
+            pending.repeatsRemaining = hit && state.ratchet >= 1 && state.ratchet <= 4 ? state.ratchet : 1;
+            pending.interval = RatchetInterval(pending.duration, delay, pending.repeatsRemaining);
+            pending.countdown = (phase ? base + offset : 0) + delay;
+            pending.velocity = hit ? uint8_t(velocity) : 0;
+            if(!hit) state.cutoffEn = state.reverbEn = state.volEn = false;
+            pending.active = true;
         }
     }
 }
@@ -5496,6 +5536,16 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
      * synth engines this callback. Must run even on the early-exit paths
      * below (tone test / safe mode / kit mute) so queued commands are
      * never starved while one of those states is active. */
+    if(patternCommitState == 1) {
+        __DMB();
+        auto* old = dsqSteps[patternTransfer.slot];
+        dsqSteps[patternTransfer.slot] = dsqStaging;
+        dsqStaging = old;
+        dsqLoadedPatternMask |= 1u << patternTransfer.slot;
+        dseq.patternLength = 16;
+        __DMB();
+        patternCommitState = 2;
+    }
     AudioCmdDrainAndApply();
 
     /* ── STARTUP TONE TEST: tono 1kHz directo, bypasea toda la cadena ── */
@@ -5624,6 +5674,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                             } else {
                                 songPlaying = false;
                                 dseq.playing = false;
+                                DsqReleaseAllHeldNotes();
                             }
                         } else {
                             dseq.currentPattern = songChain[songIdx].pattern;
@@ -5835,7 +5886,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             /* ── Per-track filter ── */
             if(trkFilterType[p]){
                 if(trkLfoActive[p] && trkLfoTarget[p] == LFO_TGT_FILTER && !trkFilterLfoSet[p]){
-                    float modCut = trkFilterCut[p] * (1.0f + 0.9f * lfoVal[p]);
+                    float modCut = EffectiveCutoff(p) * (1.0f + 0.9f * lfoVal[p]);
                     modCut = clampF(modCut, 20.f, 20000.f);
                     trkFilter[p].SetType(trkFilterType[p], modCut, trkFilterQ[p], (float)SAMPLE_RATE);
                     if(trkFilterType[p] == FTYPE_RESONANT)
@@ -5943,7 +5994,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
 
             /* ── Send buses (stereo) — only accumulate if master FX engaged ── */
             if(revEng){
-                float rSend = trackReverbSend[p];
+                float rSend = EffectiveReverbSend(p);
                 if(trkLfoActive[p] && trkLfoTarget[p] == LFO_TGT_SEND_REV)
                     rSend = clampF(rSend + 0.5f * lfoVal[p], 0.0f, 1.0f);
                 reverbBusL += outL * rSend;
@@ -5976,7 +6027,12 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         /* ── SYNTH ENGINES — process + cadena FX per-track ── */
         /* Lambda: aplica filtro/dist/EQ/echo/flanger/comp/vol/pan del track t  */
         /* al sample s y lo suma a busL/busR. Si t<0 -> bus directo sin FX.     */
-        auto synthTobus = [&](float s, int8_t t){
+        float synthTrackInput[MAX_PADS] = {};
+        auto synthTobus = [&](float s, int8_t t) {
+            if(t < 0 || t >= MAX_PADS) { busL += s; busR += s; }
+            else synthTrackInput[t] += s;
+        };
+        auto renderSynthTrack = [&](float s, int8_t t){
             if(t < 0 || t >= MAX_PADS){ busL += s; busR += s; return; }
             if(trkFxRouted[t]){
             /* filtro */
@@ -6038,7 +6094,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             if(trkLfoActive[t] && trkLfoTarget[t] == LFO_TGT_PAN)
                 panTrk = clampF(panTrk + 0.9f * lfoVal[t], -1.0f, 1.0f);
             /* vol + pan -> bus */
-            float outS = s * trackGain[t] * lfoGain;
+            float outS = s * EffectiveTrackGain(t) * lfoGain;
             float pL = (1.f - panTrk) * 0.5f;
             float pR = (1.f + panTrk) * 0.5f;
             busL += outS * pL;
@@ -6046,8 +6102,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             /* sends (stereo) — only if master FX engaged */
             float sndL = outS * pL, sndR = outS * pR;
             if(revEng){
-                reverbBusL += sndL * trackReverbSend[t];
-                reverbBusR += sndR * trackReverbSend[t];
+                reverbBusL += sndL * EffectiveReverbSend(t);
+                reverbBusR += sndR * EffectiveReverbSend(t);
             }
             if(delEng){
                 delayBusL  += sndL * trackDelaySend[t];
@@ -6062,29 +6118,29 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             if(pk > trackPeak[t]) trackPeak[t] = pk;
         };
 
-        if (synthActiveMask & (1 << SYNTH_ENGINE_808)){
+        auto drumToBus = [&](auto& kit, uint8_t engine, const uint8_t* mapping) {
+            float outputs[16];
+            kit.Process(outputs);
+            for(uint8_t track = 0; track < 16; ++track) {
+                const uint8_t inst = mapping[track];
+                const float gain = drumSeqSource[engine][inst] ? seqVolume : liveVolume;
+                synthTobus(sanitizeF(outputs[inst]) * kDrumBusHeadroom * gain, track);
+            }
+        };
+        if(synthActiveMask & (1 << SYNTH_ENGINE_808)) {
             DSP_PROF_SCOPE(SYNTH_808);
-            float s = sanitizeF(synth808.Process()) * kDrumBusHeadroom;
+            drumToBus(synth808, SYNTH_ENGINE_808, padTo808);
             DSP_PROF_END(SYNTH_808);
-            DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s, engTrk[SYNTH_ENGINE_808]);
-            DSP_PROF_END(SYNTH_ROUTING);
         }
-        if (synthActiveMask & (1 << SYNTH_ENGINE_909)){
+        if(synthActiveMask & (1 << SYNTH_ENGINE_909)) {
             DSP_PROF_SCOPE(SYNTH_909);
-            float s = sanitizeF(synth909.Process()) * kDrumBusHeadroom;
+            drumToBus(synth909, SYNTH_ENGINE_909, padTo909);
             DSP_PROF_END(SYNTH_909);
-            DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s, engTrk[SYNTH_ENGINE_909]);
-            DSP_PROF_END(SYNTH_ROUTING);
         }
-        if (kEnableSynth505 && (synthActiveMask & (1 << SYNTH_ENGINE_505))){
+        if(kEnableSynth505 && (synthActiveMask & (1 << SYNTH_ENGINE_505))) {
             DSP_PROF_SCOPE(SYNTH_505);
-            float s = sanitizeF(synth505.Process()) * kDrumBusHeadroom;
+            drumToBus(synth505, SYNTH_ENGINE_505, padTo505);
             DSP_PROF_END(SYNTH_505);
-            DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s, engTrk[SYNTH_ENGINE_505]);
-            DSP_PROF_END(SYNTH_ROUTING);
         }
         if ((synthActiveMask & (1 << SYNTH_ENGINE_303)) && acid303.IsActive()){
             /* v2.5: −4dB headroom en synths melódicos para no saturar el bus */
@@ -6092,7 +6148,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             float s = sanitizeF(acid303.Process()) * 0.63f;
             DSP_PROF_END(SYNTH_303);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s, engTrk[SYNTH_ENGINE_303]);
+            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_303] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_303] >= 0 ? melodicOwner[SYNTH_ENGINE_303] : engTrk[SYNTH_ENGINE_303]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
         if ((synthActiveMask & (1 << SYNTH_ENGINE_WTOSC)) && wtOsc.IsActive()){
@@ -6100,7 +6156,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             float s = sanitizeF(wtOsc.Process()) * 0.63f;
             DSP_PROF_END(SYNTH_WT);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s, engTrk[SYNTH_ENGINE_WTOSC]);
+            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_WTOSC] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_WTOSC] >= 0 ? melodicOwner[SYNTH_ENGINE_WTOSC] : engTrk[SYNTH_ENGINE_WTOSC]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
         if ((synthActiveMask & (1 << SYNTH_ENGINE_SH101)) && synthSH101.IsActive()){  /* I1 */
@@ -6108,7 +6164,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             float s = sanitizeF(synthSH101.Process()) * 0.63f;
             DSP_PROF_END(SYNTH_SH101);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s, engTrk[SYNTH_ENGINE_SH101]);
+            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_SH101] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_SH101] >= 0 ? melodicOwner[SYNTH_ENGINE_SH101] : engTrk[SYNTH_ENGINE_SH101]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
         if ((synthActiveMask & (1 << SYNTH_ENGINE_FM2OP)) && synthFM2Op.IsActive()){  /* I2 */
@@ -6116,7 +6172,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             float s = sanitizeF(synthFM2Op.Process()) * 0.63f;
             DSP_PROF_END(SYNTH_FM2OP);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(s, engTrk[SYNTH_ENGINE_FM2OP]);
+            synthTobus(s * (melodicSeqSource[SYNTH_ENGINE_FM2OP] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_FM2OP] >= 0 ? melodicOwner[SYNTH_ENGINE_FM2OP] : engTrk[SYNTH_ENGINE_FM2OP]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
         if (synthActiveMask & (1 << SYNTH_ENGINE_PHYS)){
@@ -6126,7 +6182,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             if(physStringActive) s += sanitizeF(physString.Process()) * physStringGain;
             DSP_PROF_END(SYNTH_PHYS);
             DSP_PROF_SCOPE(SYNTH_ROUTING);
-            synthTobus(sanitizeF(s), engTrk[SYNTH_ENGINE_PHYS]);
+            synthTobus(sanitizeF(s) * (melodicSeqSource[SYNTH_ENGINE_PHYS] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_PHYS] >= 0 ? melodicOwner[SYNTH_ENGINE_PHYS] : engTrk[SYNTH_ENGINE_PHYS]);
             DSP_PROF_END(SYNTH_ROUTING);
         }
         if (synthActiveMask & (1 << SYNTH_ENGINE_NOISE)){
@@ -6135,10 +6191,16 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 float s = sanitizeF(noisePart.Process()) * noisePartGain;
                 DSP_PROF_END(SYNTH_NOISE);
                 DSP_PROF_SCOPE(SYNTH_ROUTING);
-                synthTobus(sanitizeF(s), engTrk[SYNTH_ENGINE_NOISE]);
+                synthTobus(sanitizeF(s) * (melodicSeqSource[SYNTH_ENGINE_NOISE] ? seqVolume : liveVolume), melodicOwner[SYNTH_ENGINE_NOISE] >= 0 ? melodicOwner[SYNTH_ENGINE_NOISE] : engTrk[SYNTH_ENGINE_NOISE]);
                 DSP_PROF_END(SYNTH_ROUTING);
             }
         }
+
+        // One FX pass per track, even if several kits contributed. Advancing
+        // the same filter/delay three times per sample changes its frequency.
+        for(uint8_t t = 0; t < DSQ_TRACKS; ++t)
+            if(dsqTrackEngine[t] >= 0 || synthTrackInput[t] != 0.f)
+                renderSynthTrack(synthTrackInput[t], t);
 
         /* ── Startup section cue (formante retro-robótico) ── */
         if(startupAnnounceActive)
@@ -9128,6 +9190,48 @@ static void ProcessCommand()
     /* ════════════════════════════════════════════════════════
      *  DAISY SEQUENCER (0xD0-0xD8)
      * ════════════════════════════════════════════════════════ */
+    case CMD_PATTERN_BEGIN:
+        if(len == 3 && p[0] < DSQ_PATTERNS && patternCommitState == 0) {
+            patternTransfer.begin(p[0], uint16_t(p[1]) | (uint16_t(p[2]) << 8));
+            memset(dsqStaging, 0, sizeof(DsqPattern));
+        }
+        break;
+    case CMD_PATTERN_TRACK:
+        if(len == 4 + 16 * sizeof(PatternWireStep) && patternCommitState == 0
+           && patternTransfer.track(p[0], uint16_t(p[1]) | (uint16_t(p[2]) << 8), p[3], p + 4, len - 4)) {
+            const auto* in = reinterpret_cast<const PatternWireStep*>(p + 4);
+            for(uint8_t i = 0; i < 16; ++i) {
+                auto& dst = dsqStaging[p[3]][i];
+                dst.active = in[i].active != 0;
+                dst.velocity = in[i].velocity > 127 ? 127 : in[i].velocity;
+                dst.noteLenDiv = (in[i].division & 15u) ? (in[i].division & 15u) : 1;
+                dst.ratchet = ((in[i].division >> 4) & 3u) + 1;
+                dst.probability = in[i].probability;
+                dst.flags = in[i].flags;
+                memcpy(dst.notes, in[i].notes, 4);
+                dst.cutoffEn = in[i].cutoffEn != 0;
+                dst.cutoffHz = in[i].cutoffHz;
+                dst.reverbEn = in[i].reverbEn != 0;
+                dst.reverbSend = in[i].reverbSend;
+                dst.volEn = in[i].volumeEn != 0;
+                dst.volume = in[i].volume;
+            }
+        }
+        break;
+    case CMD_PATTERN_COMMIT: {
+        uint32_t hash = 0;
+        if(len == 7) memcpy(&hash, p + 3, 4);
+        if(len == 7 && patternCommitState == 0 && patternTransfer.ready(p[0], uint16_t(p[1]) | (uint16_t(p[2]) << 8), hash)) {
+            patternCommitSequence = hdr->sequence;
+            __DMB();
+            patternCommitState = 1;
+        } else {
+            const uint8_t ack[4] = {uint8_t(len ? p[0] : 0xFF), uint8_t(len > 1 ? p[1] : 0), uint8_t(len > 2 ? p[2] : 0), 0};
+            BuildResponse(CMD_PATTERN_COMMIT, hdr->sequence, ack, sizeof(ack));
+        }
+        return;
+    }
+
     case CMD_DSQ_UPLOAD_TRACK:
         /* [pat(1), trk(1), stepCount(1), rsvd(1)] + stepCount × DsqStepPkt(4) */
         if(len >= 4){
@@ -9146,7 +9250,7 @@ static void ProcessCommand()
                 dst.probability = sp[i].probability;
                 dst.flags = 0;
                 memset(dst.notes, 0, sizeof(dst.notes));
-                /* param locks preserved — only reset on full pattern clear */
+                dst.cutoffEn = dst.reverbEn = dst.volEn = false;
             }
             dsqLoadedPatternMask |= (1u << pat);
         }
@@ -9285,7 +9389,7 @@ static void ProcessCommand()
                 newEngine = DsqFallbackEngine(track);
             if(oldEngine != newEngine)
             {
-                pendingTriggers[track].active = false;
+                pendingTriggers[0][track].active = pendingTriggers[1][track].active = false;
                 DsqReleaseHeldNotes(track);
                 StopPadVoices(track);
                 ReleaseTrackEngine(track, oldEngine);
@@ -10472,8 +10576,15 @@ static void ApplyPodLed(uint8_t index, uint8_t function,
 
 static void ProcessDaisyUsb()
 {
+    if(patternCommitState == 2 && !pendingResponse) {
+        __DMB();
+        const uint8_t ack[4] = {patternTransfer.slot, uint8_t(patternTransfer.token), uint8_t(patternTransfer.token >> 8), 1};
+        BuildResponse(CMD_PATTERN_COMMIT, patternCommitSequence, ack, sizeof(ack));
+        patternCommitState = 0;
+        patternTransfer.slot = 0xFF;
+    }
     uint16_t budget = USB_RX_RING_SIZE;
-    while(usbRxTail != usbRxHead && budget-- > 0)
+    while(!pendingResponse && usbRxTail != usbRxHead && budget-- > 0)
     {
         __DMB(); /* pairs with the producer's __DMB() before it publishes head */
         const uint8_t byte = usbRxRing[usbRxTail];

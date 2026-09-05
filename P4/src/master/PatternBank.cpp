@@ -500,6 +500,10 @@ void setPatternSoundProfile(int pattern, const BuiltinPatternSoundProfile& profi
   ACTIVE_SOUND_PROFILE_VALID[pattern] = true;
 }
 
+void clearPatternSoundProfile(int pattern) {
+  if (pattern >= 0 && pattern < MAX_PATTERNS) ACTIVE_SOUND_PROFILE_VALID[pattern] = false;
+}
+
 uint8_t getConfiguredPatternCount(void) {
   for (int pattern = MAX_PATTERNS - 1; pattern >= 0; --pattern) {
     if (ACTIVE_SOUND_PROFILE_VALID[pattern]) return (uint8_t)(pattern + 1);

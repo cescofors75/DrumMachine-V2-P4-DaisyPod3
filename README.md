@@ -7,6 +7,12 @@ Proyecto nuevo de batería y sintetizador dividido en dos firmwares:
 
 El único enlace de control entre placas es un cable USB-C de datos:
 
+La versión de protocolo actual es **2.4**: actualizar ambos firmwares juntos.
+Las cargas completas de patrón se verifican con checksum y se activan en Daisy
+al comenzar un bloque de audio; una carga incompleta conserva el patrón anterior.
+Los guardados de usuario usan dos copias verificadas y mantienen compatibilidad
+de lectura con los archivos antiguos. Véase [correcciones y rendimiento](CORRECCIONES_Y_RENDIMIENTO.md).
+
 ```text
 ESP32-P4 (USB host)  <──── USB-C CDC binario ────>  DaisyPod3 (USB device)
 ```

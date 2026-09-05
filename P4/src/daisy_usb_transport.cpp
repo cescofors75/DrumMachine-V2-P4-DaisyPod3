@@ -1,4 +1,5 @@
 #include "daisy_usb_transport.h"
+#include "../../shared/pattern_transfer.h"
 
 #include "usb_cdc_handler.h"
 #include "ui/ui_screens.h"
@@ -415,7 +416,11 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
         }
     }
 
-    if(header->cmd == CMD_PING && header->length >= 8)
+    if(header->cmd == CMD_PATTERN_COMMIT && header->length == 4) {
+        pattern_ack_token_ = uint16_t(payload[1]) | (uint16_t(payload[2]) << 8);
+        pattern_ack_accepted_ = payload[3] != 0;
+    }
+    else if(header->cmd == CMD_PING && header->length >= 8)
     {
         uint32_t echo_ms = 0;
         memcpy(&echo_ms, payload, sizeof(echo_ms));

@@ -114,6 +114,9 @@ class DaisyUsbTransport
     // Producer (handleResponse) and consumer both run from loop().
     bool popMidiEvent(MidiMonitorEvent& event);
 
+    void clearPatternAck() { pattern_ack_token_ = 0; pattern_ack_accepted_ = false; }
+    uint16_t patternAckToken() const { return pattern_ack_token_; }
+    bool patternAckAccepted() const { return pattern_ack_accepted_; }
     bool connected() const { return state_.engine_responding; }
     const TransportState& state() const { return state_; }
     uint32_t sampleEndAckRevision() const
@@ -158,6 +161,8 @@ class DaisyUsbTransport
     std::atomic<uint32_t> sample_end_ack_revision_{0};
     std::atomic<uint8_t> sample_end_ack_pad_{0xFFu};
     std::atomic<bool> sample_end_ack_accepted_{false};
+    uint16_t pattern_ack_token_ = 0;
+    bool pattern_ack_accepted_ = false;
     TransportState state_ = {};
 };
 

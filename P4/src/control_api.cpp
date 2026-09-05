@@ -1,4 +1,5 @@
 #include "control_api.h"
+#include "../../shared/pattern_transfer.h"
 
 #include "app_state.h"
 #include "daisy_usb_transport.h"
@@ -31,6 +32,7 @@ Sequencer& SequencerInstance()
 }
 
 std::atomic<bool> fxDirty{false};
+std::atomic<uint8_t> patternSyncState{0};
 uint32_t tempoLockUntilMs = 0;
 uint8_t melodyEngine = 3;
 uint8_t melodyOctave = 4;
@@ -72,6 +74,8 @@ std::atomic<int>  pendingQueueUpload{-1};
 std::atomic<bool> pendingQueueCancel{false};
 std::atomic<bool> pendingCurrentPatternSync{false};
 std::atomic<bool> midiSongPrepared{false};
+std::atomic<bool> midiSongUploaded{false};
+std::atomic<bool> pendingSongStart{false};
 std::atomic<bool> midiSongPersisted{false};
 uint8_t midiSongPatternCount = 0;
 uint8_t midiSongChainCount = 0;
@@ -187,6 +191,7 @@ void ProcessMidiMonitor()
     MidiMonitorEvent event;
     while(daisyUsb.popMidiEvent(event))
     {
+        ui_note_control_activity();
         const uint8_t type = event.status & 0xF0u;
         const uint8_t channel = event.status & 0x0Fu;
         midiActivity = event;
@@ -274,83 +279,72 @@ bool SendWithRetry(uint8_t command, const void* payload, uint16_t length)
 
 bool UploadPattern(uint8_t destination, int logicalPattern)
 {
-    Sequencer& sequencer = SequencerInstance();
-    logicalPattern = Clamp(logicalPattern, 0, MAX_PATTERNS - 1);
-    const uint8_t length = 16;
-    bool uploaded = SendWithRetry(CMD_DSQ_SET_LENGTH, &length, sizeof(length));
-
+    patternSyncState.store(1);
+    struct Completion {
+        bool ok = false;
+        ~Completion() { patternSyncState.store(ok ? 2 : 3); }
+    } completion;
+    static uint16_t token = 0;
+    if(++token == 0) ++token; // zero is the "no acknowledgement" sentinel
+    const uint16_t id = token;
+    const uint8_t begin[3] = {destination, uint8_t(id), uint8_t(id >> 8)};
+    if(!SendWithRetry(CMD_PATTERN_BEGIN, begin, sizeof(begin))) return false;
+    uint32_t hash = 2166136261u;
     StepUploadData snapshot[16] = {};
-    uint8_t trackPayload[4 + 16 * sizeof(DsqStepPkt)] = {};
-    auto* steps = reinterpret_cast<DsqStepPkt*>(trackPayload + 4);
-    for(uint8_t track = 0; track < 16; ++track)
-    {
-        sequencer.snapshotTrackForUpload(logicalPattern, track, 16, snapshot);
-        trackPayload[0] = destination;
-        trackPayload[1] = track;
-        trackPayload[2] = 16;
-        trackPayload[3] = 0;
-        for(uint8_t step = 0; step < 16; ++step)
-        {
-            steps[step].active = snapshot[step].active ? 1u : 0u;
-            steps[step].velocity = snapshot[step].velocity;
-            const uint8_t noteLength = snapshot[step].noteLenDiv & 0x0Fu;
-            const uint8_t ratchet = Clamp<uint8_t>(snapshot[step].ratchet, 1, 4);
-            steps[step].noteLenDiv = noteLength | ((ratchet - 1u) << 4);
-            steps[step].probability = snapshot[step].probability;
+    for(uint8_t track = 0; track < 16; ++track) {
+        uint8_t packet[4 + 16 * sizeof(PatternWireStep)] = {destination, uint8_t(id), uint8_t(id >> 8), track};
+        auto* out = reinterpret_cast<PatternWireStep*>(packet + 4);
+        SequencerInstance().snapshotTrackForUpload(logicalPattern, track, 16, snapshot);
+        for(uint8_t step = 0; step < 16; ++step) {
+            const auto& in = snapshot[step];
+            out[step].active = in.active;
+            out[step].velocity = in.velocity;
+            out[step].division = PackStepDivision(in.noteLenDiv, in.ratchet);
+            out[step].probability = in.probability;
+            out[step].flags = in.flags;
+            memcpy(out[step].notes, in.noteVoices, 4);
+            out[step].cutoffEn = in.cutoffEn;
+            out[step].cutoffHz = in.cutoffHz;
+            out[step].reverbEn = in.reverbEn;
+            out[step].reverbSend = in.reverbSend;
+            out[step].volumeEn = in.volumeEn;
+            out[step].volume = in.volume;
         }
-        if(!SendWithRetry(CMD_DSQ_UPLOAD_TRACK, trackPayload, sizeof(trackPayload)))
-            uploaded = false;
-
-        // The track upload intentionally clears melodic information in Daisy;
-        // restore the note voices and accent/slide flags exactly as S3 did.
-        for(uint8_t step = 0; step < 16; ++step)
-        {
-            bool hasNotes = false;
-            for(uint8_t voice = 0; voice < MELODY_STEP_VOICES; ++voice)
-                hasNotes |= snapshot[step].noteVoices[voice] != 0;
-            if(hasNotes || snapshot[step].flags != 0)
-            {
-                DsqSetStepNotesPayload notes = {};
-                notes.pattern = destination;
-                notes.track = track;
-                notes.step = step;
-                notes.flags = snapshot[step].flags;
-                memcpy(notes.notes, snapshot[step].noteVoices, sizeof(notes.notes));
-                if(!SendWithRetry(CMD_DSQ_SET_STEP_NOTES, &notes, sizeof(notes)))
-                    uploaded = false;
-            }
-
-            if(snapshot[step].cutoffEn || snapshot[step].reverbEn
-               || snapshot[step].volumeEn)
-            {
-                DsqSetParamLockPayload lock = {};
-                lock.pattern = destination;
-                lock.track = track;
-                lock.step = step;
-                lock.cutoffEn = snapshot[step].cutoffEn ? 1u : 0u;
-                lock.cutoffHi = static_cast<uint8_t>(snapshot[step].cutoffHz >> 8);
-                lock.cutoffLo = static_cast<uint8_t>(snapshot[step].cutoffHz);
-                lock.reverbEn = snapshot[step].reverbEn ? 1u : 0u;
-                lock.reverbSend = snapshot[step].reverbSend;
-                lock.volEn = snapshot[step].volumeEn ? 1u : 0u;
-                lock.volume = snapshot[step].volume;
-                if(!SendWithRetry(CMD_DSQ_SET_PARAM_LOCK, &lock, sizeof(lock)))
-                    uploaded = false;
-            }
+        hash = PatternHash(packet + 4, sizeof(packet) - 4, hash);
+        if(!SendWithRetry(CMD_PATTERN_TRACK, packet, sizeof(packet))) return false;
+        daisyUsb.process();
+        ui_process_pad_queue();
+        ui_process_control_queue();
+        taskYIELD();
+    }
+    uint8_t commit[7] = {destination, uint8_t(id), uint8_t(id >> 8)};
+    memcpy(commit + 3, &hash, 4);
+    daisyUsb.clearPatternAck();
+    if(!SendWithRetry(CMD_PATTERN_COMMIT, commit, sizeof(commit))) return false;
+    const uint32_t started = millis();
+    while(millis() - started < 2000u && control_available()) {
+        daisyUsb.process();
+        ui_process_pad_queue();
+        ui_process_control_queue();
+        if(daisyUsb.patternAckToken() == id) {
+            completion.ok = daisyUsb.patternAckAccepted();
+            return completion.ok;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-    return uploaded;
+    return false;
 }
 
 bool UploadPreparedMidiSong()
 {
+    midiSongUploaded.store(false);
     if(!midiSongPrepared || midiSongPatternCount == 0
        || midiSongChainCount == 0 || !control_available())
         return false;
 
     for(uint8_t resident = 0; resident < midiSongPatternCount; ++resident)
-        UploadPattern(resident, midiSongLogicalPattern[resident]);
+        if(!midiSongPrepared || !UploadPattern(resident, midiSongLogicalPattern[resident])) return false;
+    if(!midiSongPrepared) return false;
 
     // MIDI drum imports target the sampler kit. Clear any synth-engine profile
     // left by the previously resident scene before starting the arrangement.
@@ -363,6 +357,7 @@ bool UploadPreparedMidiSong()
     expectedDaisyPattern = 0;
     expectedDaisyPatternSinceMs = millis();
     daisyUsb.selectPattern(0);
+    midiSongUploaded.store(true);
     return true;
 }
 
@@ -442,7 +437,7 @@ void SendCurrentState()
         SequencerInstance().selectPattern(firstPattern);
         LoadPatternToUi(firstPattern);
         ApplyPatternPerformance(firstPattern);
-        UploadPreparedMidiSong();
+        if(!UploadPreparedMidiSong()) { pendingCurrentPatternSync.store(true); return; }
         uint16_t muteMask = 0;
         uint16_t soloMask = 0;
         for(uint8_t track = 0; track < 16; ++track)
@@ -457,7 +452,7 @@ void SendCurrentState()
         return;
     }
     activeDaisyPattern = DefaultDaisyPattern(p4.current_pattern);
-    UploadPattern(activeDaisyPattern, p4.current_pattern);
+    if(!UploadPattern(activeDaisyPattern, p4.current_pattern)) { pendingSelectUpload.store(p4.current_pattern); return; }
     ApplyPatternPerformance(p4.current_pattern);
     expectedDaisyPattern = activeDaisyPattern;
     expectedDaisyPatternSinceMs = millis();
@@ -495,8 +490,13 @@ void ProcessPendingPatternWork()
     const int sel = pendingSelectUpload.exchange(-1, std::memory_order_acq_rel);
     if(sel >= 0)
     {
-        activeDaisyPattern = DefaultDaisyPattern(sel);
-        UploadPattern(activeDaisyPattern, sel);
+        const uint8_t destination = DefaultDaisyPattern(sel);
+        if(!UploadPattern(destination, sel)) {
+            int empty = -1;
+            pendingSelectUpload.compare_exchange_strong(empty, sel);
+            return;
+        }
+        activeDaisyPattern = destination;
         ApplyPatternPerformance(sel);
         expectedDaisyPattern = activeDaisyPattern;
         expectedDaisyPatternSinceMs = millis();
@@ -508,15 +508,28 @@ void ProcessPendingPatternWork()
     {
         queuedLogicalPattern = queued;
         queuedDaisyPattern = static_cast<uint8_t>((activeDaisyPattern + 1u) % 20u);
-        UploadPattern(queuedDaisyPattern, queuedLogicalPattern);
+        if(!UploadPattern(queuedDaisyPattern, queuedLogicalPattern)) {
+            int empty = -1;
+            pendingQueueUpload.compare_exchange_strong(empty, queued);
+            return;
+        }
         daisyUsb.queuePattern(queuedDaisyPattern);
     }
 
-    if(pendingCurrentPatternSync.exchange(false, std::memory_order_acq_rel))
-        UploadPattern(activeDaisyPattern,
-                      Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1));
+    if(pendingCurrentPatternSync.exchange(false, std::memory_order_acq_rel)) {
+        const bool ok = midiSongPrepared ? UploadPreparedMidiSong()
+            : UploadPattern(activeDaisyPattern, Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1));
+        if(!ok) pendingCurrentPatternSync.store(true);
+    }
+    if(midiSongPrepared && midiSongUploaded && pendingSongStart.exchange(false)) {
+        SequencerInstance().songChainPlay();
+        daisyUsb.controlSong(1);
+        p4.is_playing = true;
+    }
 }
 }
+
+uint8_t control_pattern_sync_state() { return patternSyncState.load(); }
 
 void control_init()
 {
@@ -707,7 +720,10 @@ void control_process()
     {
         if(transport.engine_responding)
         {
-            UploadPattern(pendingUploadDaisySlot, pendingUploadLogicalPattern);
+            if(!UploadPattern(pendingUploadDaisySlot, pendingUploadLogicalPattern)) {
+                pendingUploadSinceMs = millis();
+                return;
+            }
             ApplyPatternPerformance(pendingUploadLogicalPattern);
         }
         pendingUploadLogicalPattern = -1;
@@ -885,6 +901,10 @@ void control_send_start()
 {
     if(midiSongPrepared)
     {
+        if(!midiSongUploaded) {
+            pendingSongStart.store(true);
+            return;
+        }
         SequencerInstance().songChainPlay();
         daisyUsb.controlSong(1);
     }
@@ -898,6 +918,7 @@ void control_send_start()
 
 void control_send_stop()
 {
+    pendingSongStart.store(false);
     SequencerInstance().stop();
     if(midiSongPrepared)
     {
@@ -926,6 +947,7 @@ void control_send_tempo(float bpm)
 // touch callbacks holding the LVGL mutex.
 void control_send_select_pattern(int index)
 {
+    patternSyncState.store(1);
     if(midiSongPrepared) control_cancel_midi_song();
     index = Clamp(index, 0, MAX_PATTERNS - 1);
     SequencerInstance().selectPattern(index);
@@ -2031,6 +2053,8 @@ bool control_install_midi_song(const mem_midi::MidiSongData& song)
     daisyUsb.stop();
     p4.is_playing = false;
     midiSongPrepared = false;
+    midiSongUploaded.store(false);
+    pendingSongStart.store(false);
     midiSongPatternCount = song.pattern_count;
     midiSongChainCount = song.chain_count;
 
@@ -2100,7 +2124,8 @@ bool control_install_midi_song(const mem_midi::MidiSongData& song)
     if(song.bpm >= 40.0f && song.bpm <= 240.0f
        && !i2c_rotaries_owns_function(POD_FUNC_TEMPO))
         control_send_tempo(song.bpm);
-    if(control_available()) UploadPreparedMidiSong();
+    // The import worker must not become a second USB parser/consumer.
+    pendingCurrentPatternSync.store(true);
     if(!persisted)
         log_w("[MIDI-SONG] ready in RAM, but one or more user patterns were not persisted");
     return true;
@@ -2118,6 +2143,8 @@ bool control_midi_song_persisted()
 
 void control_cancel_midi_song()
 {
+    pendingSongStart.store(false);
+    midiSongUploaded.store(false);
     if(!midiSongPrepared) return;
     SequencerInstance().songChainStop();
     SequencerInstance().songChainReset();
@@ -2134,6 +2161,20 @@ void control_send_unload_daisy(uint8_t pad)
     if(pad < 24) p4.sample_loaded[pad] = false;
 }
 
+static void SendCompleteStep(int track, int step)
+{
+    if(pendingSelectUpload.load() >= 0 || patternSyncState.load() == 1) {
+        pendingCurrentPatternSync.store(true);
+        return;
+    }
+    auto& seq = SequencerInstance();
+    const int pat = p4.current_pattern;
+    daisyUsb.setStep(activeDaisyPattern, track, step, p4.steps[track][step],
+        seq.getStepVelocity(pat, track, step),
+        PackStepDivision(seq.getStepNoteLen(pat, track, step), seq.getStepRatchet(pat, track, step)),
+        seq.getStepProbability(pat, track, step));
+}
+
 void control_send_set_step(int track, int step, bool active)
 {
     if(track < 0 || track >= 16 || step < 0 || step >= 16) return;
@@ -2143,7 +2184,7 @@ void control_send_set_step(int track, int step, bool active)
     SequencerInstance().setStep(
         p4.current_pattern, track, step, active, velocity);
     p4.steps[track][step] = active;
-    daisyUsb.setStep(activeDaisyPattern, track, step, active, velocity);
+    SendCompleteStep(track, step);
 }
 
 void control_send_set_step_velocity(int track, int step, int velocity)
@@ -2151,8 +2192,7 @@ void control_send_set_step_velocity(int track, int step, int velocity)
     if(track < 0 || track >= 16 || step < 0 || step >= 16) return;
     velocity = Clamp(velocity, 1, 127);
     SequencerInstance().setStepVelocity(p4.current_pattern, track, step, velocity);
-    daisyUsb.setStep(activeDaisyPattern, track, step,
-                     p4.steps[track][step], static_cast<uint8_t>(velocity));
+    SendCompleteStep(track, step);
 }
 
 void control_send_set_step_probability(int track, int step, int probability)
@@ -2161,12 +2201,7 @@ void control_send_set_step_probability(int track, int step, int probability)
     probability = Clamp(probability, 0, 100);
     Sequencer& sequencer = SequencerInstance();
     sequencer.setStepProbability(p4.current_pattern, track, step, (uint8_t)probability);
-    uint8_t velocity = sequencer.getStepVelocity(p4.current_pattern, track, step);
-    if(velocity == 0) velocity = 100;
-    uint8_t noteLenDiv = sequencer.getStepNoteLen(p4.current_pattern, track, step);
-    if(noteLenDiv == 0) noteLenDiv = 1;
-    daisyUsb.setStep(activeDaisyPattern, track, step, p4.steps[track][step],
-                     velocity, noteLenDiv, (uint8_t)probability);
+    SendCompleteStep(track, step);
 }
 
 uint8_t control_get_step_probability(int track, int step)
@@ -2814,10 +2849,7 @@ void local_push_pattern(int pattern, const bool steps[16][16])
             SequencerInstance().setStep(
                 pattern, track, step, steps[track][step], velocity);
         }
-    activeDaisyPattern = DefaultDaisyPattern(pattern);
-    UploadPattern(activeDaisyPattern, pattern);
-    ApplyPatternPerformance(pattern);
-    daisyUsb.selectPattern(activeDaisyPattern);
+    pendingSelectUpload.store(pattern, std::memory_order_release);
 }
 
 bool local_restore_pattern(uint8_t slot)

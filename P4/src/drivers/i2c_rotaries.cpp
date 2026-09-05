@@ -2,6 +2,7 @@
 
 #include "../app_state.h"
 #include "../control_api.h"
+#include "../ui/ui_screens.h"
 #include "../daisy_usb_transport.h"
 #include "../master/protocol.h"
 #include "display_init.h"
@@ -746,6 +747,7 @@ void i2c_rotaries_process()
         ? transport.pod.config.faderFunction : POD_FUNC_SCREEN_BRIGHTNESS;
 
     uint8_t changed = s_changedMask.exchange(0, std::memory_order_acq_rel);
+    if(changed) ui_note_control_activity();
     for(uint8_t i = 0; i < kRotaryCount; ++i)
     {
         const uint8_t previous = s_functions[i].exchange(functions[i],
@@ -755,6 +757,7 @@ void i2c_rotaries_process()
 
     bool faderChanged = s_faderChanged.exchange(false,
                                                  std::memory_order_acq_rel);
+    if(faderChanged) ui_note_control_activity();
     if(s_faderFunction.exchange(faderFunction, std::memory_order_acq_rel)
        != faderFunction)
         faderChanged = true;
@@ -769,6 +772,7 @@ void i2c_rotaries_process()
             s_buttonPressCounts[i].load(std::memory_order_acquire);
         const uint32_t presses = buttonCount
                                - s_processedButtonPressCounts[i];
+        if(presses) ui_note_control_activity();
         s_processedButtonPressCounts[i] = buttonCount;
         if((present & bit) == 0 || function == POD_FUNC_NONE
            || function >= POD_FUNC_COUNT)

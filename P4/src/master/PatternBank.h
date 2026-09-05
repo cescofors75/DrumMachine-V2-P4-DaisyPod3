@@ -30,6 +30,7 @@ void initializeFactoryExpansionBank(Sequencer& sequencer);
 bool getBuiltinPatternSoundProfile(int pattern, BuiltinPatternSoundProfile& out);
 void resetPatternSoundProfiles(void);
 void setPatternSoundProfile(int pattern, const BuiltinPatternSoundProfile& profile);
+void clearPatternSoundProfile(int pattern);
 uint8_t getConfiguredPatternCount(void);
 
 // Musical cleanup applied only to the shipped 20-pattern JSON bank. Pad 8 is

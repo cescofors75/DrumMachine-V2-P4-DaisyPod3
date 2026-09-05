@@ -73,3 +73,20 @@ tienen la segunda prioridad y bloquean el control táctil equivalente
 mientras estén detectados y asignados. Cada SEN0502 publica su botón por separado,
 con debounce, y al estar asignado a un FX su pulsación conmuta el bypass de ese FX.
 P4 se corrige con la siguiente revisión nueva de `POD_GET_STATE`.
+# Actualización de patrones — protocolo 2.4
+
+Ambos firmwares anuncian `0x0204` y deben actualizarse juntos. El formato
+canónico está en `shared/pattern_transfer.h`; números multibyte little-endian.
+
+- `0xF5 BEGIN`: slot (u8), token (u16). Prepara un buffer independiente.
+- `0xF6 TRACK`: slot (u8), token (u16), pista (u8), 16 `PatternWireStep`
+  (16 bytes cada uno). Deben llegar las pistas 0..15 en orden. Incluye estados
+  desactivados, notas y todos los locks, sustituyendo el contenido anterior.
+- `0xF7 COMMIT`: slot (u8), token (u16), FNV-1a de todos los registros de pasos
+  en orden de pista (u32). Solo un conjunto completo y válido puede publicarse.
+- Respuesta `0xF7`: slot (u8), token (u16), aceptado (u8). Un ACK positivo se
+  emite después del intercambio del buffer en el límite del bloque de audio.
+
+Los comandos de edición puntual siguen disponibles. División ocupa los cuatro
+bits bajos y ratchet-1 los bits 4..5; editar velocidad/probabilidad debe conservar
+el resto de atributos. El swing por pista 0 hereda el global; 1..100 lo sustituye.

@@ -1166,13 +1166,14 @@ public:
         }
     }
 
-    float Process() {
+    float Process(float* outputs = nullptr) {
         float mix = 0.0f;
+        float channels[INST_COUNT] = {};
 
         auto add = [&](uint8_t id, auto& inst) {
             if (inst.IsActive()) {
                 float sample = inst.Process();
-                if (!chanMute_[id]) mix += sample * chanVol_[id];
+                if (!chanMute_[id]) channels[id] += sample * chanVol_[id];
             }
         };
 
@@ -1212,17 +1213,22 @@ public:
             slot.pos += slot.step;
             if (slot.pos >= (float)slot.length) slot.active = false;
             if (!chanMute_[id])
-                mix += sample * slot.velocity * slot.chokeGain * chanVol_[id];
+                channels[id] += sample * slot.velocity * slot.chokeGain * chanVol_[id];
         }
 
         /* Soft limiter: peak follower con attack instantaneo
          * y release ~0.2s -- evita clipping sin comer transientes */
+        for(uint8_t id = 0; id < INST_COUNT; ++id) mix += channels[id];
         mix *= masterVol_;
         float absv = fabsf(mix);
         limitState_ = (absv > limitState_) ? absv : limitState_ * 0.9985f;
         if (limitState_ > 0.98f)
             mix *= 0.98f / limitState_;
 
+        if(outputs) {
+            const float gain = masterVol_ * (limitState_ > 0.98f ? 0.98f / limitState_ : 1.0f);
+            for(uint8_t id = 0; id < INST_COUNT; ++id) outputs[id] = channels[id] * gain;
+        }
         return mix;
     }
 

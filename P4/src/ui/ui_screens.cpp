@@ -24,6 +24,8 @@
 #include <esp_system.h>
 #include <atomic>
 #include <math.h>
+static std::atomic<uint32_t> s_control_activity_ms{0};
+void ui_note_control_activity() { s_control_activity_ms.store(millis(), std::memory_order_relaxed); }
 
 // ── IntelliSense fallbacks ───────────────────────────────────────────────────
 // The real values are provided via -D flags in platformio.ini and via
@@ -5952,6 +5954,14 @@ static void pod_process_physical_actions(void) {
     }
 
     const int16_t encoderPosition = transport.pod.encoderPosition;
+    static uint16_t lastKnob1 = 0, lastKnob2 = 0;
+    if(abs(int(transport.pod.knob1) - int(lastKnob1)) > 3
+       || abs(int(transport.pod.knob2) - int(lastKnob2)) > 3
+       || (s_pod_encoder_position_ready && encoderPosition != s_pod_encoder_position_seen)
+       || transport.pod.buttonPressEvents) {
+        ui_note_control_activity();
+        lastKnob1 = transport.pod.knob1; lastKnob2 = transport.pod.knob2;
+    }
     if (!s_pod_encoder_position_ready) {
         s_pod_encoder_position_seen = encoderPosition;
         s_pod_encoder_position_ready = true;
@@ -9366,21 +9376,40 @@ static void seq_save_confirm_hide(void) {
     seq_save_confirm_slot = -1;
 }
 
+static std::atomic<int> seq_save_state{0}; // 0 idle, 1 writing, 2 complete
+static int seq_save_source = 0, seq_save_destination = 0;
+static bool seq_save_ok = false;
+static void seq_save_worker(void*) {
+    seq_save_ok = control_save_user_pattern(seq_save_source, seq_save_destination);
+    seq_save_state.store(2, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+static void seq_save_poll() {
+    if(seq_save_state.load(std::memory_order_acquire) != 2) return;
+    if(seq_save_ok) {
+        char message[64];
+        snprintf(message, sizeof(message), "P%03d guardado desde P%03d",
+                 seq_save_destination + 1, seq_save_source + 1);
+        ui_show_toast(message, RED808_SUCCESS);
+    } else ui_show_toast("No se pudo guardar el patron", RED808_ERROR);
+    // Keep the current editor: the musician may have continued editing
+    // or selected another pattern while flash was busy.
+    seq_save_state.store(0, std::memory_order_release);
+}
 static void seq_save_user_pattern(int destination) {
-    const int source = p4.current_pattern;
-    const bool saved = control_save_user_pattern(source, destination);
-    seq_save_confirm_hide();
-    seq_pattern_list_hide();
-    if (!saved) {
-        ui_show_toast("No se pudo guardar el patron", RED808_ERROR);
+    if(seq_save_state.load(std::memory_order_acquire) != 0) {
+        ui_show_toast("Guardado en curso", RED808_SUCCESS);
         return;
     }
-    char message[64];
-    snprintf(message, sizeof(message), "P%03d guardado desde P%03d",
-             destination + 1, source + 1);
-    seq_set_pattern_dirty(false);
-    seq_launch_absolute_pattern(destination);
-    ui_show_toast(message, RED808_SUCCESS);
+    seq_save_source = p4.current_pattern;
+    seq_save_destination = destination;
+    seq_save_state.store(1, std::memory_order_release);
+    seq_save_confirm_hide();
+    seq_pattern_list_hide();
+    if(xTaskCreatePinnedToCore(seq_save_worker, "pattern_save", 4096, nullptr, 1, nullptr, 1) != pdPASS) {
+        seq_save_ok = false;
+        seq_save_state.store(2, std::memory_order_release);
+    }
 }
 
 static void seq_save_confirm_cb(lv_event_t* e) {
@@ -10748,16 +10777,22 @@ static void seq_pattern_modal_show(int pattern) {
 
 static void seq_pattern_modal_mark_loaded(void) {
     if (!seq_pattern_modal) return;
+    const uint8_t sync = control_pattern_sync_state();
+    if(ui_control_available() && sync == 1) {
+        if(seq_pattern_modal_lbl) lv_label_set_text(seq_pattern_modal_lbl, "Sincronizando con Daisy...");
+        seq_pattern_waiting = true;
+        return;
+    }
     if (seq_pattern_modal_spin) {
         lv_obj_add_flag(seq_pattern_modal_spin, LV_OBJ_FLAG_HIDDEN);
     }
     if (seq_pattern_modal_lbl) {
-        lv_label_set_text(seq_pattern_modal_lbl,
-            ui_control_available() ? "P4 cargado / sync USB enviada"
-                                   : "Pattern cargado en P4");
-        lv_obj_set_style_text_color(seq_pattern_modal_lbl, RED808_SUCCESS, 0);
+        lv_label_set_text(seq_pattern_modal_lbl, !ui_control_available() ? "Pattern cargado en P4"
+            : sync == 2 ? "Patron confirmado en Daisy"
+            : sync == 3 ? "Error USB: reintentando" : "Sincronizando con Daisy...");
+        lv_obj_set_style_text_color(seq_pattern_modal_lbl, sync == 3 ? RED808_ERROR : RED808_SUCCESS, 0);
     }
-    lv_obj_set_style_border_color(seq_pattern_modal, RED808_SUCCESS, 0);
+    lv_obj_set_style_border_color(seq_pattern_modal, sync == 3 ? RED808_ERROR : RED808_SUCCESS, 0);
     seq_pattern_waiting = false;
     seq_pattern_wait_ms = millis();
 }
@@ -11618,9 +11653,7 @@ static void update_sequencer_screen(void) {
     bool playing = p4.is_playing;
     unsigned long now = millis();
 
-    // Pattern loading modal lifecycle. P4 owns the bank, so completion is the
-    // actual selected local slot. Daisy sync is an outbound upload and has no
-    // pattern_sync response packet.
+    // Local selection is immediate; connected loads wait for Daisy's commit.
     if (seq_pattern_modal) {
         if (seq_pattern_waiting) {
             if (p4.current_pattern == seq_pattern_wait_pat) {
@@ -19604,10 +19637,8 @@ void ui_process_pad_queue(void) {
         if (!velocity) velocity = 100;   // defensive floor
         // Feed DSP spectrum with real velocity
         dsp_notify_pad(pad, velocity);
-        // Notify the local controller first. The internal tap event ignores
-        // velocity; we still send it for forward compatibility.
-        local_apply_message(MSG_TOUCH_CMD, TCMD_PAD_TAP, pad);
-        // Then send the DaisyPod3 trigger with MPC-style velocity.
+        // Dispatch once with the actual velocity. TCMD_PAD_TAP also triggers
+        // Daisy and used to duplicate each touch at velocity 127 first.
         if (p4.master_connected) {
             // Kit per-pad: si el pad usa un engine drum (808/909/505) y su
             // kit asignado difiere del último aplicado a ese engine en la
@@ -20170,7 +20201,7 @@ static void screensaver_tick(void) {
 
     // Preferencia del usuario (STATUS > SALVAPANTALLAS). Si lo desactiva
     // mientras esta activo, se restaura la pantalla anterior al instante.
-    if (!p4.screensaver_enabled) {
+    if (!p4.screensaver_enabled || p4.is_playing) {
         if (s_screensaver_active) {
             s_screensaver_active = false;
             ui_navigate_to(s_screensaver_return);
@@ -20180,6 +20211,8 @@ static void screensaver_tick(void) {
 
     const uint32_t now = millis();
     uint32_t inact = millis() - lvgl_port_last_touch_ms();
+    const uint32_t controlInact = now - s_control_activity_ms.load(std::memory_order_relaxed);
+    if(controlInact < inact) inact = controlInact;
     if (!s_screensaver_active) {
         if (inact >= SCREENSAVER_TIMEOUT_MS) {
             if (!scr_screensaver) create_screensaver_screen();
@@ -20209,6 +20242,16 @@ static void screensaver_tick(void) {
 }
 
 void ui_update_current_screen(void) {
+    seq_save_poll();
+    static bool syncFailed = false;
+    const uint8_t sync = control_pattern_sync_state();
+    if(sync == 3 && !syncFailed) {
+        ui_show_toast("Error de sincronizacion: reintentando", RED808_ERROR);
+        syncFailed = true;
+    } else if(sync == 2 && syncFailed) {
+        ui_show_toast("Patron confirmado en Daisy", RED808_SUCCESS);
+        syncFailed = false;
+    }
     unsigned long now = millis();
     static unsigned long boot_enter_ms = 0;
     ui_toast_update();
