@@ -1,4 +1,5 @@
 #include "i2c_rotaries.h"
+#include "../ui/bank_input.h"
 
 #include "../app_state.h"
 #include "../control_api.h"
@@ -263,7 +264,7 @@ bool probeRotary(uint8_t index, uint16_t& value)
     return false;
 }
 
-bool readRotary(uint8_t index, uint16_t& value)
+bool readRotary(uint8_t index, uint16_t& value, uint32_t bankEpoch)
 {
     const uint8_t address = rotaryAddress(index);
     if(!selectMuxChannel(index)) return false;
@@ -288,6 +289,7 @@ bool readRotary(uint8_t index, uint16_t& value)
             s_buttonLastAcceptedMs[index] = now;
             s_buttonPressCount.fetch_add(1, std::memory_order_release);
             s_buttonPressCounts[index].fetch_add(1, std::memory_order_release);
+            bank_input::press(index,bankEpoch);
         }
         if(acknowledged)
         {
@@ -341,6 +343,9 @@ void updateFaderLeds(uint16_t value, uint32_t now)
     const uint8_t lit = static_cast<uint8_t>(1u
         + (static_cast<uint32_t>(value) * (kFaderLedCount - 1u) + 511u)
           / 1023u);
+    static uint8_t lastLit=255;
+    s_lastFaderLedRefreshMs=now;
+    if(lit==lastLit) return;
     size_t symbol = 0;
     for(uint8_t pixel = 0; pixel < kFaderLedCount; ++pixel)
     {
@@ -358,6 +363,7 @@ void updateFaderLeds(uint16_t value, uint32_t now)
     }
     if(!rmtWrite(kFaderLedGpio, s_faderLedData, kFaderLedSymbols, 20))
         P4_LOG_PRINTLN("[Fader LED] RMT write timed out");
+    else lastLit=lit;
     s_lastFaderLedRefreshMs = now;
 }
 
@@ -667,8 +673,9 @@ void i2c_rotaries_poll()
        && static_cast<uint32_t>(now - s_lastProbeMs[index]) < kAbsentRetryMs)
         return;
 
+    const uint32_t bankEpoch = bank_input::epoch.load();
     uint16_t value = 0;
-    const bool ok = wasPresent ? readRotary(index, value)
+    const bool ok = wasPresent ? readRotary(index, value, bankEpoch)
                                : probeRotary(index, value);
     if(!ok)
     {
@@ -703,6 +710,18 @@ void i2c_rotaries_poll()
             P4_LOG_PRINTF("[I2C Rotary] #%u SEN0502 detected at 0x%02X\n",
                           index + 1u, rotaryAddress(index));
     }
+    // The LED ring and count register share one value on SEN0502. Read motion
+    // BEFORE publishing feedback; remember successful writes as the new baseline.
+    if(wasPresent && s_haveValue[index]) {
+        const int diff = int(value)-int(s_values[index].load());
+        if(diff) {
+            const int ticks = (abs(diff)+25)/51;
+            bank_input::rotate(index, (diff > 0 ? 1 : -1)*(ticks ? ticks : 1), bankEpoch);
+        }
+    }
+    uint16_t feedback = bank_input::leds[index].load();
+    if(value != feedback && writeBigEndian16(rotaryAddress(index), kCountRegister, feedback))
+        value = feedback;
     if(!s_haveValue[index]
        || s_values[index].load(std::memory_order_relaxed) != value)
     {
@@ -733,86 +752,16 @@ void i2c_rotaries_task_start()
 
 void i2c_rotaries_process()
 {
-    const auto& transport = daisyUsb.state();
-    uint8_t functions[kRotaryCount] = {};
-    const bool configValid = transport.pod.config.version == POD_CONFIG_VERSION;
-    if(configValid)
-    {
-        functions[0] = transport.pod.config.rotary1Function;
-        functions[1] = transport.pod.config.rotary2Function;
-        functions[2] = transport.pod.config.rotary3Function;
-        functions[3] = transport.pod.config.rotary4Function;
-    }
-    const uint8_t faderFunction = configValid
-        ? transport.pod.config.faderFunction : POD_FUNC_SCREEN_BRIGHTNESS;
-
-    uint8_t changed = s_changedMask.exchange(0, std::memory_order_acq_rel);
-    if(changed) ui_note_control_activity();
-    for(uint8_t i = 0; i < kRotaryCount; ++i)
-    {
-        const uint8_t previous = s_functions[i].exchange(functions[i],
-                                                          std::memory_order_acq_rel);
-        if(previous != functions[i]) changed |= static_cast<uint8_t>(1u << i);
+    // BANK owns the four encoders and fader globally. On administrative screens
+    // it consumes input without musical side effects; touch never loses ownership.
+    s_changedMask.exchange(0);
+    s_faderChanged.exchange(false);
+    s_ownedFunctionMask.store(0);
+    for(uint8_t i=0;i<kRotaryCount;++i) {
+        const uint32_t count = s_buttonPressCounts[i].load();
+        s_processedButtonPressCounts[i]=count;
     }
 
-    bool faderChanged = s_faderChanged.exchange(false,
-                                                 std::memory_order_acq_rel);
-    if(faderChanged) ui_note_control_activity();
-    if(s_faderFunction.exchange(faderFunction, std::memory_order_acq_rel)
-       != faderFunction)
-        faderChanged = true;
-
-    const uint8_t present = s_presentMask.load(std::memory_order_acquire);
-    uint64_t owned = 0;
-    for(uint8_t i = 0; i < kRotaryCount; ++i)
-    {
-        const uint8_t bit = static_cast<uint8_t>(1u << i);
-        const uint8_t function = functions[i];
-        const uint32_t buttonCount =
-            s_buttonPressCounts[i].load(std::memory_order_acquire);
-        const uint32_t presses = buttonCount
-                               - s_processedButtonPressCounts[i];
-        if(presses) ui_note_control_activity();
-        s_processedButtonPressCounts[i] = buttonCount;
-        if((present & bit) == 0 || function == POD_FUNC_NONE
-           || function >= POD_FUNC_COUNT)
-            continue;
-        // DaisyPod knobs are the highest-priority mechanical controls. Among
-        // P4 rotaries, the lowest address wins if a duplicated assignment is
-        // ever received from an older configuration.
-        if(configValid && daisyKnobOwns(transport.pod.config, function)) continue;
-        const uint64_t functionBits = functionOwnershipBits(function);
-        if((owned & functionBits) != 0) continue;
-        owned |= functionBits;
-        if(changed & bit)
-            applyPhysicalValue(function,
-                s_values[i].load(std::memory_order_acquire));
-        if(presses != 0)
-        {
-            // A press is consumed per rotary. The hardware task already
-            // debounces/acknowledges the SEN0502 latch, so unrelated rotaries
-            // can never toggle the wrong effect.
-            for(uint32_t press = 0; press < presses && press < 4u; ++press)
-                togglePhysicalFx(function,
-                    s_values[i].load(std::memory_order_acquire));
-        }
-    }
-    if(s_faderReady.load(std::memory_order_acquire)
-       && faderFunction != POD_FUNC_NONE && faderFunction < POD_FUNC_COUNT
-       && (!configValid
-           || !daisyKnobOwns(transport.pod.config, faderFunction)))
-    {
-        const uint64_t functionBits = functionOwnershipBits(faderFunction);
-        if((owned & functionBits) == 0)
-        {
-            owned |= functionBits;
-            if(faderChanged)
-                applyPhysicalValue(faderFunction,
-                    s_faderValue.load(std::memory_order_acquire));
-        }
-    }
-
-    s_ownedFunctionMask.store(owned, std::memory_order_release);
 }
 
 bool i2c_rotaries_owns_function(uint8_t function)

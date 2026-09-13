@@ -7,6 +7,10 @@
 #include "ui_theme.h"
 #include "../drivers/lvgl_port.h"
 #include "../drivers/i2c_rotaries.h"
+#include "bank_input.h"
+#include "bank_state.h"
+#include "../../../shared/bank_controller.h"
+#include "../../../shared/synth_banks.h"
 #include "../control_api.h"
 #include "../daisy_usb_transport.h"
 #include "../app_state.h"
@@ -167,19 +171,26 @@ static void pad_hit_store(int i, int x, int y, int w, int h, bool visible) {
     if (i < 0 || i >= 16) return;
     portENTER_CRITICAL(&s_pad_hit_mux);
     s_pad_hit[i].x = (int16_t)x;
-    s_pad_hit[i].y = (int16_t)y;
+    s_pad_hit[i].y = (int16_t)(y + 88); // LIVE content starts below the rotary strip.
     s_pad_hit[i].w = (int16_t)w;
     s_pad_hit[i].h = (int16_t)h;
     s_pad_hit[i].visible = visible;
     portEXIT_CRITICAL(&s_pad_hit_mux);
 }
 
+static inline uint8_t ui_live_pad_velocity(void);
 static inline void enqueue_pad_event(uint8_t pad, uint8_t velocity) {
     uint8_t h = s_pad_qh.load(std::memory_order_relaxed);
     uint8_t t = s_pad_qt.load(std::memory_order_acquire);
     if ((uint8_t)(h - t) >= 32) {
         s_pad_q_drops.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+    if(pad < 16) {
+        const auto& perf = bank_state::pads[pad];
+        if(perf.probability.load() < 100 && int(esp_random()%100) >= perf.probability.load()) return;
+        velocity=bank_state::hitVelocity(velocity,perf.velocity.load(),perf.velocityEnabled.load(),
+                                        ui_live_pad_velocity(),perf.accent.load()!=0);
     }
     s_pad_q[h & 0x1F] = (uint16_t)((velocity << 8) | pad);
     s_pad_qh.store(h + 1, std::memory_order_release);
@@ -278,8 +289,15 @@ static unsigned long ui_nr_interval_ms(void) {
 }
 
 static unsigned long ui_pad_tremolo_interval_ms(uint8_t pad, unsigned long nr_interval) {
-    if (nr_interval) return nr_interval;
     if (pad >= 16) return 0;
+    const int repeat = bank_state::pads[pad].repeat.load();
+    if(repeat > 0 && repeat < 7) {
+        int bpm_x10=p4.bpm_int*10+p4.bpm_frac;
+        if(bpm_x10<400) bpm_x10=1200;
+        if(bpm_x10>3000) bpm_x10=3000;
+        return 600000u/(unsigned(bpm_x10)*NR_SUBDIV_PER_BEAT[repeat]);
+    }
+    if (nr_interval) return nr_interval;
     uint8_t x = s_pad_hold_x[pad];
     if (x > 127) x = 127;
     return PAD_TREMOLO_SLOW_MS - (((PAD_TREMOLO_SLOW_MS - PAD_TREMOLO_FAST_MS) * (unsigned long)x) / 127UL);
@@ -3611,18 +3629,6 @@ static bool pod_function_has_physical_owner(uint8_t function) {
     for (uint8_t value : podAssigned)
         if (pod_control_functions_conflict(value, function)) return true;
 
-    const uint8_t rotaryAssigned[] = {
-        config->rotary1Function, config->rotary2Function,
-        config->rotary3Function, config->rotary4Function
-    };
-    const uint8_t rotaryMask = i2c_rotaries_detected_mask();
-    for (uint8_t index = 0; index < 4; ++index)
-        if ((rotaryMask & (1u << index))
-            && pod_control_functions_conflict(rotaryAssigned[index], function))
-            return true;
-    if (p4_fader_detected()
-        && pod_control_functions_conflict(config->faderFunction, function))
-        return true;
     return false;
 }
 
@@ -3696,7 +3702,7 @@ static uint8_t* pod_control_config_field(uint8_t row) {
 
 static bool pod_control_function_used_by_other(uint8_t row, uint8_t function) {
     if (function == POD_FUNC_NONE) return false;
-    for (uint8_t other = 0; other < POD_CONTROL_ROW_COUNT; ++other) {
+    for (uint8_t other = 0; other < 6; ++other) {
         if (other == row) continue;
         uint8_t* otherField = pod_control_config_field(other);
         if (otherField
@@ -3748,6 +3754,10 @@ static void pod_control_function_list(uint8_t row, const uint8_t*& list,
 
 static void pod_control_value_refresh(uint8_t row) {
     if (row >= POD_CONTROL_ROW_COUNT || !s_pod_control_value_labels[row]) return;
+    if(row>=6) {
+        lv_label_set_text(s_pod_control_value_labels[row],row==10 ? "BANK SELECTOR" : "BANK CONTEXT R1-R4");
+        return;
+    }
     uint8_t* field = pod_control_config_field(row);
     if (!field) return;
     const bool patternEncoder = row == 4
@@ -3820,6 +3830,9 @@ static void pod_function_select_cb(lv_event_t* e) {
 static void pod_control_modal_open_cb(lv_event_t* e) {
     const uint8_t row = static_cast<uint8_t>(
         reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    if(row>=6 && row<POD_CONTROL_ROW_COUNT) {
+        ui_show_toast("BANK: contexto > banco > R1-R4. Pulsar: ajuste fino.",RED808_INFO); return;
+    }
     if (row >= POD_CONTROL_ROW_COUNT || !s_pod_status_modal) return;
     if (s_pod_function_modal) pod_function_modal_close_cb(NULL);
     uint8_t* field = pod_control_config_field(row);
@@ -5704,11 +5717,11 @@ static void pod_status_popup_cb(lv_event_t* e) {
 // =============================================================================
 static void apply_pad_layout(int mode) {
     s_pad_mode = mode;
-    const int M = 8, G = 4, SCR_W = 1024, SCR_H = 600;
+    const int M = 8, G = 4, SCR_W = 1024, SCR_H = 512;
     int cols, count, pw, ph;
     switch (mode) {
         default:
-        case 0: cols=4; count=16; pw=122;                ph=143;                break;
+        case 0: cols=4; count=16; pw=122;                ph=121;                break;
         case 1: cols=4; count=16; pw=(SCR_W-2*M-3*G)/4;  ph=(SCR_H-2*M-3*G)/4; break;
         case 2: cols=4; count=8;  pw=(SCR_W-2*M-3*G)/4;  ph=(SCR_H-2*M-1*G)/2; break;
         case 3: cols=2; count=4;  pw=(SCR_W-2*M-1*G)/2;  ph=(SCR_H-2*M-1*G)/2; break;
@@ -6004,13 +6017,13 @@ static void create_live_screen(void) {
 
     // 8×4 full-screen grid: 1024×600
     // Left 4 cols = pads, Right 4 cols = controls
-    const int M = 8, G = 4, CG = 8, CW = 122, CH = 143;
+    const int M = 8, G = 4, CG = 8, CW = 122, CH = 121;
     #define COL_X(c) ((c) < 4 ? (M + (c)*(CW+G)) : (M + 4*(CW+G) + CG + ((c)-4)*(CW+G)))
     #define ROW_Y(r) (M + (r)*(CH+G))
 
     lv_obj_t* pads_deck = lv_obj_create(scr_live);
     lv_obj_set_pos(pads_deck, 3, 3);
-    lv_obj_set_size(pads_deck, 506, LCD_V_RES - 6);
+    lv_obj_set_size(pads_deck, 506, LCD_V_RES - 94);
     lv_obj_set_style_radius(pads_deck, 18, 0);
     lv_obj_set_style_bg_color(pads_deck, RED808_PANEL, 0);
     lv_obj_set_style_bg_opa(pads_deck, LV_OPA_30, 0);
@@ -6022,7 +6035,7 @@ static void create_live_screen(void) {
 
     lv_obj_t* control_deck = lv_obj_create(scr_live);
     lv_obj_set_pos(control_deck, 515, 3);
-    lv_obj_set_size(control_deck, LCD_H_RES - 518, LCD_V_RES - 6);
+    lv_obj_set_size(control_deck, LCD_H_RES - 518, LCD_V_RES - 94);
     lv_obj_set_style_radius(control_deck, 18, 0);
     lv_obj_set_style_bg_color(control_deck, lv_color_mix(theme_accent2(), RED808_PANEL, 235), 0);
     lv_obj_set_style_bg_opa(control_deck, LV_OPA_40, 0);
@@ -7139,11 +7152,15 @@ enum FxCardKind : uint8_t {
 };
 
 static constexpr int FX_CARD_COUNT = 18;
-static constexpr int FX_VIEW_MODE_COUNT = 4;
-// 18 cards at 3-per-page is 6 pages — bumped so the page-dot row still has
-// one dot per page in the densest-page (fewest-per-page) view mode.
-static constexpr int FX_PAGE_DOT_COUNT = 6;
-static const int fx_view_modes[FX_VIEW_MODE_COUNT] = {3, 6, 12, 18};
+static constexpr int FX_VIEW_MODE_COUNT = 3;
+static constexpr int FX_PAGE_DOT_COUNT = (FX_CARD_COUNT + 3) / 4;
+static const int fx_view_modes[FX_VIEW_MODE_COUNT] = {4, 8, 12};
+static lv_obj_t* fx_group_headers[FX_PAGE_DOT_COUNT] = {};
+static const char* fx_group_names[FX_PAGE_DOT_COUNT] = {
+    "MOD / SPACE", "CRUSH / FILTER", "COLOR", "MOD / DYNAMICS", "MORPH / REPEAT"
+};
+static int s_fx_bank_visual = 0;
+static int s_fx_bank_requested = -1;
 
 static int fx_page = 0;
 static int fx_view_mode = 0;
@@ -7382,9 +7399,7 @@ static int fx_card_neutral_u7(int cell) {
 }
 
 static void fx_card_send_value(int cell, int u7, bool transmit = true) {
-    const uint8_t ownerFunction = fx_card_owner_function(cell);
-    if (ownerFunction != POD_FUNC_NONE
-        && pod_function_has_physical_owner(ownerFunction)) return;
+    // Touch, BANK and MIDI use last-writer-wins; physical assignments do not lock the UI.
     int neutral_u7 = fx_card_neutral_u7(cell);
     if (u7 != neutral_u7) {
         s_fx_last_active_u7[cell] = (uint8_t)u7;
@@ -7642,9 +7657,7 @@ static void fx_active_header_refresh(void) {
 
 static void fx_card_turn_off(int cell) {
     if (cell < 0 || cell >= FX_CARD_COUNT) return;
-    const uint8_t ownerFunction = fx_card_owner_function(cell);
-    if (ownerFunction != POD_FUNC_NONE
-        && pod_function_has_physical_owner(ownerFunction)) return;
+    // Touch, BANK and MIDI use last-writer-wins; physical assignments do not lock the UI.
 
     if (cell <= FX_CARD_REVERB) {
         p4.enc_muted[cell] = true;
@@ -7848,33 +7861,24 @@ static void fx_apply_layout(void) {
     int start = fx_page * perPage;
     int visibleCount = constrain(FX_CARD_COUNT - start, 0, perPage);
 
-    // Grid geometry (cols/rows) and "how compact" the styling is are
-    // properties of the VIEW MODE (perPage) itself, never of how many cards
-    // happen to be left on the current page — otherwise a partially-filled
-    // last page (e.g. 18 cards in VIEW 12 leaves only 6 on page 2) would
-    // silently fall back to VIEW 3's oversized styling on an undersized
-    // slot, which is exactly what made the new FX cards "look weird" on
-    // VIEW 6/12's last page before this fix.
-    int cols, rows;
-    bool compact12, compact6;
-    switch (perPage) {
-        case 6:  cols = 3; rows = 2; compact12 = false; compact6 = true;  break;
-        case 12: cols = 4; rows = 3; compact12 = true;  compact6 = false; break;
-        case 18: cols = 6; rows = 3; compact12 = true;  compact6 = false; break;
-        default: cols = 3; rows = 1; compact12 = false; compact6 = false; break; // VIEW 3
-    }
+    // Every row is one group of four. Partial final pages retain the same
+    // geometry, including the two empty positions after the final FX pair.
+    const int cols = 4, rows = perPage / 4;
+    const bool compact12 = perPage == 12, compact6 = perPage == 8;
 
     const int topY = 96;
     const int bottomPad = 8;
     const int sidePad = 12;
     const int gap = 10;
-    int gridH = LCD_V_RES - topY - bottomPad;
+    const int groupHeaderH = 22;
+    int gridH = LCD_V_RES - 88 - topY - bottomPad;
     int cardW = (LCD_H_RES - sidePad * 2 - gap * (cols - 1)) / cols;
-    int cardH = (gridH - gap * (rows - 1)) / rows;
+    int rowH = (gridH - gap * (rows - 1)) / rows;
+    int cardH = rowH - groupHeaderH;
     int arcSize = compact12
-        ? constrain((cardW < cardH ? cardW : cardH) - 96, 60, 130)
+        ? constrain(cardH - 64, 40, 80)
         : (compact6
-            ? constrain((cardW < cardH ? cardW : cardH) - 84, 96, 190)
+            ? constrain((cardW < cardH ? cardW : cardH) - 84, 64, 160)
             : constrain((cardW < cardH ? cardW : cardH) - 72, 120, 290));
 
     const lv_font_t* titleFont = compact12 ? &lv_font_montserrat_12 : (compact6 ? &lv_font_montserrat_16 : &lv_font_montserrat_22);
@@ -7884,9 +7888,23 @@ static void fx_apply_layout(void) {
 
     int nameY = compact12 ? 4 : (compact6 ? 8 : 14);
     int srcY = compact12 ? 20 : (compact6 ? 28 : 42);
-    int centerY = compact12 ? -4 : (compact6 ? -8 : -18);
+    int centerY = compact12 ? -2 : (compact6 ? -8 : -18);
     int pctY = compact12 ? 10 : (compact6 ? 4 : -2);
 
+    for(int group=0;group<FX_PAGE_DOT_COUNT;++group) {
+        auto* header=fx_group_headers[group];
+        if(!header) continue;
+        if(group*4 < start || group*4 >= start+perPage) {
+            lv_obj_add_flag(header,LV_OBJ_FLAG_HIDDEN); continue;
+        }
+        lv_obj_clear_flag(header,LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(header,sidePad,topY+(group-start/4)*(rowH+gap));
+        lv_obj_set_size(header,LCD_H_RES-sidePad*2,groupHeaderH-2);
+        auto* label=lv_obj_get_child(header,0);
+        if(group<3) lv_label_set_text_fmt(label,"BANK %d  %s%s   |   R1  /  R2  /  R3  /  R4",group+1,fx_group_names[group],group==s_fx_bank_visual ? "  [ACTIVO]" : "");
+        else lv_label_set_text_fmt(label,"FX EXTRA  %s   |   TOUCH",fx_group_names[group]);
+        lv_obj_set_style_bg_opa(header,group==s_fx_bank_visual ? LV_OPA_40 : LV_OPA_10,0);
+    }
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         if (!fx_cards[cell]) continue;
         bool visible = (cell >= start && cell < start + visibleCount);
@@ -7899,11 +7917,12 @@ static void fx_apply_layout(void) {
         int col = local % cols;
         int row = local / cols;
         int x = sidePad + col * (cardW + gap);
-        int y = topY + row * (cardH + gap);
+        int y = topY + row * (rowH + gap) + groupHeaderH;
         lv_obj_set_pos(fx_cards[cell], x, y);
         lv_obj_set_size(fx_cards[cell], cardW, cardH);
 
         if (fx_name_labels[cell]) {
+            if(cell<12) lv_label_set_text_fmt(fx_name_labels[cell],"R%d  %s",cell%4+1,fx_names[cell]);
             lv_obj_set_width(fx_name_labels[cell], cardW);
             lv_obj_set_style_text_font(fx_name_labels[cell], titleFont, 0);
             lv_obj_align(fx_name_labels[cell], LV_ALIGN_TOP_MID, 0, nameY);
@@ -7928,7 +7947,7 @@ static void fx_apply_layout(void) {
             int toggleWidth = compact12 ? 76 : (compact6 ? 90 : 104);
             if (cell == FX_CARD_FILTER)
                 toggleWidth = compact12 ? 100 : (compact6 ? 112 : 126);
-            lv_obj_set_size(fx_toggle_btns[cell], toggleWidth, compact12 ? 32 : (compact6 ? 38 : 42));
+            lv_obj_set_size(fx_toggle_btns[cell], toggleWidth, compact12 ? 24 : (compact6 ? 32 : 42));
             lv_obj_align(fx_toggle_btns[cell], LV_ALIGN_BOTTOM_MID, 0, compact12 ? -6 : (compact6 ? -10 : -14));
             lv_obj_t* lbl = lv_obj_get_child(fx_toggle_btns[cell], 0);
             if (lbl) lv_obj_set_style_text_font(lbl, toggleFont, 0);
@@ -7939,12 +7958,11 @@ static void fx_apply_layout(void) {
             else lv_obj_clear_flag(fx_pct_labels[cell], LV_OBJ_FLAG_HIDDEN);
         }
 
-        // LED/BAR alt visualizations — sit just under the source tag,
-        // independent of arcSize so they stay legible even in VIEW 18's
-        // tiny cards. Visibility (which of ARC/LED/BAR shows) is handled
+        // LED/BAR meters fit above the value even in the compact VIEW 12.
+        // Visibility (which of ARC/LED/BAR shows) is handled
         // separately by fx_apply_viz_style(); this only sizes/positions.
         {
-            int meterY = srcY + 16;
+            int meterY = compact12 ? 24 : srcY + 16;
             int meterH = compact12 ? 10 : (compact6 ? 14 : 18);
             int meterX = compact12 ? 6 : 14;
             int meterW = cardW - meterX * 2;
@@ -8013,9 +8031,7 @@ static void fx_toggle_cb(lv_event_t* e) {
         fx_all_turn_off();
         return;
     }
-    const uint8_t ownerFunction = fx_card_owner_function(cell);
-    if (ownerFunction != POD_FUNC_NONE
-        && pod_function_has_physical_owner(ownerFunction)) return;
+    // Touch, BANK and MIDI use last-writer-wins; physical assignments do not lock the UI.
     if (fx_card_has_onoff(cell)) {
         if (cell < 3) {
             bool unmuting = p4.enc_muted[cell];
@@ -8129,13 +8145,16 @@ static void fx_page_cb(lv_event_t* e) {
     int dir = (int)(intptr_t)lv_event_get_user_data(e);
     int pages = fx_page_count();
     fx_page = (fx_page + dir + pages) % pages;
+    int group=fx_page*fx_view_modes[fx_view_mode]/4;
+    if(group<3) s_fx_bank_requested=group;
     fx_apply_layout();
 }
 
 static void fx_view_cb(lv_event_t* e) {
     LV_UNUSED(e);
+    int firstCell=fx_page*fx_view_modes[fx_view_mode];
     fx_view_mode = (fx_view_mode + 1) % FX_VIEW_MODE_COUNT;
-    fx_page = 0;
+    fx_page = firstCell/fx_view_modes[fx_view_mode];
     fx_apply_layout();
 }
 
@@ -8565,6 +8584,22 @@ static void create_fx_screen(void) {
     lv_obj_set_style_text_font(s_fx_viz_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(s_fx_viz_lbl);
 
+    for(int group=0;group<FX_PAGE_DOT_COUNT;++group) {
+        auto* header=lv_btn_create(scr_fx); fx_group_headers[group]=header;
+        lv_obj_set_style_pad_all(header,0,0);
+        lv_obj_set_style_radius(header,4,0);
+        lv_obj_set_style_bg_color(header,RED808_CYAN,0);
+        lv_obj_set_style_border_width(header,0,0);
+        lv_obj_set_style_shadow_width(header,0,0);
+        auto* label=lv_label_create(header);
+        lv_obj_set_style_text_font(label,&lv_font_montserrat_12,0);
+        lv_obj_align(label,LV_ALIGN_LEFT_MID,8,0);
+        lv_obj_add_event_cb(header,[](lv_event_t* e) {
+            int group=int(intptr_t(lv_event_get_user_data(e)));
+            if(group<3) s_fx_bank_requested=group;
+        },LV_EVENT_CLICKED,(void*)(intptr_t)group);
+    }
+
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         // Card container
         lv_obj_t* card = lv_obj_create(scr_fx);
@@ -8784,7 +8819,7 @@ static void create_fx_screen(void) {
     apply_control_button_style(fx_view_btn, RED808_WARNING, false, 8);
     lv_obj_add_event_cb(fx_view_btn, fx_view_cb, LV_EVENT_CLICKED, NULL);
     fx_view_lbl = lv_label_create(fx_view_btn);
-    lv_label_set_text(fx_view_lbl, "VIEW 3");
+    lv_label_set_text(fx_view_lbl, "VIEW 4");
     lv_obj_set_style_text_font(fx_view_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(fx_view_lbl);
 
@@ -12251,6 +12286,7 @@ static void xtra_editor_open(int slot_idx) {
 static void vol_slider_cb(lv_event_t* e) {
     int trk = (int)(intptr_t)lv_event_get_user_data(e);
     if (trk < 0 || trk >= 16) return;
+    s_pad_inst_focus_pad = uint8_t(trk);
     lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
     int val = lv_slider_get_value(slider);
     p4.track_volume[trk] = val;
@@ -12681,7 +12717,7 @@ static void create_volumes_screen(void) {
 
     // Layout in actual LVGL canvas coordinates (landscape 1024×600)
     const int LW = LCD_H_RES;   // 1024 — full display width
-    const int LH = LCD_V_RES;   // 600  — full display height
+    const int LH = LCD_V_RES - 88; // reserve BANK dock
 
     lv_obj_t* title = lv_label_create(scr_volumes);
     lv_label_set_text(title, LV_SYMBOL_VOLUME_MAX "  MIXER");
@@ -17863,7 +17899,7 @@ static void matrix_modal_show(lv_event_t* e) {
 
 static void create_piano_screen(void) {
     int W = ui_layout_w();
-    int H = ui_layout_h();
+    int H = ui_layout_h() - 88;
     scr_piano = lv_obj_create(NULL);
     apply_screen_theme_bg(scr_piano);
     lv_obj_clear_flag(scr_piano, LV_OBJ_FLAG_SCROLLABLE);
@@ -18141,6 +18177,7 @@ static void create_piano_screen(void) {
 #define PP_GRID_ROWS_P4   7
 #define PP_MAX_PARAMS_P4  21
 
+static bool s_pp_initialized[SP_ENGINE_COUNT] = {};
 static int       s_pp_engine_idx = 0;
 static int       s_pp_preset_idx[SP_ENGINE_COUNT] = { -1 };
 static float     s_pp_values[SP_ENGINE_COUNT][PP_MAX_PARAMS_P4] = {};
@@ -18303,6 +18340,7 @@ static void pp_format_value(char* buf, size_t bufsz, const SynthParamDef* p, flo
 }
 
 static void pp_init_engine_defaults(int eng_idx) {
+    s_pp_initialized[eng_idx]=true;
     const SynthEngineDef* eng = &SP_ENGINES[eng_idx];
     for (uint8_t i = 0; i < eng->param_count && i < PP_MAX_PARAMS_P4; i++) {
         s_pp_values[eng_idx][i] = eng->params[i].vdef;
@@ -18601,7 +18639,7 @@ static void pp_rebuild_param_grid(void) {
     // Use the screen geometry directly — lv_obj_get_width() can return 0 when
     // called before LVGL has laid out the panel after creation.
     int W = ui_layout_w();
-    int H = ui_layout_h();
+    int H = ui_layout_h() - 88;
     int panel_w = W - 24;
     int panel_h = H - 152 - 12;
 
@@ -18867,10 +18905,10 @@ static void xtra_timing_edit_cb(lv_event_t* e) {
 
 static void create_piano_params_screen(void) {
     int W = ui_layout_w();
-    int H = ui_layout_h();
+    int H = ui_layout_h() - 88;
 
     for (int e = 0; e < SP_ENGINE_COUNT; e++) {
-        pp_init_engine_defaults(e);
+        if(!s_pp_initialized[e]) pp_init_engine_defaults(e);
     }
 
     scr_piano_params = lv_obj_create(NULL);
@@ -18984,7 +19022,8 @@ static void create_piano_params_screen(void) {
     lv_obj_set_style_border_color(s_pp_param_panel, RED808_BORDER, 0);
     lv_obj_set_style_border_width(s_pp_param_panel, 1, 0);
     lv_obj_set_style_pad_all(s_pp_param_panel, 0, 0);
-    lv_obj_clear_flag(s_pp_param_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_pp_param_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_pp_param_panel, LV_DIR_VER);
 
     pp_refresh_view();
 }
@@ -19316,7 +19355,8 @@ static void ui_reload_themed_screens(void) {
         fx_pct_labels[i] = NULL;
         fx_midi_badges[i] = NULL;
     }
-    for (int i = 0; i < FX_PAGE_DOT_COUNT; i++) fx_page_dot[i] = NULL;
+    for (int i = 0; i < FX_PAGE_DOT_COUNT; i++) { fx_page_dot[i] = NULL; fx_group_headers[i]=NULL; }
+    s_fx_bank_requested=-1;
     fx_page_lbl = NULL;
     fx_view_btn = NULL;
     fx_view_lbl = NULL;
@@ -19679,8 +19719,13 @@ void ui_process_pad_queue(void) {
                     uint8_t gate = s_piano_gate_percent.load(std::memory_order_relaxed);
                     uint32_t gate_ms = (uint32_t)((uint64_t)sixteenth_ms * gate / 100U);
                     gate_ms = (uint32_t)constrain((int)gate_ms, 55, 420);
+                    if(bank_state::pads[pad].gate.load()>0) gate_ms=bank_state::pads[pad].gate.load();
                     s_pad_noteoff_engine[pad] = engine;
                     s_pad_noteoff_at[pad]     = now_ms + gate_ms;
+                } else {
+                    const int gate=bank_state::pads[pad].gate.load();
+                    s_pad_noteoff_engine[pad]=-2;
+                    s_pad_noteoff_at[pad]=engine<0 && gate>0 ? now_ms+gate : 0;
                 }
             }
         }
@@ -19698,7 +19743,8 @@ void ui_process_pad_queue(void) {
         s_pad_noteoff_at[pad]     = 0;
         s_pad_noteoff_engine[pad] = -1;
         if (!p4.master_connected) continue;
-        if (engine == 3) {
+        if(engine==-2) { daisyUsb.sendU8(CMD_TRIGGER_STOP,uint8_t(pad)); }
+        else if (engine == 3) {
             // 303 is a single-voice mono synth on master
             control_send_synth303_note_off();
         } else if (engine >= 0 && engine <= 7) {
@@ -20241,6 +20287,8 @@ static void screensaver_tick(void) {
     }
 }
 
+#include "ui_bank_contexts.inc"
+
 void ui_update_current_screen(void) {
     seq_save_poll();
     static bool syncFailed = false;
@@ -20527,6 +20575,8 @@ void ui_update_current_screen(void) {
         && daisyUsb.state().daisy_sd_revision != sd_daisy_seen_revision) {
         p4sd.needs_refresh.store(true, std::memory_order_release);
     }
+
+    bank_tick();
 
     // Per-screen pacing. LIVE and STEPS need 60Hz for pad fades/playhead.
     // Static editors do not: most interaction is handled by event callbacks.

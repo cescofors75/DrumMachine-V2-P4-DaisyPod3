@@ -2,6 +2,26 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
+			"label": "DrumMachineV2- Monitor P4",
+			"type": "process",
+			"command": "${env:USERPROFILE}/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"device", "monitor",
+				"--project-dir", "${workspaceFolder}/P4",
+				"--environment", "esp32p4-upload"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/P4"
+			},
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated",
+				"clear": true,
+				"focus": true
+			}
+		},
+		{
 			"label": "DrumMachineV2- Flash P4",
 			"type": "shell",
 			"command": "powershell.exe",

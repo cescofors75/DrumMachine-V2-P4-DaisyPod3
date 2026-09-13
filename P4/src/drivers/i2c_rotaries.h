@@ -3,8 +3,8 @@
 #include <stdint.h>
 
 // Four DFRobot SEN0502 rotaries and one direct-ADC M5Stack fader. Hardware
-// polling uses a dedicated Wire1 task;
-// process() applies changes from Arduino loop().
+// polling uses a dedicated Wire1 task; process() forwards button events.
+// The LVGL BANK controller consumes relative input and applies musical changes.
 void i2c_rotaries_init();
 void i2c_rotaries_task_start();
 void i2c_rotaries_poll();

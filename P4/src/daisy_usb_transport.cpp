@@ -1,3 +1,5 @@
+#include "ui/bank_state.h"
+#include "../../shared/synth_params.h"
 #include "daisy_usb_transport.h"
 #include "../../shared/pattern_transfer.h"
 
@@ -53,6 +55,7 @@ void DaisyUsbTransport::begin()
 bool DaisyUsbTransport::send(uint8_t command, const void* payload,
                              uint16_t payload_length)
 {
+    bank_state::observe(command,payload,payload_length);
     return sendPacket(command, payload, payload_length, nullptr);
 }
 
@@ -295,6 +298,7 @@ void DaisyUsbTransport::synthNoteOff(uint8_t engine, uint8_t track, uint8_t note
 void DaisyUsbTransport::synthParam(uint8_t engine, uint8_t instrument,
                                    uint8_t parameter, float value)
 {
+    bank_state::param(engine, parameter, value);
     uint8_t payload[7] = {engine, instrument, parameter, 0, 0, 0, 0};
     memcpy(payload + 3, &value, sizeof(value));
     send(CMD_SYNTH_PARAM, payload, sizeof(payload));
@@ -302,6 +306,11 @@ void DaisyUsbTransport::synthParam(uint8_t engine, uint8_t instrument,
 
 void DaisyUsbTransport::synthPreset(uint8_t engine, uint8_t preset)
 {
+    if(engine >= 3 && engine <= 6) {
+        const auto& e = SP_ENGINES[engine-3];
+        if(preset < e.preset_count) for(uint8_t i=0;i<e.presets[preset].count;++i)
+            bank_state::param(engine,e.presets[preset].values[i].param_id,e.presets[preset].values[i].value);
+    }
     const uint8_t payload[2] = {engine, preset};
     send(CMD_SYNTH_PRESET, payload, sizeof(payload));
 }

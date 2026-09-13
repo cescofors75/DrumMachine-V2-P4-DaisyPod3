@@ -23,5 +23,12 @@ with compilers that define NDEBUG in optimized builds.
   Also tests migration of existing V1 files. This does not simulate a damaged
   SPIFFS partition or flash-controller failure.
 
+- `bank_controller_regression.cpp`: production BANK controller and hardware
+  mailbox; fader hysteresis/debounce, context recall, touch override, relative
+  edits, bounds, fine/log modes, protected actions and complete synth mapping.
+- `bank_state_regression.cpp`: production wire observer; packed/truncated
+  payloads, invalid floats, signed values, FX reset, round-trip of every send
+  and bitcrush detent, and preservation of default LIVE velocity dynamics.
+
 These are host tests, not measurements of real-time CPU load, touch response,
 USB latency or power-loss behavior of the physical filesystem.

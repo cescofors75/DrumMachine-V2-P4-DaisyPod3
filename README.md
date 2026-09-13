@@ -5,6 +5,9 @@ Proyecto nuevo de batería y sintetizador dividido en dos firmwares:
 - `P4`: interfaz completa, secuenciador, patrones, MIDI y host USB.
 - `DaisyPod3`: motor de audio RED808 de 64 MB, sintetizadores, sampler, efectos y todos los controles físicos del Daisy Pod.
 
+La capa [BANK4](BANK4_IMPLEMENTACION.md) añade cuatro rotary contextuales y
+selección de banco con fader en P4, manteniendo el acceso táctil.
+
 El único enlace de control entre placas es un cable USB-C de datos:
 
 La versión de protocolo actual es **2.4**: actualizar ambos firmwares juntos.
