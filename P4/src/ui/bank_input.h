@@ -31,6 +31,18 @@ inline int take(uint8_t i) {
     const uint64_t v=deltas[i].exchange(0);
     return uint32_t(v>>32)==epoch.load() ? int32_t(v) : 0;
 }
+// Drain selectors one detent per UI frame without discarding the remainder.
+inline int takeStep(uint8_t i) {
+    uint64_t old=deltas[i].load();
+    while(uint32_t(old>>32)==epoch.load()) {
+        const int count=int32_t(old);
+        if(!count) return 0;
+        const int step=count>0 ? 1 : -1;
+        const uint64_t next=(old & 0xffffffff00000000ULL) | uint32_t(count-step);
+        if(deltas[i].compare_exchange_weak(old,next)) return step;
+    }
+    return 0;
+}
 inline int takePress(uint8_t i) {
     const uint64_t v=presses[i].exchange(0);
     return uint32_t(v>>32)==epoch.load() ? int32_t(v) : 0;

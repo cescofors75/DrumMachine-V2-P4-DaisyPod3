@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "master/protocol.h"
+#include "pod_button_events.h"
 #include "../../shared/pattern_transfer.h"
 
 class DaisyUsbTransport
@@ -52,6 +53,8 @@ class DaisyUsbTransport
         uint8_t daisy_sd_file_count;
         char daisy_sd_files[20][32];
         uint32_t daisy_sd_revision;
+        uint32_t daisy_sd_files_revision;
+        uint16_t daisy_sd_files_sequence;
         PodStatePayload pod;
         uint32_t pod_revision;
         // From StatusResponse (CMD_GET_STATUS) — already sent periodically
@@ -60,10 +63,14 @@ class DaisyUsbTransport
         uint8_t daisy_cpu_load_pct;
         uint8_t daisy_cpu_avg_pct;
         uint8_t daisy_cpu_peak_pct;
+        uint32_t daisy_audio_deadline_trips;
+        bool daisy_audio_fx_shed;
+        bool daisy_audio_diagnostics_seen;
         uint32_t daisy_sdram_used_bytes;
     };
 
     void begin();
+    bool requestFileList(const char* folder, uint16_t& sequence);
     void process();
 
     bool send(uint8_t command, const void* payload = nullptr,
@@ -120,6 +127,7 @@ class DaisyUsbTransport
     bool patternAckAccepted() const { return pattern_ack_.accepted; }
     bool connected() const { return state_.engine_responding; }
     const TransportState& state() const { return state_; }
+    uint32_t takePodButtonPresses(unsigned button) { return pod_button_events_.take(button); }
     uint32_t sampleEndAckRevision() const
     {
         return sample_end_ack_revision_.load(std::memory_order_acquire);
@@ -163,6 +171,7 @@ class DaisyUsbTransport
     std::atomic<uint8_t> sample_end_ack_pad_{0xFFu};
     std::atomic<bool> sample_end_ack_accepted_{false};
     PatternAckTracker pattern_ack_;
+    PodButtonEvents pod_button_events_;
     TransportState state_ = {};
 };
 

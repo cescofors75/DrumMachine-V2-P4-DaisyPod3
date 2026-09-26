@@ -147,6 +147,15 @@
 #define DAISYPOD_USB_VID 0x0483
 #define DAISYPOD_USB_PID 0x5740
 
+// DIN MIDI shield on P4 UART1. Assign only after verifying the board wiring
+// and 3.3 V logic levels. -1 leaves the UART disabled (no guessed GPIOs).
+#ifndef P4_MIDI_RX_GPIO
+#define P4_MIDI_RX_GPIO -1
+#endif
+#ifndef P4_MIDI_TX_GPIO
+#define P4_MIDI_TX_GPIO -1
+#endif
+
 // =============================================================================
 // SEQUENCER (mirror of S3 constants for UI rendering)
 // =============================================================================

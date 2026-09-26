@@ -7,10 +7,14 @@
 #include "ui_theme.h"
 #include "../drivers/lvgl_port.h"
 #include "../drivers/i2c_rotaries.h"
+#include "../drivers/display_init.h"
 #include "bank_input.h"
 #include "bank_state.h"
+namespace { static void bank_home_mount(lv_obj_t* home); static void bank_toggle_indicator(); }
 #include "../../../shared/bank_controller.h"
 #include "../../../shared/synth_banks.h"
+#include "../../../shared/sequence_group_variations.h"
+#include "../../../shared/fx_rotary_selection.h"
 #include "../control_api.h"
 #include "../daisy_usb_transport.h"
 #include "../app_state.h"
@@ -65,6 +69,11 @@ static std::atomic<bool>     s_ctrl_solo_mask_pending{false};
 static std::atomic<uint16_t> s_ctrl_solo_mask{0};
 static std::atomic<bool>     s_ctrl_pattern_sync_pending{false};
 static std::atomic<int8_t>   s_ctrl_pattern_step_pending{0};
+static std::atomic<int> s_ctrl_pattern_target_pending{-1};
+static std::atomic<int> s_ctrl_group_variation[4]{{-1},{-1},{-1},{-1}};
+static std::atomic<int> s_ui_group_variation_changed{-1};
+static std::atomic<int> s_ctrl_evolve_values[4]{{-1},{-1},{-1},{-1}};
+static std::atomic<bool> s_ctrl_evolve_step{false};
 
 // ── UI work requested FROM the control task (Core 1) ──
 // LVGL is not thread-safe and only the LVGL task (Core 0) may touch
@@ -171,7 +180,7 @@ static void pad_hit_store(int i, int x, int y, int w, int h, bool visible) {
     if (i < 0 || i >= 16) return;
     portENTER_CRITICAL(&s_pad_hit_mux);
     s_pad_hit[i].x = (int16_t)x;
-    s_pad_hit[i].y = (int16_t)(y + 88); // LIVE content starts below the rotary strip.
+    s_pad_hit[i].y = (int16_t)y;
     s_pad_hit[i].w = (int16_t)w;
     s_pad_hit[i].h = (int16_t)h;
     s_pad_hit[i].visible = visible;
@@ -944,6 +953,9 @@ static lv_obj_t*  s_pad_fx_bits_lbl = NULL;
 static lv_obj_t*  s_pad_fx_rvb_lbl = NULL;
 static lv_obj_t*  s_pad_fx_dly_lbl = NULL;
 static lv_obj_t*  s_pad_fx_subtitle_lbl = NULL;
+static lv_obj_t* s_pad_fx_type_slider=nullptr,*s_pad_fx_type_lbl=nullptr;
+static lv_obj_t* s_pad_fx_mod_slider=nullptr,*s_pad_fx_mod_lbl=nullptr;
+static int s_pad_fx_bank_requested=-1;
 static uint8_t    s_pad_fx_focus_pad = 0;
 
 // STATUS is a hub (s_pod_status_modal) with two full-screen sub-pages
@@ -1105,6 +1117,14 @@ static uint8_t s_pad_inst_sel[16] = {0};
 // Selección pendiente del modal PAD SOUND — no se aplica al master hasta
 // pulsar PREVIEW (suena) o ASIGNAR (suena y cierra).
 static uint8_t s_pad_inst_pending[16] = {0};
+static bool s_pad_sound_manual=false;
+static uint8_t s_pad_sound_preset[16]={},s_pad_sound_character[16]={};
+static uint8_t s_pad_sound_character_applied[16]={};
+static int s_pad_sound_volume[16]={};
+static bool s_pad_sound_preset_dirty[16]={},s_pad_sound_character_dirty[16]={};
+static lv_obj_t* s_pad_sound_readouts[4]={};
+static lv_obj_t* s_pad_sound_mode_label=nullptr;
+static void pad_sound_apply_draft(uint8_t pad);
 // Kit (preset 0..4) por pad. Solo aplica cuando el instrumento del pad es un
 // drum engine (808/909/505). El "pending" es lo que el usuario marca en el
 // modal antes de PREVIEW/ASIGNAR; el "assigned" es lo confirmado por pad.
@@ -2075,13 +2095,15 @@ static void xtra_pages_poll(void) {
     ui_show_toast(toast, RED808_SUCCESS);
 }
 
+#include "ui_xtra_directories.inc"
+
 static void xtra_page_prev_cb(lv_event_t* e) { LV_UNUSED(e); xtra_page_go(-1); }
 static void xtra_page_next_cb(lv_event_t* e) { LV_UNUSED(e); xtra_page_go(1); }
 static void xtra_page_rescan_cb(lv_event_t* e) {
     LV_UNUSED(e);
     ui_show_toast("Buscando carpetas en /data/xtra...", RED808_CYAN);
     s_xtra_scan_toast_on_done = true;
-    xtra_pages_request_folders();
+    xtra_directories_start();
 }
 
 static void xtra_refresh_panel(void) {
@@ -2117,7 +2139,7 @@ static void xtra_refresh_panel(void) {
         // xtra_apply_visual_state(false) so a released pad lands on the
         // exact same style as a freshly refreshed one.
         xtra_apply_visual_state(i, false, 0, 0);
-        if (grid_xtra_slot_lbls[i]) lv_label_set_text_fmt(grid_xtra_slot_lbls[i], "S%02d", i + 1);
+        if (grid_xtra_slot_lbls[i]) lv_label_set_text_fmt(grid_xtra_slot_lbls[i], "R%d %s", i + 1,XTRA_DIRECTORY_LABELS[i]);
         if (grid_xtra_change_btns[i]) {
             lv_obj_set_style_border_color(grid_xtra_change_btns[i], accent, 0);
             lv_obj_t* lbl = lv_obj_get_child(grid_xtra_change_btns[i], 0);
@@ -2546,6 +2568,8 @@ static void pad_inst_modal_close_cb(lv_event_t* e) {
     if (s_pad_inst_modal) {
         lv_obj_del(s_pad_inst_modal);
         s_pad_inst_modal = NULL;
+        for(auto& label:s_pad_sound_readouts) label=nullptr;
+        s_pad_sound_mode_label=nullptr;
         s_pad_inst_modal_pad_lbl = NULL;
         s_pad_inst_modal_inst_lbl = NULL;
         for (int i = 0; i < 16; i++) s_pad_inst_modal_pad_btns[i] = NULL;
@@ -2566,9 +2590,8 @@ static void pad_inst_modal_pick_pad_cb(lv_event_t* e) {
     int pad = (int)(intptr_t)lv_event_get_user_data(e);
     if (pad < 0 || pad > 15) return;
     s_pad_inst_focus_pad = (uint8_t)pad;
-    // Al cambiar de pad, descarta pendiente del anterior y empieza con
-    // la asignación actual del nuevo.
-    s_pad_inst_pending[pad] = s_pad_inst_sel[pad];
+    // Keep each pad's draft while navigating the grid.
+    if(s_pad_sound_manual) pad_sound_apply_draft(pad);
     pad_inst_refresh_controls();
     pad_inst_modal_refresh();
 }
@@ -2692,6 +2715,7 @@ static bool pad_inst_commit_pending(uint8_t pad) {
             changed = true;
         }
     }
+    pad_sound_apply_draft(pad);
     // Cambio de instrumento (engine asignado al pad)
     if (s_pad_inst_sel[pad] != inst) {
         s_pad_inst_sel[pad] = inst;
@@ -2779,319 +2803,8 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
         return;
     }
 
-    // Inicializa la selección pendiente con la asignación actual de cada pad
-    for (int i = 0; i < 16; i++) {
-        s_pad_inst_pending[i] = s_pad_inst_sel[i];
-        s_pad_kit_pending[i]  = s_pad_kit_assigned[i];
-    }
+    #include "ui_pad_sound_layout.inc"
 
-    // Fullscreen solid background + corner back button, same convention as
-    // STATUS/MATRIX, instead of the old dim-backdrop-behind-a-floating-card
-    // look. "card" keeps its original local padding/coordinate system (14px
-    // pad, same origin) so every position below stays unchanged — it just
-    // fills nearly the whole screen now instead of a small centered panel.
-    s_pad_inst_modal = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(s_pad_inst_modal, LV_HOR_RES, LV_VER_RES);
-    lv_obj_set_style_bg_color(s_pad_inst_modal, RED808_BG, 0);
-    lv_obj_set_style_bg_opa(s_pad_inst_modal, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_pad_inst_modal, 0, 0);
-    lv_obj_set_style_pad_all(s_pad_inst_modal, 0, 0);
-    lv_obj_clear_flag(s_pad_inst_modal, LV_OBJ_FLAG_SCROLLABLE);
-    pod_overlay_back_button(s_pad_inst_modal, pad_inst_modal_close_cb);
-
-    lv_obj_t* card = lv_obj_create(s_pad_inst_modal);
-    lv_obj_set_size(card, 1000, 580);
-    lv_obj_set_pos(card, 12, 10);
-    lv_obj_set_style_bg_opa(card, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(card, 0, 0);
-    lv_obj_set_style_pad_all(card, 14, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t* title = lv_label_create(card);
-    lv_label_set_text(title, "PAD SOUND");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
-
-    lv_obj_t* sub = lv_label_create(card);
-    lv_label_set_text(sub, "Seleccion directa por instrumento");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sub, RED808_TEXT_DIM, 0);
-    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 32);
-
-    // Current-selection summary as one highlighted chip instead of two plain
-    // stacked labels — the single most-referenced piece of state on this
-    // screen (which pad, what it currently plays) now reads at a glance
-    // instead of blending into the rest of the title area.
-    lv_obj_t* sel_chip = lv_obj_create(card);
-    lv_obj_set_size(sel_chip, 420, 52);
-    lv_obj_align(sel_chip, LV_ALIGN_TOP_MID, 0, 56);
-    lv_obj_set_style_bg_color(sel_chip, RED808_SURFACE, 0);
-    lv_obj_set_style_bg_opa(sel_chip, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(sel_chip, 1, 0);
-    lv_obj_set_style_border_color(sel_chip, RED808_BORDER, 0);
-    lv_obj_set_style_radius(sel_chip, 12, 0);
-    lv_obj_clear_flag(sel_chip, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_pad_inst_modal_pad_lbl = lv_label_create(sel_chip);
-    lv_obj_set_style_text_font(s_pad_inst_modal_pad_lbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(s_pad_inst_modal_pad_lbl, RED808_ACCENT, 0);
-    lv_obj_align(s_pad_inst_modal_pad_lbl, LV_ALIGN_LEFT_MID, 14, 0);
-
-    s_pad_inst_modal_inst_lbl = lv_label_create(sel_chip);
-    lv_obj_set_style_text_font(s_pad_inst_modal_inst_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_pad_inst_modal_inst_lbl, RED808_TEXT, 0);
-    lv_obj_align(s_pad_inst_modal_inst_lbl, LV_ALIGN_RIGHT_MID, -14, 0);
-
-    // Two grouping panels (PAD on the left, INSTRUMENT+DRUM KITS together on
-    // the right, since they sit back-to-back with no real gap between them)
-    // behind the existing grids below — created first so they render behind
-    // every button, without moving a single one of those buttons' original
-    // coordinates. This is what turns "controls scattered on a blank
-    // background" into something that reads as distinct sections.
-    lv_obj_t* pad_panel = lv_obj_create(card);
-    lv_obj_set_size(pad_panel, 308, 220);
-    lv_obj_set_pos(pad_panel, 18, 100);
-    lv_obj_set_style_bg_color(pad_panel, RED808_SURFACE, 0);
-    lv_obj_set_style_bg_opa(pad_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(pad_panel, 1, 0);
-    lv_obj_set_style_border_color(pad_panel, RED808_BORDER, 0);
-    lv_obj_set_style_radius(pad_panel, 14, 0);
-    lv_obj_clear_flag(pad_panel, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t* inst_panel = lv_obj_create(card);
-    lv_obj_set_size(inst_panel, 646, 300);
-    lv_obj_set_pos(inst_panel, 336, 100);
-    lv_obj_set_style_bg_color(inst_panel, RED808_SURFACE, 0);
-    lv_obj_set_style_bg_opa(inst_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(inst_panel, 1, 0);
-    lv_obj_set_style_border_color(inst_panel, RED808_BORDER, 0);
-    lv_obj_set_style_radius(inst_panel, 14, 0);
-    lv_obj_clear_flag(inst_panel, LV_OBJ_FLAG_SCROLLABLE);
-
-    const int pad_grid_x0 = 32;
-    const int pad_grid_y0 = 138;
-    const int pad_btn_w = 64;
-    const int pad_btn_h = 34;
-    const int pad_gap_x = 10;
-    const int pad_gap_y = 10;
-    for (int i = 0; i < 16; i++) {
-        lv_obj_t* pb = lv_btn_create(card);
-        s_pad_inst_modal_pad_btns[i] = pb;
-        int col = i % 4;
-        int row = i / 4;
-        lv_obj_set_size(pb, pad_btn_w, pad_btn_h);
-        lv_obj_set_pos(pb, pad_grid_x0 + col * (pad_btn_w + pad_gap_x), pad_grid_y0 + row * (pad_btn_h + pad_gap_y));
-        apply_control_button_style(pb, RED808_BORDER, false, 8);
-        // Franja de color a la izquierda con el mismo track-color que usa el
-        // pad en la pantalla LIVE, para reconocer el pad de un vistazo.
-        lv_obj_t* strip = lv_obj_create(pb);
-        lv_obj_set_size(strip, 4, pad_btn_h);
-        lv_obj_set_pos(strip, 0, 0);
-        lv_obj_set_style_bg_color(strip, ui_track_color(i), 0);
-        lv_obj_set_style_bg_opa(strip, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(strip, 0, 0);
-        lv_obj_set_style_radius(strip, 0, 0);
-        lv_obj_clear_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(strip, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_t* pl = lv_label_create(pb);
-        lv_label_set_text_fmt(pl, "%02d", i + 1);
-        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
-        lv_obj_center(pl);
-        lv_obj_add_event_cb(pb, pad_inst_modal_pick_pad_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-    }
-
-    lv_obj_t* pad_hdr = lv_label_create(card);
-    lv_label_set_text(pad_hdr, "PAD");
-    lv_obj_set_style_text_font(pad_hdr, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(pad_hdr, RED808_TEXT_DIM, 0);
-    lv_obj_set_pos(pad_hdr, pad_grid_x0, pad_grid_y0 - 20);
-
-    const int grid_x0 = 350;
-    const int grid_y0 = 138;
-    const int grid_cols = 4;
-    const int btn_w = 116;
-    const int btn_h = 46;
-    const int gap_x = 10;
-    const int gap_y = 10;
-
-    lv_obj_t* inst_hdr = lv_label_create(card);
-    lv_label_set_text(inst_hdr, "INSTRUMENT");
-    lv_obj_set_style_text_font(inst_hdr, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(inst_hdr, RED808_TEXT_DIM, 0);
-    lv_obj_set_pos(inst_hdr, grid_x0, grid_y0 - 20);
-
-    // Fila 0 (Sampler/808/909/505) = "SAMPLE + DRUM", fila 1 (303/WT/FM2/SH101)
-    // = "MELODICO". La franja de color a la izquierda de cada botón hace
-    // visible esa agrupación de un vistazo, pero el nombre solo ("MELODIC")
-    // no explicaba la diferencia real: un pad SAMPLE+DRUM siempre dispara el
-    // mismo sonido, un pad MELODICO cambia de nota segun lo que toques (via
-    // MIDI/MPD218 o la propia rejilla) porque lleva un motor de sintesis en
-    // vez de un one-shot. La segunda linea deja eso claro sin abrir nada mas.
-    // No 'static' on the colors: RED808_ACCENT2/CYAN resolve the active theme
-    // at call time, and a static local would freeze on whatever theme was
-    // active the first time this modal opened.
-    const lv_color_t inst_row_colors[2] = { RED808_ACCENT2, RED808_CYAN };
-    static const char* inst_row_names[2] = {
-        "SAMPLE + DRUM\nsonido fijo", "MELODICO\ncambia con la nota"
-    };
-    for (int row = 0; row < 2; row++) {
-        lv_obj_t* rl = lv_label_create(card);
-        lv_label_set_text(rl, inst_row_names[row]);
-        lv_obj_set_width(rl, 118);
-        lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(rl, inst_row_colors[row], 0);
-        lv_obj_set_pos(rl, grid_x0 + grid_cols * (btn_w + gap_x) + 6,
-                        grid_y0 + row * (btn_h + gap_y) + btn_h / 2 - 14);
-    }
-
-    for (int i = 0; i < 8; i++) {
-        lv_obj_t* ib = lv_btn_create(card);
-        s_pad_inst_modal_inst_btns[i] = ib;
-        int col = i % grid_cols;
-        int row = i / grid_cols;
-        lv_obj_set_size(ib, btn_w, btn_h);
-        lv_obj_set_pos(ib, grid_x0 + col * (btn_w + gap_x), grid_y0 + row * (btn_h + gap_y));
-        apply_control_button_style(ib, RED808_BORDER, false, 10);
-        lv_obj_t* strip = lv_obj_create(ib);
-        lv_obj_set_size(strip, 4, btn_h);
-        lv_obj_set_pos(strip, 0, 0);
-        lv_obj_set_style_bg_color(strip, inst_row_colors[row], 0);
-        lv_obj_set_style_bg_opa(strip, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(strip, 0, 0);
-        lv_obj_set_style_radius(strip, 0, 0);
-        lv_obj_clear_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(strip, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_t* il = lv_label_create(ib);
-        lv_label_set_text(il, PAD_INST_NAMES[i]);
-        lv_obj_set_style_text_font(il, &lv_font_montserrat_14, 0);
-        lv_obj_center(il);
-        lv_obj_add_event_cb(ib, pad_inst_modal_pick_inst_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-    }
-
-    /* === DRUM KITS — preset selector (engines × presets, Pure incluido) === */
-    const int kits_y0 = grid_y0 + 2 * (btn_h + gap_y) + 18;  // tras el grid 2x4 de instruments
-
-    lv_obj_t* kit_hdr = lv_label_create(card);
-    lv_label_set_text(kit_hdr, "DRUM KITS");
-    lv_obj_set_style_text_font(kit_hdr, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(kit_hdr, RED808_CYAN, 0);
-    lv_obj_set_pos(kit_hdr, grid_x0, kits_y0 - 18);
-
-    static const char* engine_names[3]      = { "808", "909", "505" };
-    static const char* preset_names_808[5] = { "Classic", "HipHop", "Techno",  "Latin",      "Pure 808" };
-    static const char* preset_names_909[5] = { "Classic", "Techno", "House",   "Industrial", "Pure 909" };
-    static const char* preset_names_505[5] = { "Classic", "NewWav", "Electro", "LoFi HH",    "Pure 505" };
-    const char* const* preset_names[3] = { preset_names_808, preset_names_909, preset_names_505 };
-
-    const int eng_lbl_w = 56;
-    const int kit_btn_h = 36;
-    const int kit_gap_x = 6;
-    const int kit_gap_y = 6;
-    const int kit_btn_w = (4 * btn_w + 3 * gap_x - eng_lbl_w - kit_gap_x - 4 * kit_gap_x) / 5;
-
-    for (int eng = 0; eng < 3; eng++) {
-        int row_y = kits_y0 + eng * (kit_btn_h + kit_gap_y);
-
-        lv_obj_t* eng_lbl = lv_label_create(card);
-        lv_label_set_text(eng_lbl, engine_names[eng]);
-        lv_obj_set_style_text_font(eng_lbl, &lv_font_montserrat_18, 0);
-        lv_obj_set_style_text_color(eng_lbl, RED808_ACCENT, 0);
-        lv_obj_set_pos(eng_lbl, grid_x0, row_y + 6);
-        s_pad_inst_modal_kit_lbl_eng[eng] = eng_lbl;
-
-        for (int p = 0; p < 5; p++) {
-            bool is_pure = (p == 4);
-            lv_obj_t* kb = lv_btn_create(card);
-            s_pad_inst_modal_kit_btns[eng][p] = kb;
-            lv_obj_set_size(kb, kit_btn_w, kit_btn_h);
-            lv_obj_set_pos(kb,
-                grid_x0 + eng_lbl_w + kit_gap_x + p * (kit_btn_w + kit_gap_x),
-                row_y);
-            apply_control_button_style(kb, RED808_BORDER, false, 8);
-            if (is_pure) {
-                lv_obj_set_style_border_color(kb, RED808_CYAN, 0);
-                lv_obj_set_style_border_width(kb, 2, 0);
-            }
-            lv_obj_t* kl = lv_label_create(kb);
-            lv_label_set_text(kl, preset_names[eng][p]);
-            lv_obj_set_style_text_font(kl, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(kl, RED808_TEXT, 0);
-            lv_obj_center(kl);
-            uint32_t key = ((uint32_t)eng << 8) | (uint32_t)p;
-            lv_obj_add_event_cb(kb, grid_pad_kit_select_cb, LV_EVENT_CLICKED,
-                                (void*)(intptr_t)key);
-        }
-    }
-
-    // Bottom action row — a single running cursor (all anchored BOTTOM_LEFT)
-    // instead of the previous mix of LEFT/MID/RIGHT anchors, which left
-    // some gaps as tight as 8px and made the six buttons look like they
-    // were touching on real hardware. 20px gaps here guarantee separation
-    // regardless of card width, and there's still ~30px of margin on
-    // both sides at the card's 984px width.
-    int bottomBtnX = 48;
-    auto makeBottomBtn = [&](int width, lv_color_t color) -> lv_obj_t* {
-        lv_obj_t* btn = lv_btn_create(card);
-        lv_obj_set_size(btn, width, 48);
-        lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, bottomBtnX, -14);
-        apply_control_button_style(btn, color, false, 10);
-        bottomBtnX += width + 20;
-        return btn;
-    };
-
-    lv_obj_t* original_btn = makeBottomBtn(170, RED808_ACCENT2);
-    lv_obj_t* original_lbl = lv_label_create(original_btn);
-    lv_label_set_text(original_lbl, "SAMPLER ORIG.");
-    lv_obj_set_style_text_font(original_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_center(original_lbl);
-    lv_obj_add_event_cb(original_btn, pad_inst_sampler_original_cb, LV_EVENT_CLICKED, NULL);
-
-    // Per-instrument FX page (idea 2): filter + drive/crush + sends, scoped
-    // to just the focused pad, with its own RANDOM.
-    lv_obj_t* inst_fx_btn = makeBottomBtn(64, RED808_CYAN);
-    lv_obj_t* inst_fx_lbl = lv_label_create(inst_fx_btn);
-    lv_label_set_text(inst_fx_lbl, "FX");
-    lv_obj_set_style_text_font(inst_fx_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_center(inst_fx_lbl);
-    lv_obj_add_event_cb(inst_fx_btn, pad_fx_modal_show, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* preview_btn = makeBottomBtn(160, RED808_SURFACE);
-    lv_obj_set_style_border_color(preview_btn, RED808_CYAN, 0);
-    lv_obj_set_style_border_width(preview_btn, 2, 0);
-    lv_obj_t* preview_lbl = lv_label_create(preview_btn);
-    lv_label_set_text(preview_lbl, LV_SYMBOL_PLAY "  PREVIEW");
-    lv_obj_set_style_text_font(preview_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(preview_lbl, RED808_TEXT, 0);
-    lv_obj_center(preview_lbl);
-    lv_obj_add_event_cb(preview_btn, pad_inst_modal_preview_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* assign_btn = makeBottomBtn(170, RED808_SUCCESS);
-    lv_obj_set_style_border_color(assign_btn, RED808_CYAN, 0);
-    lv_obj_set_style_border_width(assign_btn, 2, 0);
-    lv_obj_t* assign_lbl = lv_label_create(assign_btn);
-    lv_label_set_text(assign_lbl, LV_SYMBOL_OK "  ASIGNAR");
-    lv_obj_set_style_text_font(assign_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(assign_lbl, RED808_TEXT, 0);
-    lv_obj_center(assign_lbl);
-    lv_obj_add_event_cb(assign_btn, pad_inst_modal_assign_cb, LV_EVENT_CLICKED, NULL);
-
-    // RANDOM: re-roll pad engines across the 16-pad kit (Sampler/808/909/505).
-    lv_obj_t* random_btn = makeBottomBtn(130, RED808_INFO);
-    lv_obj_t* random_lbl = lv_label_create(random_btn);
-    lv_label_set_text(random_lbl, LV_SYMBOL_SHUFFLE "  RANDOM");
-    lv_obj_set_style_text_font(random_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(random_lbl, RED808_TEXT, 0);
-    lv_obj_center(random_lbl);
-    lv_obj_add_event_cb(random_btn, pad_random_all_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* close_btn = makeBottomBtn(110, RED808_BORDER);
-    lv_obj_t* close_lbl = lv_label_create(close_btn);
-    lv_label_set_text(close_lbl, "CERRAR");
-    lv_obj_center(close_lbl);
-    lv_obj_add_event_cb(close_btn, pad_inst_modal_close_cb, LV_EVENT_CLICKED, NULL);
-
-    pad_inst_modal_refresh();
 }
 
 // =============================================================================
@@ -3099,7 +2812,7 @@ static void grid_pad_inst_popup_cb(lv_event_t* e) {
 // single pad, independent from the FX LAB's global chain. Reachable from
 // the "FX" button inside the PAD INSTRUMENT SELECT popup above.
 // =============================================================================
-enum PadFxSliderId : uint8_t { PFX_CUTOFF = 0, PFX_RESO, PFX_DRIVE, PFX_BITS, PFX_RVB, PFX_DLY };
+enum PadFxSliderId : uint8_t { PFX_CUTOFF = 0, PFX_RESO, PFX_DRIVE, PFX_BITS, PFX_RVB, PFX_DLY, PFX_TYPE, PFX_MOD };
 
 // LADDER (10) used to be listed here but never actually filtered anything:
 // this modal drives the per-TRACK filter (control_send_track_filter ->
@@ -3154,6 +2867,12 @@ static void pad_fx_modal_refresh(void) {
     if (pad > 15) pad = 15;
     const PadFxState& st = pad_fx_state_for(pad);
     uint8_t inst = s_pad_inst_sel[pad];
+    int typeIndex=0;
+    for(int i=0;i<7;++i) if(PAD_FX_FILTER_TYPES[i]==st.filterType) typeIndex=i;
+    if(s_pad_fx_type_slider) lv_slider_set_value(s_pad_fx_type_slider,typeIndex,LV_ANIM_OFF);
+    if(s_pad_fx_type_lbl) lv_label_set_text(s_pad_fx_type_lbl,PAD_FX_FILTER_NAMES[typeIndex]);
+    if(s_pad_fx_mod_slider) lv_slider_set_value(s_pad_fx_mod_slider,bank_state::pads[pad].mod.load(),LV_ANIM_OFF);
+    if(s_pad_fx_mod_lbl) lv_label_set_text_fmt(s_pad_fx_mod_lbl,"%d%%",bank_state::pads[pad].mod.load());
     if (inst > 7) inst = 0;
 
     if (s_pad_fx_subtitle_lbl)
@@ -3210,6 +2929,7 @@ static void pad_fx_modal_close_cb(lv_event_t* e) {
         s_pad_fx_bits_lbl = s_pad_fx_rvb_lbl = s_pad_fx_dly_lbl = NULL;
         s_pad_fx_subtitle_lbl = NULL;
         s_pad_fx_modal_title = NULL;
+        s_pad_fx_type_slider=s_pad_fx_type_lbl=s_pad_fx_mod_slider=s_pad_fx_mod_lbl=nullptr;
     }
 }
 
@@ -3229,6 +2949,7 @@ static void pad_fx_filter_select_cb(lv_event_t* e) {
 
 static void pad_fx_slider_cb(lv_event_t* e) {
     int id = (int)(intptr_t)lv_event_get_user_data(e);
+    s_pad_fx_bank_requested=(id==PFX_TYPE || id<=PFX_DRIVE) ? 0 : 1;
     lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
     uint8_t u7 = (uint8_t)constrain(lv_slider_get_value(slider), 0, 127);
     uint8_t pad = s_pad_fx_focus_pad;
@@ -3241,6 +2962,8 @@ static void pad_fx_slider_cb(lv_event_t* e) {
 
     PadFxState& st = pad_fx_state_for(pad);
     switch (id) {
+        case PFX_TYPE: st.filterType=PAD_FX_FILTER_TYPES[constrain(int(u7),0,6)]; break;
+        case PFX_MOD: bank_state::pads[pad].mod=constrain(int(u7),0,100); break;
         case PFX_CUTOFF: st.cutoffU7 = u7; break;
         case PFX_RESO:   st.resoU7 = u7;   break;
         case PFX_DRIVE:  st.driveU7 = u7;  break;
@@ -3257,6 +2980,11 @@ static void pad_fx_slider_cb(lv_event_t* e) {
     lastTxMs = now;
 
     switch (id) {
+        case PFX_TYPE: pad_fx_send_filter(pad); break;
+        case PFX_MOD: {
+            const uint8_t data[2]={pad,uint8_t(bank_state::pads[pad].mod.load())};
+            daisyUsb.send(CMD_TRACK_CHORUS_SEND,data,2); break;
+        }
         case PFX_CUTOFF:
         case PFX_RESO:
             if (st.filterType == 0) st.filterType = 1;  // moving cutoff/reso engages LOWPASS
@@ -3349,6 +3077,7 @@ static void pad_fx_modal_show_for_pad(uint8_t pad) {
         return;
     }
     s_pad_fx_focus_pad = pad > 15 ? 15 : pad;
+    s_pad_fx_bank_requested=0;
 
     s_pad_fx_modal = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_pad_fx_modal, LV_HOR_RES, LV_VER_RES);
@@ -3360,8 +3089,8 @@ static void pad_fx_modal_show_for_pad(uint8_t pad) {
     lv_obj_add_event_cb(s_pad_fx_modal, pad_fx_modal_close_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(s_pad_fx_modal);
-    lv_obj_set_size(card, 720, 540);
-    lv_obj_center(card);
+    lv_obj_set_size(card, 1000, 510);
+    lv_obj_set_pos(card,12,78);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_bg_grad_color(card, RED808_SURFACE, 0);
     lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
@@ -3384,64 +3113,38 @@ static void pad_fx_modal_show_for_pad(uint8_t pad) {
     lv_obj_set_style_text_color(s_pad_fx_subtitle_lbl, RED808_TEXT_DIM, 0);
     lv_obj_align(s_pad_fx_subtitle_lbl, LV_ALIGN_TOP_MID, 0, 32);
 
-    lv_obj_t* filter_hdr = lv_label_create(card);
-    lv_label_set_text(filter_hdr, "FILTER");
-    lv_obj_set_style_text_font(filter_hdr, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(filter_hdr, RED808_TEXT_DIM, 0);
-    lv_obj_set_pos(filter_hdr, 4, 58);
-
-    {
-        constexpr int btnW = 90, btnH = 40, gapX = 6, y0 = 76;
-        for (int i = 0; i < 7; i++) {
-            lv_obj_t* fb = lv_btn_create(card);
-            s_pad_fx_filter_btns[i] = fb;
-            lv_obj_set_size(fb, btnW, btnH);
-            lv_obj_set_pos(fb, 4 + i * (btnW + gapX), y0);
-            apply_control_button_style(fb, RED808_BORDER, false, 8);
-            lv_obj_t* fl = lv_label_create(fb);
-            lv_label_set_text(fl, PAD_FX_FILTER_NAMES[i]);
-            lv_obj_set_style_text_font(fl, &lv_font_montserrat_12, 0);
-            lv_obj_center(fl);
-            lv_obj_add_event_cb(fb, pad_fx_filter_select_cb, LV_EVENT_CLICKED,
-                                (void*)(intptr_t)i);
-        }
-    }
-
-    // ── Sliders: label | slider | value readout ──
-    auto makeRow = [&](int y, int id, const char* name, lv_obj_t** slider,
-                       lv_obj_t** valueLbl) {
-        lv_obj_t* nameLbl = lv_label_create(card);
-        lv_label_set_text(nameLbl, name);
-        lv_obj_set_style_text_font(nameLbl, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(nameLbl, RED808_TEXT, 0);
-        lv_obj_set_pos(nameLbl, 4, y + 4);
-        lv_obj_set_width(nameLbl, 112);
-
-        *slider = lv_slider_create(card);
-        lv_obj_set_pos(*slider, 122, y + 6);
-        lv_obj_set_size(*slider, 470, 16);
-        lv_slider_set_range(*slider, 0, 127);
-        lv_obj_set_style_bg_color(*slider, RED808_SURFACE, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(*slider, RED808_ACCENT, LV_PART_INDICATOR);
-        lv_obj_set_style_bg_color(*slider, lv_color_white(), LV_PART_KNOB);
-        lv_obj_add_event_cb(*slider, pad_fx_slider_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)id);
-        lv_obj_add_event_cb(*slider, pad_fx_slider_cb, LV_EVENT_RELEASED, (void*)(intptr_t)id);
-        lv_obj_add_event_cb(*slider, pad_fx_slider_cb, LV_EVENT_PRESS_LOST, (void*)(intptr_t)id);
-
-        *valueLbl = lv_label_create(card);
-        lv_obj_set_style_text_font(*valueLbl, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(*valueLbl, RED808_ACCENT, 0);
-        lv_obj_set_pos(*valueLbl, 606, y + 4);
-        lv_obj_set_width(*valueLbl, 96);
+    auto family=[&](const char* name,int y) {
+        auto* label=lv_label_create(card); lv_label_set_text(label,name);
+        lv_obj_set_pos(label,4,y); lv_obj_set_style_text_color(label,theme_text_dim(),0);
+        lv_obj_add_flag(label,LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(label,[](lv_event_t* e) {
+            s_pad_fx_bank_requested=int(intptr_t(lv_event_get_user_data(e)));
+        },LV_EVENT_CLICKED,(void*)(intptr_t)(y==62 ? 0 : 1));
     };
-
-    const int rowY0 = 134, rowH = 58;
-    makeRow(rowY0 + 0 * rowH, PFX_CUTOFF, "CUTOFF",      &s_pad_fx_cutoff_slider, &s_pad_fx_cutoff_lbl);
-    makeRow(rowY0 + 1 * rowH, PFX_RESO,   "RESONANCE",   &s_pad_fx_reso_slider,   &s_pad_fx_reso_lbl);
-    makeRow(rowY0 + 2 * rowH, PFX_DRIVE,  "DRIVE",       &s_pad_fx_drive_slider,  &s_pad_fx_drive_lbl);
-    makeRow(rowY0 + 3 * rowH, PFX_BITS,   "BITCRUSH",    &s_pad_fx_bits_slider,   &s_pad_fx_bits_lbl);
-    makeRow(rowY0 + 4 * rowH, PFX_RVB,    "REVERB SEND", &s_pad_fx_rvb_slider,    &s_pad_fx_rvb_lbl);
-    makeRow(rowY0 + 5 * rowH, PFX_DLY,    "DELAY SEND",  &s_pad_fx_dly_slider,    &s_pad_fx_dly_lbl);
+    family("FILTER FAMILY  /  R1 TYPE  -  R2 CUTOFF  -  R3 RESONANCE  -  R4 DRIVE",62);
+    family("COLOR / SEND  /  R1 CRUSH  -  R2 REVERB  -  R3 DELAY  -  R4 CHORUS",224);
+    auto cell=[&](int col,int row,int id,const char* name,lv_obj_t** slider,lv_obj_t** value) {
+        auto* panel=lv_obj_create(card); lv_obj_set_pos(panel,4+col*242,86+row*162); lv_obj_set_size(panel,230,128);
+        lv_obj_set_style_bg_color(panel,theme_panel(),0); lv_obj_set_style_border_color(panel,theme_border(),0);
+        lv_obj_clear_flag(panel,LV_OBJ_FLAG_SCROLLABLE);
+        auto* title=lv_label_create(panel); lv_label_set_text(title,name); lv_obj_set_pos(title,2,0);
+        lv_obj_set_style_text_color(title,theme_text(),0);
+        *slider=lv_slider_create(panel); lv_obj_set_pos(*slider,8,42); lv_obj_set_size(*slider,180,16);
+        lv_slider_set_range(*slider,0,id==PFX_TYPE ? 6 : id==PFX_MOD ? 100 : 127);
+        lv_obj_set_style_bg_color(*slider,theme_accent(),LV_PART_INDICATOR);
+        lv_obj_add_event_cb(*slider,pad_fx_slider_cb,LV_EVENT_VALUE_CHANGED,(void*)(intptr_t)id);
+        lv_obj_add_event_cb(*slider,pad_fx_slider_cb,LV_EVENT_RELEASED,(void*)(intptr_t)id);
+        lv_obj_add_event_cb(*slider,pad_fx_slider_cb,LV_EVENT_PRESS_LOST,(void*)(intptr_t)id);
+        *value=lv_label_create(panel); lv_obj_set_pos(*value,2,78); lv_obj_set_style_text_color(*value,theme_text(),0);
+    };
+    cell(0,0,PFX_TYPE,"R1 TYPE",&s_pad_fx_type_slider,&s_pad_fx_type_lbl);
+    cell(1,0,PFX_CUTOFF,"R2 CUTOFF",&s_pad_fx_cutoff_slider,&s_pad_fx_cutoff_lbl);
+    cell(2,0,PFX_RESO,"R3 RESONANCE",&s_pad_fx_reso_slider,&s_pad_fx_reso_lbl);
+    cell(3,0,PFX_DRIVE,"R4 DRIVE",&s_pad_fx_drive_slider,&s_pad_fx_drive_lbl);
+    cell(0,1,PFX_BITS,"R1 CRUSH",&s_pad_fx_bits_slider,&s_pad_fx_bits_lbl);
+    cell(1,1,PFX_RVB,"R2 REVERB",&s_pad_fx_rvb_slider,&s_pad_fx_rvb_lbl);
+    cell(2,1,PFX_DLY,"R3 DELAY",&s_pad_fx_dly_slider,&s_pad_fx_dly_lbl);
+    cell(3,1,PFX_MOD,"R4 CHORUS",&s_pad_fx_mod_slider,&s_pad_fx_mod_lbl);
 
     lv_obj_t* random_btn = lv_btn_create(card);
     lv_obj_set_size(random_btn, 160, 48);
@@ -3754,6 +3457,10 @@ static void pod_control_function_list(uint8_t row, const uint8_t*& list,
 
 static void pod_control_value_refresh(uint8_t row) {
     if (row >= POD_CONTROL_ROW_COUNT || !s_pod_control_value_labels[row]) return;
+    if(row<2) {
+        lv_label_set_text(s_pod_control_value_labels[row],row==0 ? "BACK" : "ROTARY OVERLAY");
+        return;
+    }
     if(row>=6) {
         lv_label_set_text(s_pod_control_value_labels[row],row==10 ? "BANK SELECTOR" : "BANK CONTEXT R1-R4");
         return;
@@ -3830,6 +3537,9 @@ static void pod_function_select_cb(lv_event_t* e) {
 static void pod_control_modal_open_cb(lv_event_t* e) {
     const uint8_t row = static_cast<uint8_t>(
         reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    if(row<2) {
+        ui_show_toast(row==0 ? "Boton 1: BACK" : "Boton 2: mostrar/ocultar rotarys",RED808_INFO); return;
+    }
     if(row>=6 && row<POD_CONTROL_ROW_COUNT) {
         ui_show_toast("BANK: contexto > banco > R1-R4. Pulsar: ajuste fino.",RED808_INFO); return;
     }
@@ -5412,7 +5122,8 @@ static void pod_dashboard_modal_update(void) {
             "DAISY CPU: %u%%  (avg %u%%  pico %u%%)\n"
             "DAISY SDRAM: %lu/%lu KB (%lu%%)\n"
             "P4 HEAP: %lu/%lu KB libres\n"
-            "P4 PSRAM: %lu/%lu KB libres",
+            "P4 PSRAM: %lu/%lu KB libres\n"
+            "AUDIO XRUN: %lu  FX LOAD: %s",
             state.daisy_cpu_load_pct, state.daisy_cpu_avg_pct, state.daisy_cpu_peak_pct,
             static_cast<unsigned long>(state.daisy_sdram_used_bytes / 1024u),
             static_cast<unsigned long>(POD_DAISY_SDRAM_POOL_BYTES / 1024u),
@@ -5420,7 +5131,9 @@ static void pod_dashboard_modal_update(void) {
             static_cast<unsigned long>(heapFree / 1024u),
             static_cast<unsigned long>(heapTotal / 1024u),
             static_cast<unsigned long>(psramFree / 1024u),
-            static_cast<unsigned long>(psramTotal / 1024u));
+            static_cast<unsigned long>(psramTotal / 1024u),
+            static_cast<unsigned long>(state.daisy_audio_deadline_trips),
+            !state.daisy_audio_diagnostics_seen ? "N/D" : state.daisy_audio_fx_shed ? "REDUCIDOS" : "NORMAL");
         lv_obj_set_style_text_color(s_pod_dashboard_lbls[4],
             state.daisy_cpu_load_pct >= 90 ? RED808_WARNING : RED808_SUCCESS, 0);
     }
@@ -5717,11 +5430,11 @@ static void pod_status_popup_cb(lv_event_t* e) {
 // =============================================================================
 static void apply_pad_layout(int mode) {
     s_pad_mode = mode;
-    const int M = 8, G = 4, SCR_W = 1024, SCR_H = 512;
+    const int M = 8, G = 4, SCR_W = 1024, SCR_H = 600;
     int cols, count, pw, ph;
     switch (mode) {
         default:
-        case 0: cols=4; count=16; pw=122;                ph=121;                break;
+        case 0: cols=4; count=16; pw=122;                ph=143;                break;
         case 1: cols=4; count=16; pw=(SCR_W-2*M-3*G)/4;  ph=(SCR_H-2*M-3*G)/4; break;
         case 2: cols=4; count=8;  pw=(SCR_W-2*M-3*G)/4;  ph=(SCR_H-2*M-1*G)/2; break;
         case 3: cols=2; count=4;  pw=(SCR_W-2*M-1*G)/2;  ph=(SCR_H-2*M-1*G)/2; break;
@@ -5959,7 +5672,11 @@ static void pod_process_physical_actions(void) {
         s_pod_encoder_position_ready = false;
         return;
     }
-    if (transport.pod_revision == s_pod_action_seen_revision) return;
+    const uint32_t backPresses = daisyUsb.takePodButtonPresses(0);
+    const uint32_t overlayPresses = daisyUsb.takePodButtonPresses(1);
+    const uint32_t encoderPresses = daisyUsb.takePodButtonPresses(2);
+    const bool hasPresses = backPresses || overlayPresses || encoderPresses;
+    if (transport.pod_revision == s_pod_action_seen_revision && !hasPresses) return;
     s_pod_action_seen_revision = transport.pod_revision;
     if (transport.pod.config.version != POD_CONFIG_VERSION) {
         s_pod_encoder_position_ready = false;
@@ -5971,7 +5688,7 @@ static void pod_process_physical_actions(void) {
     if(abs(int(transport.pod.knob1) - int(lastKnob1)) > 3
        || abs(int(transport.pod.knob2) - int(lastKnob2)) > 3
        || (s_pod_encoder_position_ready && encoderPosition != s_pod_encoder_position_seen)
-       || transport.pod.buttonPressEvents) {
+       || hasPresses) {
         ui_note_control_activity();
         lastKnob1 = transport.pod.knob1; lastKnob2 = transport.pod.knob2;
     }
@@ -5990,15 +5707,11 @@ static void pod_process_physical_actions(void) {
             step_pattern_relative(encoderDelta);
     }
 
-    const uint8_t events = transport.pod.buttonPressEvents;
-    const uint8_t functions[3] = {
-        transport.pod.config.button1Function,
-        transport.pod.config.button2Function,
-        transport.pod.config.encoderButtonFunction
-    };
-    for (uint8_t i = 0; i < 3; i++)
-        if (events & (1u << i))
-            pod_apply_navigation_action(functions[i], transport.pod.selectedPad);
+    for(uint32_t i=0;i<backPresses;++i)
+        pod_apply_navigation_action(POD_FUNC_BACK,transport.pod.selectedPad);
+    if(overlayPresses & 1u) bank_toggle_indicator();
+    for(uint32_t i=0;i<encoderPresses;++i)
+        pod_apply_navigation_action(transport.pod.config.encoderButtonFunction,transport.pod.selectedPad);
 }
 
 // Fondo con identidad de tema: degradado horizontal bg → acento secundario.
@@ -6017,13 +5730,13 @@ static void create_live_screen(void) {
 
     // 8×4 full-screen grid: 1024×600
     // Left 4 cols = pads, Right 4 cols = controls
-    const int M = 8, G = 4, CG = 8, CW = 122, CH = 121;
+    const int M = 8, G = 4, CG = 8, CW = 122, CH = 143;
     #define COL_X(c) ((c) < 4 ? (M + (c)*(CW+G)) : (M + 4*(CW+G) + CG + ((c)-4)*(CW+G)))
     #define ROW_Y(r) (M + (r)*(CH+G))
 
     lv_obj_t* pads_deck = lv_obj_create(scr_live);
     lv_obj_set_pos(pads_deck, 3, 3);
-    lv_obj_set_size(pads_deck, 506, LCD_V_RES - 94);
+    lv_obj_set_size(pads_deck, 506, LCD_V_RES - 6);
     lv_obj_set_style_radius(pads_deck, 18, 0);
     lv_obj_set_style_bg_color(pads_deck, RED808_PANEL, 0);
     lv_obj_set_style_bg_opa(pads_deck, LV_OPA_30, 0);
@@ -6035,7 +5748,7 @@ static void create_live_screen(void) {
 
     lv_obj_t* control_deck = lv_obj_create(scr_live);
     lv_obj_set_pos(control_deck, 515, 3);
-    lv_obj_set_size(control_deck, LCD_H_RES - 518, LCD_V_RES - 94);
+    lv_obj_set_size(control_deck, LCD_H_RES - 518, LCD_V_RES - 6);
     lv_obj_set_style_radius(control_deck, 18, 0);
     lv_obj_set_style_bg_color(control_deck, lv_color_mix(theme_accent2(), RED808_PANEL, 235), 0);
     lv_obj_set_style_bg_opa(control_deck, LV_OPA_40, 0);
@@ -6490,6 +6203,7 @@ static void create_live_screen(void) {
 
     #undef COL_X
     #undef ROW_Y
+    bank_home_mount(scr_live);
 }
 
 static void update_live_screen(void) {
@@ -7161,6 +6875,19 @@ static const char* fx_group_names[FX_PAGE_DOT_COUNT] = {
 };
 static int s_fx_bank_visual = 0;
 static int s_fx_bank_requested = -1;
+static FxRotarySelection s_fx_rotary_selection;
+static bool s_fx_assignment_dirty=false;
+static uint16_t s_fx_assignment_fader_anchor=0;
+static void fx_bind_rotary_touch(lv_obj_t* obj,int cell) {
+    lv_obj_add_event_cb(obj,[](lv_event_t* e) {
+        const int cell=int(intptr_t(lv_event_get_user_data(e)));
+        if(s_fx_rotary_selection.touch(cell)) {
+            s_fx_assignment_dirty=true; s_fx_assignment_fader_anchor=p4_fader_value();
+            bank_input::clear();
+        }
+    },LV_EVENT_PRESSED,(void*)(intptr_t)cell);
+    for(uint32_t i=0;i<lv_obj_get_child_cnt(obj);++i) fx_bind_rotary_touch(lv_obj_get_child(obj,i),cell);
+}
 
 static int fx_page = 0;
 static int fx_view_mode = 0;
@@ -7871,7 +7598,7 @@ static void fx_apply_layout(void) {
     const int sidePad = 12;
     const int gap = 10;
     const int groupHeaderH = 22;
-    int gridH = LCD_V_RES - 88 - topY - bottomPad;
+    int gridH = LCD_V_RES - topY - bottomPad;
     int cardW = (LCD_H_RES - sidePad * 2 - gap * (cols - 1)) / cols;
     int rowH = (gridH - gap * (rows - 1)) / rows;
     int cardH = rowH - groupHeaderH;
@@ -7922,7 +7649,7 @@ static void fx_apply_layout(void) {
         lv_obj_set_size(fx_cards[cell], cardW, cardH);
 
         if (fx_name_labels[cell]) {
-            if(cell<12) lv_label_set_text_fmt(fx_name_labels[cell],"R%d  %s",cell%4+1,fx_names[cell]);
+            if(s_fx_rotary_selection.cells[cell%4]==cell) lv_label_set_text_fmt(fx_name_labels[cell],"R%d  %s",cell%4+1,fx_names[cell]);
             lv_obj_set_width(fx_name_labels[cell], cardW);
             lv_obj_set_style_text_font(fx_name_labels[cell], titleFont, 0);
             lv_obj_align(fx_name_labels[cell], LV_ALIGN_TOP_MID, 0, nameY);
@@ -8145,8 +7872,6 @@ static void fx_page_cb(lv_event_t* e) {
     int dir = (int)(intptr_t)lv_event_get_user_data(e);
     int pages = fx_page_count();
     fx_page = (fx_page + dir + pages) % pages;
-    int group=fx_page*fx_view_modes[fx_view_mode]/4;
-    if(group<3) s_fx_bank_requested=group;
     fx_apply_layout();
 }
 
@@ -8596,7 +8321,7 @@ static void create_fx_screen(void) {
         lv_obj_align(label,LV_ALIGN_LEFT_MID,8,0);
         lv_obj_add_event_cb(header,[](lv_event_t* e) {
             int group=int(intptr_t(lv_event_get_user_data(e)));
-            if(group<3) s_fx_bank_requested=group;
+            if(group<FX_PAGE_DOT_COUNT) s_fx_bank_requested=group;
         },LV_EVENT_CLICKED,(void*)(intptr_t)group);
     }
 
@@ -8764,6 +8489,8 @@ static void create_fx_screen(void) {
         lv_obj_set_style_text_font(tog_lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(tog_lbl, fx_safe_text_color(fx_colors[cell]), 0);
         lv_obj_center(tog_lbl);
+        lv_obj_add_flag(card,LV_OBJ_FLAG_CLICKABLE);
+        fx_bind_rotary_touch(card,cell);
     }
 
     // Page controls — same row 2 as the action buttons above (actionY), far
@@ -9828,9 +9555,9 @@ static lv_obj_t* seq_evolve_stop_badge = NULL;
 static lv_obj_t* seq_evolve_modal = NULL;
 static lv_obj_t* seq_evolve_amount_slider = NULL;
 static lv_obj_t* seq_evolve_amount_lbl = NULL;
-static lv_obj_t* seq_evolve_bars_btns[4] = {};
+static lv_obj_t* seq_evolve_bars_btns[8] = {};
 static lv_obj_t* seq_evolve_toggle_btn = NULL;
-static const uint8_t SEQ_EVOLVE_BAR_OPTIONS[4] = {1, 2, 4, 8};
+static const uint8_t SEQ_EVOLVE_BAR_OPTIONS[8] = {1, 2, 3, 4, 6, 8, 12, 16};
 
 static void seq_evolve_btn_refresh(void) {
     if (!seq_hdr_evolve_btn) return;
@@ -9851,13 +9578,15 @@ static void seq_evolve_stop_badge_cb(lv_event_t* e) {
 
 static void seq_evolve_modal_refresh(void) {
     if (!seq_evolve_modal) return;
-    const uint8_t amount = control_random_evolve_amount();
+    const int pendingAmount=s_ctrl_evolve_values[1].load();
+    const uint8_t amount = pendingAmount>=0 ? pendingAmount : control_random_evolve_amount();
     if (seq_evolve_amount_slider)
         lv_slider_set_value(seq_evolve_amount_slider, amount, LV_ANIM_OFF);
     if (seq_evolve_amount_lbl) lv_label_set_text_fmt(seq_evolve_amount_lbl, "%d%%", amount);
 
-    const uint8_t bars = control_random_evolve_bars();
-    for (int i = 0; i < 4; i++) {
+    const int pendingBars=s_ctrl_evolve_values[2].load();
+    const uint8_t bars = pendingBars>=0 ? pendingBars : control_random_evolve_bars();
+    for (int i = 0; i < 8; i++) {
         lv_obj_t* btn = seq_evolve_bars_btns[i];
         if (!btn) continue;
         const bool sel = SEQ_EVOLVE_BAR_OPTIONS[i] == bars;
@@ -9880,19 +9609,19 @@ static void seq_evolve_modal_hide(lv_event_t* e = NULL) {
     seq_evolve_modal = NULL;
     seq_evolve_amount_slider = NULL;
     seq_evolve_amount_lbl = NULL;
-    for (int i = 0; i < 4; i++) seq_evolve_bars_btns[i] = NULL;
+    for (int i = 0; i < 8; i++) seq_evolve_bars_btns[i] = NULL;
     seq_evolve_toggle_btn = NULL;
 }
 
 static void seq_evolve_amount_cb(lv_event_t* e) {
     lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
-    control_random_evolve_set_amount((uint8_t)lv_slider_get_value(slider));
+    s_ctrl_evolve_values[1].store(lv_slider_get_value(slider));
     seq_evolve_modal_refresh();
 }
 
 static void seq_evolve_bars_cb(lv_event_t* e) {
     const int bars = (int)(intptr_t)lv_event_get_user_data(e);
-    control_random_evolve_set_bars((uint8_t)bars);
+    s_ctrl_evolve_values[2].store(bars);
     seq_evolve_modal_refresh();
 }
 
@@ -9904,14 +9633,14 @@ static void seq_evolve_toggle_cb(lv_event_t* e) {
     // itself mutates gradually every bar with no single "last action" of
     // its own to reverse otherwise.
     if (turningOn) undo_arm_evolve_snapshot();
-    control_random_evolve_set_active(turningOn);
+    s_ctrl_evolve_values[0].store(turningOn ? control_random_evolve_mode()+1 : 0);
     seq_evolve_modal_refresh();
     seq_evolve_btn_refresh();
 }
 
 static void seq_evolve_apply_now_cb(lv_event_t* e) {
     LV_UNUSED(e);
-    control_random_evolve_apply_now();
+    s_ctrl_evolve_step.store(true);
 }
 
 static void seq_evolve_modal_show(lv_event_t* e) {
@@ -9928,7 +9657,7 @@ static void seq_evolve_modal_show(lv_event_t* e) {
     lv_obj_add_event_cb(seq_evolve_modal, seq_evolve_modal_hide, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* card = lv_obj_create(seq_evolve_modal);
-    lv_obj_set_size(card, 420, 344);
+    lv_obj_set_size(card, 420, 384);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
     lv_obj_set_style_border_width(card, 2, 0);
@@ -9982,11 +9711,11 @@ static void seq_evolve_modal_show(lv_event_t* e) {
     lv_obj_set_style_text_color(barsLbl, RED808_TEXT_DIM, 0);
     lv_obj_set_pos(barsLbl, 0, 96);
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 8; i++) {
         lv_obj_t* btn = lv_btn_create(card);
         seq_evolve_bars_btns[i] = btn;
         lv_obj_set_size(btn, 86, 36);
-        lv_obj_set_pos(btn, i * (86 + 8), 116);
+        lv_obj_set_pos(btn, (i % 4) * (86 + 8), 116 + (i / 4) * 40);
         lv_obj_add_event_cb(btn, seq_evolve_bars_cb, LV_EVENT_CLICKED,
                             (void*)(intptr_t)SEQ_EVOLVE_BAR_OPTIONS[i]);
         lv_obj_t* lbl = lv_label_create(btn);
@@ -9997,7 +9726,7 @@ static void seq_evolve_modal_show(lv_event_t* e) {
 
     seq_evolve_toggle_btn = lv_btn_create(card);
     lv_obj_set_size(seq_evolve_toggle_btn, 388, 48);
-    lv_obj_set_pos(seq_evolve_toggle_btn, 0, 160);
+    lv_obj_set_pos(seq_evolve_toggle_btn, 0, 200);
     lv_obj_add_event_cb(seq_evolve_toggle_btn, seq_evolve_toggle_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* toggleLbl = lv_label_create(seq_evolve_toggle_btn);
     lv_obj_set_style_text_font(toggleLbl, &lv_font_montserrat_16, 0);
@@ -10005,7 +9734,7 @@ static void seq_evolve_modal_show(lv_event_t* e) {
 
     lv_obj_t* applyBtn = lv_btn_create(card);
     lv_obj_set_size(applyBtn, 388, 40);
-    lv_obj_set_pos(applyBtn, 0, 220);
+    lv_obj_set_pos(applyBtn, 0, 260);
     apply_control_button_style(applyBtn, RED808_INFO, false, 10);
     lv_obj_add_event_cb(applyBtn, seq_evolve_apply_now_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* applyLbl = lv_label_create(applyBtn);
@@ -10015,7 +9744,7 @@ static void seq_evolve_modal_show(lv_event_t* e) {
 
     lv_obj_t* closeBtn = lv_btn_create(card);
     lv_obj_set_size(closeBtn, 388, 36);
-    lv_obj_set_pos(closeBtn, 0, 268);
+    lv_obj_set_pos(closeBtn, 0, 308);
     apply_control_button_style(closeBtn, RED808_BORDER, false, 10);
     lv_obj_add_event_cb(closeBtn, seq_evolve_modal_hide, LV_EVENT_CLICKED, NULL);
     lv_obj_t* closeLbl = lv_label_create(closeBtn);
@@ -10412,7 +10141,7 @@ static void seq_kanban_style_cb(lv_event_t* /*e*/) {
 
 static void seq_kanban_evolve_amount_cb(lv_event_t* e) {
     lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
-    control_random_evolve_set_amount((uint8_t)lv_slider_get_value(slider));
+    s_ctrl_evolve_values[1].store(lv_slider_get_value(slider));
     seq_kanban_refresh();
 }
 
@@ -12717,7 +12446,7 @@ static void create_volumes_screen(void) {
 
     // Layout in actual LVGL canvas coordinates (landscape 1024×600)
     const int LW = LCD_H_RES;   // 1024 — full display width
-    const int LH = LCD_V_RES - 88; // reserve BANK dock
+    const int LH = LCD_V_RES; // Overlay does not reserve layout space
 
     lv_obj_t* title = lv_label_create(scr_volumes);
     lv_label_set_text(title, LV_SYMBOL_VOLUME_MAX "  MIXER");
@@ -12733,64 +12462,11 @@ static void create_volumes_screen(void) {
     lv_obj_set_style_text_color(mix_pattern_lbl, RED808_ACCENT, 0);
     lv_obj_set_pos(mix_pattern_lbl, LCD_H_RES - 120, 10);
 
-    // Global controls row: MAIN gain + BPM, restructured (narrower) to make
-    // room for RANDOM MIX alongside them instead of hiding it in a submenu.
-    const int global_y = 30;
-    const int slider_w = 190;
-    const int slider_gap = 40;
-    const int label_w = 54;
-    const int value_w = 44;
-    const int block_w = label_w + slider_w + value_w;   // 288
-    const int random_w = 190;
-    const int random_h = 44;
-    const int presets_w = 150;
-    // PRESETS now rides in the same centered control row as RANDOM MIX
-    // instead of a separate 120x26 button crammed under the pattern number
-    // in the top-right corner — same height, same visual weight, since
-    // recalling a mixer preset is just as central an action as randomizing.
-    const int row_content_w = 2 * block_w + 3 * slider_gap + random_w + presets_w;
-    const int global_x = (LCD_H_RES - row_content_w) / 2;
-    struct GlobalCtl { const char* name; int value; int max; lv_obj_t** slider; lv_obj_t** label; };
-    GlobalCtl globals[] = {
-        {"MAIN", p4.master_volume, Config::MAX_VOLUME, &mix_master_slider, &mix_master_lbl},
-        {"BPM",  p4.bpm_int,       240,                &mix_bpm_slider,    &mix_bpm_lbl},
-    };
-    mix_seq_slider = NULL;
-    mix_seq_lbl = NULL;
-    mix_live_slider = NULL;
-    mix_live_lbl = NULL;
-    for (int i = 0; i < 2; i++) {
-        int x = global_x + i * (block_w + slider_gap);
-        lv_obj_t* name = lv_label_create(scr_volumes);
-        lv_label_set_text(name, globals[i].name);
-        lv_obj_set_style_text_font(name, &lv_font_montserrat_24, 0);
-        lv_obj_set_style_text_color(name, i == 1 ? RED808_ACCENT : RED808_CYAN, 0);
-        lv_obj_set_pos(name, x, global_y);
-
-        *globals[i].label = lv_label_create(scr_volumes);
-        lv_label_set_text_fmt(*globals[i].label, "%d", globals[i].value);
-        lv_obj_set_style_text_font(*globals[i].label, &lv_font_montserrat_28, 0);
-        lv_obj_set_style_text_color(*globals[i].label, RED808_TEXT, 0);
-        lv_obj_set_pos(*globals[i].label, x + label_w + slider_w + 10, global_y + 10);
-
-        *globals[i].slider = lv_slider_create(scr_volumes);
-        lv_obj_set_size(*globals[i].slider, slider_w, 18);
-        lv_obj_set_pos(*globals[i].slider, x + label_w, global_y + 16);
-        lv_slider_set_range(*globals[i].slider, i == 1 ? 40 : 0, globals[i].max);
-        lv_slider_set_value(*globals[i].slider, globals[i].value, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(*globals[i].slider, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(*globals[i].slider, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(*globals[i].slider, i == 1 ? RED808_ACCENT : RED808_CYAN, LV_PART_INDICATOR);
-        lv_obj_set_style_bg_opa(*globals[i].slider, LV_OPA_COVER, LV_PART_INDICATOR);
-        lv_obj_set_style_bg_color(*globals[i].slider, lv_color_white(), LV_PART_KNOB);
-        lv_obj_set_style_bg_opa(*globals[i].slider, LV_OPA_COVER, LV_PART_KNOB);
-        lv_obj_set_style_pad_all(*globals[i].slider, 10, LV_PART_KNOB);
-        lv_obj_set_style_radius(*globals[i].slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
-        int which = (i == 0 ? 0 : 3);
-        lv_obj_add_event_cb(*globals[i].slider, mix_global_slider_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)which);
-        lv_obj_add_event_cb(*globals[i].slider, mix_global_slider_cb, LV_EVENT_RELEASED, (void*)(intptr_t)which);
-        lv_obj_add_event_cb(*globals[i].slider, mix_global_slider_cb, LV_EVENT_PRESS_LOST, (void*)(intptr_t)which);
-    }
+    // Globals are controlled from HOME; use the space for taller channels.
+    const int global_y=-2,global_x=520,block_w=0,slider_gap=12;
+    const int random_w=190,random_h=36,presets_w=150;
+    mix_master_slider=mix_seq_slider=mix_live_slider=mix_bpm_slider=nullptr;
+    mix_master_lbl=mix_seq_lbl=mix_live_lbl=mix_bpm_lbl=nullptr;
 
     // RANDOM MIX: opens the AUTO MIX popup (cadence + on/off + apply now).
     // The button label keeps showing the last applied style.
@@ -12826,11 +12502,11 @@ static void create_volumes_screen(void) {
     mixer_presets_ensure_loaded();
 
     // Single row of 16 strips filling the full display width
-    int margin = 10;
-    int gap    = 4;
+    int margin = 8;
+    int gap    = 2;
     int total_w = LW - 2 * margin;
     int strip_w = (total_w - 15 * gap) / 16;   // ~56px each
-    int y_top   = 134;
+    int y_top   = 56;
     int y_bottom = LH - 8;
     int strip_h  = y_bottom - y_top;            // ~508px
     int name_h   = 14;
@@ -12885,8 +12561,8 @@ static void create_volumes_screen(void) {
 
         // Vertical fader — wide groove, gradient indicator that "lights up"
         vol_sliders[i] = lv_slider_create(scr_volumes);
-        lv_obj_set_size(vol_sliders[i], 14, slider_h);
-        lv_obj_set_pos(vol_sliders[i], cx - 7, y_sl);
+        lv_obj_set_size(vol_sliders[i], 24, slider_h);
+        lv_obj_set_pos(vol_sliders[i], cx - 12, y_sl);
         lv_slider_set_range(vol_sliders[i], 0, Config::MAX_VOLUME);
         lv_slider_set_value(vol_sliders[i], p4.track_volume[i], LV_ANIM_OFF);
         lv_obj_set_style_bg_color(vol_sliders[i], lv_color_hex(0x1C1C1C), LV_PART_MAIN);
@@ -13287,6 +12963,104 @@ static void sd_scan_task(void* arg) {
     sd_local_scan_blocking();
     s_sd_scan_state.store(0, std::memory_order_release);
     vTaskDelete(NULL);
+}
+
+enum XtraLocalScanState : uint8_t {
+    XTRA_LOCAL_SCAN_IDLE = 0,
+    XTRA_LOCAL_SCAN_REQUESTED,
+    XTRA_LOCAL_SCAN_RUNNING,
+    XTRA_LOCAL_SCAN_DONE,
+    XTRA_LOCAL_SCAN_FAILED,
+};
+static std::atomic<uint8_t> s_xtra_local_scan_state{XTRA_LOCAL_SCAN_IDLE};
+
+static bool xtra_local_scan_request(void) {
+    const uint8_t state=s_xtra_local_scan_state.load(std::memory_order_acquire);
+    if(state==XTRA_LOCAL_SCAN_RUNNING || state==XTRA_LOCAL_SCAN_REQUESTED) return false;
+    s_xtra_local_scan_state.store(XTRA_LOCAL_SCAN_REQUESTED,std::memory_order_release);
+    return true;
+}
+
+static void xtra_local_scan_task(void*) {
+    bool mounted=sd_local_try_mount();
+    int totalWavs=0;
+    for(int slot=0;slot<4;++slot) {
+        auto& result=s_xtra_directories[slot];
+        result.count=0;
+        result.selected=-1;
+        if(!mounted) continue;
+        File dir=SD_MMC.open(XTRA_DIRECTORIES[slot]);
+        if(!dir || !dir.isDirectory()) {
+            if(dir) dir.close();
+            continue;
+        }
+        File entry=dir.openNextFile();
+        while(entry && result.count<64) {
+            if(!entry.isDirectory()) {
+                const char* name=sd_basename(entry.name());
+                const size_t length=strlen(name);
+                if(length>4 && length<sizeof(result.files[0])
+                   && strcasecmp(name+length-4,".wav")==0) {
+                    snprintf(result.files[result.count++],sizeof(result.files[0]),"%s",name);
+                }
+            }
+            entry.close();
+            entry=dir.openNextFile();
+        }
+        dir.close();
+        for(int i=1;i<result.count;++i) {
+            char key[sizeof(result.files[0])];
+            memcpy(key,result.files[i],sizeof(key));
+            int j=i-1;
+            while(j>=0 && strcasecmp(result.files[j],key)>0) {
+                memcpy(result.files[j+1],result.files[j],sizeof(result.files[j]));
+                --j;
+            }
+            memcpy(result.files[j+1],key,sizeof(key));
+        }
+        for(int i=0;i<result.count;++i) {
+            char base[sizeof(result.files[0])];
+            snprintf(base,sizeof(base),"%s",result.files[i]);
+            trim_wav_extension(base);
+            if(strcmp(base,s_xtra_slots[slot].name)==0) result.selected=i;
+        }
+        totalWavs+=result.count;
+    }
+    p4sd.mounted=mounted;
+    s_xtra_scan_total_wavs=totalWavs;
+    s_sd_scan_state.store(0,std::memory_order_release);
+    s_xtra_local_scan_state.store(mounted ? XTRA_LOCAL_SCAN_DONE
+                                          : XTRA_LOCAL_SCAN_FAILED,
+                                  std::memory_order_release);
+    vTaskDelete(NULL);
+}
+
+static void xtra_local_scan_poll(void) {
+    uint8_t state=s_xtra_local_scan_state.load(std::memory_order_acquire);
+    if(state==XTRA_LOCAL_SCAN_REQUESTED) {
+        if(s_sd_scan_state.load(std::memory_order_acquire)!=0
+           || sd_upload_in_flight() || sd_midi_load_in_flight()) return;
+        s_sd_scan_state.store(1,std::memory_order_release);
+        s_xtra_local_scan_state.store(XTRA_LOCAL_SCAN_RUNNING,std::memory_order_release);
+        if(xTaskCreatePinnedToCore(xtra_local_scan_task,"xtrascan",6144,
+                                   NULL,1,NULL,1)!=pdPASS) {
+            s_sd_scan_state.store(0,std::memory_order_release);
+            s_xtra_local_scan_state.store(XTRA_LOCAL_SCAN_FAILED,std::memory_order_release);
+        }
+        return;
+    }
+    if(state!=XTRA_LOCAL_SCAN_DONE && state!=XTRA_LOCAL_SCAN_FAILED) return;
+    for(auto& dir:s_xtra_directories) dir.ready=true;
+    s_xtra_local_scan_state.store(XTRA_LOCAL_SCAN_IDLE,std::memory_order_release);
+    if(state==XTRA_LOCAL_SCAN_FAILED) {
+        ui_show_toast("XTRA: no se pudo montar la SD del P4",RED808_WARNING);
+        s_xtra_scan_toast_on_done=false;
+    } else if(s_xtra_scan_toast_on_done) {
+        char message[56];
+        snprintf(message,sizeof(message),"XTRA: %d WAV en SD P4",s_xtra_scan_total_wavs);
+        ui_show_toast(message,s_xtra_scan_total_wavs>0 ? RED808_SUCCESS : RED808_WARNING);
+        s_xtra_scan_toast_on_done=false;
+    }
 }
 
 // LVGL task: kick the scan to a one-shot worker; sd_refresh_ui() shows a
@@ -14333,6 +14107,35 @@ static void sd_upload_task(void* arg) {
                                std::memory_order_release);
     s_sd_upload_state.store(2, std::memory_order_release);
     vTaskDelete(NULL);
+}
+
+static bool xtra_local_upload_start(int slot,const char* folder,const char* filename) {
+    if(slot<0 || slot>=4 || !folder || !filename || !filename[0]) return false;
+    if(!ui_control_available()) {
+        ui_show_toast("XTRA: Daisy no conectada",RED808_WARNING);
+        return false;
+    }
+    if(sd_upload_in_flight() || sd_midi_load_in_flight()
+       || s_sd_scan_state.load(std::memory_order_acquire)!=0) return false;
+
+    SdUploadJob& job=s_sd_upload_job;
+    memset(&job,0,sizeof(job));
+    snprintf(job.path,sizeof(job.path),"%s/%s",folder,filename);
+    snprintf(job.filename,sizeof(job.filename),"%s",filename);
+    job.pad=xtra_backing_pad_for_slot(slot);
+    job.xtra_slot=slot;
+    job.close_after=false;
+    job.trigger_after=false;
+    s_sd_upload_progress.store(0,std::memory_order_release);
+    s_sd_upload_state.store(1,std::memory_order_release);
+    if(xTaskCreatePinnedToCore(sd_upload_task,"xtraupload",8192,
+                               NULL,1,NULL,1)!=pdPASS) {
+        s_sd_upload_state.store(0,std::memory_order_release);
+        ui_show_toast("XTRA: no se pudo iniciar la carga",RED808_WARNING);
+        return false;
+    }
+    ui_show_toast("XTRA: cargando desde SD P4...",RED808_CYAN);
+    return true;
 }
 
 static bool factory_wav_name(const char* name) {
@@ -17899,7 +17702,7 @@ static void matrix_modal_show(lv_event_t* e) {
 
 static void create_piano_screen(void) {
     int W = ui_layout_w();
-    int H = ui_layout_h() - 88;
+    int H = ui_layout_h();
     scr_piano = lv_obj_create(NULL);
     apply_screen_theme_bg(scr_piano);
     lv_obj_clear_flag(scr_piano, LV_OBJ_FLAG_SCROLLABLE);
@@ -18639,7 +18442,7 @@ static void pp_rebuild_param_grid(void) {
     // Use the screen geometry directly — lv_obj_get_width() can return 0 when
     // called before LVGL has laid out the panel after creation.
     int W = ui_layout_w();
-    int H = ui_layout_h() - 88;
+    int H = ui_layout_h();
     int panel_w = W - 24;
     int panel_h = H - 152 - 12;
 
@@ -18905,7 +18708,7 @@ static void xtra_timing_edit_cb(lv_event_t* e) {
 
 static void create_piano_params_screen(void) {
     int W = ui_layout_w();
-    int H = ui_layout_h() - 88;
+    int H = ui_layout_h();
 
     for (int e = 0; e < SP_ENGINE_COUNT; e++) {
         if(!s_pp_initialized[e]) pp_init_engine_defaults(e);
@@ -19046,13 +18849,13 @@ static void create_performance_screen(void) {
     lv_obj_set_pos(title, 20, 72);
 
     lv_obj_t* sub = lv_label_create(scr_performance);
-    lv_label_set_text(sub, "Banco local por P4 (sin asignacion a los 16 pads)");
+    lv_label_set_text(sub, "R1 DRUMS  /  R2 VOCALS  /  R3 FX  /  R4 MUSIC");
     lv_obj_set_style_text_font(sub, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(sub, theme_text_dim(), 0);
     lv_obj_set_pos(sub, 20, 114);
 
     lv_obj_t* hint = lv_label_create(scr_performance);
-    lv_label_set_text(hint, "MODE tap · hold MODE = sound editor · hold PRESET/LOAD = timing + trim");
+    lv_label_set_text(hint, "Gira para elegir WAV · carga al soltar el pad · CARPETAS actualiza las listas");
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(hint, theme_warning(), 0);
     lv_obj_set_pos(hint, 20, 142);
@@ -19414,7 +19217,7 @@ static void ui_reload_themed_screens(void) {
     seq_evolve_modal = NULL;
     seq_evolve_amount_slider = NULL;
     seq_evolve_amount_lbl = NULL;
-    for (int i = 0; i < 4; i++) seq_evolve_bars_btns[i] = NULL;
+    for (int i = 0; i < 8; i++) seq_evolve_bars_btns[i] = NULL;
     seq_evolve_toggle_btn = NULL;
     seq_variation_modal = NULL;
     seq_hdr_save_btn = NULL;
@@ -19557,7 +19360,7 @@ void ui_navigate_to(int screen_id) {
     int count = sizeof(targets) / sizeof(targets[0]);
     if (screen_id >= 0 && screen_id < count && targets[screen_id]) {
         if (screen_id == 6) {
-            xtra_pages_request_folders();
+            xtra_directories_start();
         }
         if (screen_id == 11) {
             if (s_pp_from_xtra && s_pp_xtra_slot >= 0 && s_pp_xtra_slot < 4) {
@@ -19626,19 +19429,49 @@ static int8_t   s_pad_noteoff_engine[16] = {-1, -1, -1, -1, -1, -1, -1, -1,
                                            -1, -1, -1, -1, -1, -1, -1, -1};
 
 void ui_process_control_queue(void) {
+    // Keep the requested value visible until application completes. USB may
+    // wait during humanize restoration; do not expose the stale value meanwhile.
+    for(int i=0;i<4;++i) {
+        int value=s_ctrl_evolve_values[i].load();
+        if(value<0) continue;
+        if(i==0) {
+            if(value>0) control_random_evolve_set_mode(value-1);
+            control_random_evolve_set_active(value!=0);
+        } else if(i==1) control_random_evolve_set_amount(value);
+        else if(i==2) control_random_evolve_set_bars(value);
+        else control_random_evolve_set_scope(value);
+        s_ctrl_evolve_values[i].compare_exchange_strong(value,-1);
+    }
+    if(s_ctrl_evolve_step.exchange(false)) control_random_evolve_apply_now();
+    const int targetPattern=s_ctrl_pattern_target_pending.exchange(-1);
     const int patternStep = s_ctrl_pattern_step_pending.exchange(
         0, std::memory_order_acquire);
-    if (patternStep != 0) {
-        int nextPattern = (p4.current_pattern + patternStep)
+    if (patternStep != 0 || targetPattern>=0) {
+        int nextPattern = ((targetPattern>=0 ? targetPattern : p4.current_pattern) + patternStep)
                         % Config::MAX_PATTERNS;
         if (nextPattern < 0) nextPattern += Config::MAX_PATTERNS;
+        if(targetPattern>=0 && p4.is_playing) {
+            seq_queued_pattern=nextPattern;
+            control_send_queue_pattern(nextPattern);
+        } else {
         seq_queued_pattern = -1;
         control_send_select_pattern(nextPattern);
         // This runs on Core 1 (loop): the grid repaint must happen on the
         // LVGL task — request it instead of calling the widget code here.
         ui_request_sequencer_resync();
+        }
     }
 
+    bool groupChanged=false;
+    for(int group=0;group<4;++group) {
+        const int request=s_ctrl_group_variation[group].exchange(-1);
+        if(request>=0 && (request>>10)==p4.current_pattern && ((request>>8)&3)==seq_page)
+            groupChanged=control_apply_group_variation(group,request&255,seq_page) || groupChanged;
+    }
+    if(groupChanged) {
+        s_ui_group_variation_changed=(p4.current_pattern<<2)|seq_page;
+        s_ctrl_pattern_sync_pending=true;
+    }
     if (s_ctrl_pattern_sync_pending.exchange(false, std::memory_order_acquire)) {
         control_sync_current_pattern();
     }
@@ -20004,7 +19837,7 @@ static const ScreensaverCreditPage SCREENSAVER_CREDITS[] = {
     },
     {
         "CREW / THE BOYS",
-        "ADRI  /  AITOR  /  BRZUOS\n"
+        "ADRI  /  AITOR  /  BRUZOS\n"
         "FREDY  /  KARZ  /  MARCOS\n"
         "ORIOL  /  VICTURIOSO",
         ""
@@ -20016,7 +19849,7 @@ static const ScreensaverCreditPage SCREENSAVER_CREDITS[] = {
     },
     {
         "AMIGOS / FAMILIARES",
-        "FRANCESC  /  NONE  /  NANDU\n"
+        "FRENETIK  /  NONE  /  NANDU\n"
         "LIMA  /  TILLO  /  XARLY\n"
         "ERNEST  /  PAULA  /  NARCIS\n"
         "GRIMAL  /  PANDA  /  GARBIN",
@@ -20290,6 +20123,14 @@ static void screensaver_tick(void) {
 #include "ui_bank_contexts.inc"
 
 void ui_update_current_screen(void) {
+    const int groupChanged=s_ui_group_variation_changed.exchange(-1);
+    if(groupChanged>=0 && groupChanged==((p4.current_pattern<<2)|seq_page)) {
+        for(int t=0;t<16;++t) for(int s=0;s<16;++s)
+            seq_raw_grid[t][seq_page*16+s]=p4.steps[t][s];
+        seq_force_refresh_cells=true;
+        undo_note_pattern_snapshot_taken();
+        seq_set_pattern_dirty(true);
+    }
     seq_save_poll();
     static bool syncFailed = false;
     const uint8_t sync = control_pattern_sync_state();
@@ -20602,5 +20443,5 @@ void ui_update_current_screen(void) {
              p4sd.needs_refresh.exchange(false, std::memory_order_acq_rel)) {
         sd_refresh_ui();
     }
-    else if (active == scr_performance) xtra_pages_poll();
+    else if (active == scr_performance) xtra_directories_poll();
 }

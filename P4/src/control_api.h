@@ -44,6 +44,7 @@ enum SequencerVariation : uint8_t {
     SEQ_VAR_UNDO
 };
 bool control_apply_sequencer_variation(uint8_t variation);
+bool control_apply_group_variation(uint8_t group,uint8_t variation,uint8_t page=0);
 bool control_variation_can_undo();
 void control_variation_snapshot_current();
 
@@ -114,10 +115,14 @@ uint8_t control_random_mix_bars();
 // MUTATE -> EVOLVE framing.
 void control_random_evolve_set_active(bool active);
 bool control_random_evolve_active();
-void control_random_evolve_set_bars(uint8_t bars);      // 1/2/4/8
+void control_random_evolve_set_bars(uint8_t bars);      // 1..16
 uint8_t control_random_evolve_bars();
 void control_random_evolve_set_amount(uint8_t amount);  // 0-100
 uint8_t control_random_evolve_amount();
+void control_random_evolve_set_mode(uint8_t mode);
+uint8_t control_random_evolve_mode();
+void control_random_evolve_set_scope(uint8_t scope);
+uint8_t control_random_evolve_scope();
 void control_random_evolve_apply_now();                 // one manual pass
 
 // AUTO VARIATIONS: a fifth bar-clock auto mode alongside SONG/FX/MIX/EVOLVE

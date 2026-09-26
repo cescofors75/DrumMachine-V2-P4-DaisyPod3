@@ -40,6 +40,7 @@ uint16_t DaisyUsbTransport::crc16(const uint8_t* data, uint16_t length)
 void DaisyUsbTransport::begin()
 {
     state_ = {};
+    pod_button_events_.clear();
     sequence_.store(0, std::memory_order_relaxed);
     sample_end_ack_revision_.store(0, std::memory_order_relaxed);
     sample_end_ack_pad_.store(0xFFu, std::memory_order_relaxed);
@@ -50,6 +51,13 @@ void DaisyUsbTransport::begin()
     pending_query_command_ = 0;
     pending_query_sequence_ = 0;
     pending_query_since_ms_ = 0;
+}
+
+bool DaisyUsbTransport::requestFileList(const char* folder, uint16_t& sequence)
+{
+    SdListFilesPayload payload={};
+    snprintf(payload.folderName,sizeof(payload.folderName),"%s",folder);
+    return sendPacket(CMD_SD_LIST_FILES,&payload,sizeof(payload),&sequence);
 }
 
 bool DaisyUsbTransport::send(uint8_t command, const void* payload,
@@ -505,6 +513,11 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
             state_.sd_spi_errors = static_cast<uint16_t>(payload[85])
                                  | (static_cast<uint16_t>(payload[86]) << 8);
         }
+        state_.daisy_audio_diagnostics_seen=header->length>=92;
+        if(state_.daisy_audio_diagnostics_seen) {
+            memcpy(&state_.daisy_audio_deadline_trips,payload+87,4);
+            state_.daisy_audio_fx_shed=payload[91]!=0;
+        }
     }
     else if(header->cmd == CMD_SAMPLE_END && header->length >= 2)
     {
@@ -551,6 +564,8 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
             memcpy(state_.daisy_sd_files, payload + 1, count * 32u);
         for(uint8_t i = 0; i < count; i++)
             state_.daisy_sd_files[i][31] = '\0';
+        state_.daisy_sd_files_revision++;
+        state_.daisy_sd_files_sequence=header->sequence;
         state_.daisy_sd_revision++;
     }
     else if((header->cmd == CMD_POD_GET_STATE
@@ -558,6 +573,11 @@ void DaisyUsbTransport::handleResponse(const uint8_t* packet,
             && header->length >= sizeof(PodStatePayload))
     {
         memcpy(&state_.pod, payload, sizeof(PodStatePayload));
+        // Only GET consumes Daisy's latched events. SET_CONFIG echoes them
+        // without clearing them, so dispatching that echo would double-toggle.
+        if(header->cmd == CMD_POD_GET_STATE
+           && state_.pod.config.version == POD_CONFIG_VERSION)
+            pod_button_events_.publish(state_.pod.buttonPressEvents);
         state_.pod_revision++;
     }
     else if(header->cmd == CMD_MIDI_GET_EVENTS && header->length >= 1)
@@ -633,6 +653,7 @@ void DaisyUsbTransport::process()
 
     if(!state_.link_ready)
     {
+        pod_button_events_.clear();
         state_.engine_responding = false;
         state_.protocol_version = 0;
         state_.capability_flags = 0;

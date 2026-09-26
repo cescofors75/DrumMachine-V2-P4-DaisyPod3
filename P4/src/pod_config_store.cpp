@@ -5,11 +5,8 @@
 
 namespace {
 constexpr uint32_t POD_STORE_MAGIC = 0x32444F50u; // "POD2"
-// v4 moves button2's factory default from CONTROL_CONFIG (opens STATUS) to
-// UNDO — STATUS stays reachable from its own on-screen "STATUS" cell, but
-// undo needed a dedicated physical button for fast recovery while playing
-// live. Later user assignments keep persisting normally until the
-// wire/config schema is intentionally migrated again.
+// Keep the v4 storage format. Sanitization reserves the two navigation
+// buttons while preserving the other saved assignments and LED settings.
 constexpr uint16_t POD_STORE_VERSION = 4;
 
 struct PodStoreBlob {
@@ -64,7 +61,7 @@ void pod_config_store_factory_defaults(PodConfigPayload& config)
 {
     config = PodConfigPayload{
         POD_CONFIG_VERSION,
-        POD_FUNC_BACK, POD_FUNC_UNDO,
+        POD_FUNC_BACK, POD_FUNC_NONE,
         POD_FUNC_MASTER_VOLUME, POD_FUNC_TEMPO,
         POD_FUNC_PATTERN_NEXT, POD_FUNC_PLAY_TOGGLE,
         POD_FUNC_DELAY_MIX, POD_FUNC_REVERB_MIX,
@@ -80,6 +77,10 @@ void pod_config_store_sanitize(PodConfigPayload& config)
 {
     config.version = POD_CONFIG_VERSION;
     config.selectorFunction = POD_FUNC_NONE;
+    // The two Pod buttons are UI navigation controls. Button 2 must do no
+    // audio action on Daisy; P4 consumes its press event to toggle the overlay.
+    config.button1Function = POD_FUNC_BACK;
+    config.button2Function = POD_FUNC_NONE;
     uint8_t* functionFields[11] = {};
     fields(config, functionFields);
     for(uint8_t i = 0; i < 11; ++i)

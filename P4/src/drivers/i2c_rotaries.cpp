@@ -1,5 +1,6 @@
 #include "i2c_rotaries.h"
 #include "../ui/bank_input.h"
+#include "../../../shared/rotary_steps.h"
 
 #include "../app_state.h"
 #include "../control_api.h"
@@ -715,11 +716,13 @@ void i2c_rotaries_poll()
     if(wasPresent && s_haveValue[index]) {
         const int diff = int(value)-int(s_values[index].load());
         if(diff) {
-            const int ticks = (abs(diff)+25)/51;
-            bank_input::rotate(index, (diff > 0 ? 1 : -1)*(ticks ? ticks : 1), bankEpoch);
+            const int ticks=rotary::detents(diff,kRotaryGain);
+            if(ticks) bank_input::rotate(index,ticks,bankEpoch);
         }
     }
-    uint16_t feedback = bank_input::leds[index].load();
+    // Keep one physical detent of headroom at both counter limits. Otherwise
+    // low percentages are clipped to < half a detent and cannot return to zero.
+    uint16_t feedback = constrain(bank_input::leds[index].load(), kRotaryGain, 1023-kRotaryGain);
     if(value != feedback && writeBigEndian16(rotaryAddress(index), kCountRegister, feedback))
         value = feedback;
     if(!s_haveValue[index]

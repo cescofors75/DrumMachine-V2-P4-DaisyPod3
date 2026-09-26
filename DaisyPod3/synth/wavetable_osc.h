@@ -33,6 +33,7 @@
  *
  * ═══════════════════════════════════════════════════════════════════ */
 #pragma once
+#include "../../shared/note_transition.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -121,6 +122,7 @@ struct WtVoice {
     float    envDecCoef= 0.9995f;  /* per-sample decay multiplier      */
     uint8_t  envStage  = 2;        /* 0=atk  1=dec  2=idle             */
     uint32_t age       = 0;
+    audio::NoteTransition transition;
 };
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -154,11 +156,13 @@ public:
     void NoteOn(uint8_t note, float vel, float wave_pos_override = -1.0f) {
         int slot = AllocVoice(note);
         WtVoice& v = voices_[slot];
+        const bool sounding=v.active;
+        v.transition.restart(sounding);
 
         float freq     = MidiToHz(note);
         v.active       = true;
         v.note         = note;
-        v.phase        = 0.0f;
+        if(!sounding) v.phase=0.f;
         v.phase_inc    = freq * (float)WT_TABLE_SIZE / sr_;
         v.wave_pos     = (wave_pos_override >= 0.0f) ? wave_pos_override : globalWavePos_;
 
@@ -199,6 +203,7 @@ public:
         }
 
         float out = 0.0f;
+        const float pitchMod=(lfoDepth_>.001f && lfoTarget_==WT_LFO_PITCH) ? powf(2.f,lfoVal*.5f) : 1.f;
 
         for(int vi = 0; vi < WT_MAX_VOICES; vi++) {
             WtVoice& v = voices_[vi];
@@ -227,7 +232,7 @@ public:
                         break;
                     case WT_LFO_PITCH:
                         /* ±0.5 octava de vibrato */
-                        phase_inc_mod *= powf(2.0f, lfoVal * 0.5f);
+                        phase_inc_mod *= pitchMod;
                         break;
                     case WT_LFO_VOL:
                         vol_mod = WTOSC_CLAMP(1.0f + lfoVal, 0.0f, 1.5f);
@@ -256,7 +261,7 @@ public:
             if(v.phase >= (float)WT_TABLE_SIZE) v.phase -= (float)WT_TABLE_SIZE;
 
             /* ── Acumular en salida ── */
-            out += s * v.env * v.gainL * vol_mod;
+            out += v.transition.process(s * v.env * v.gainL * vol_mod);
         }
 
         /* ── Filter compartido ── */

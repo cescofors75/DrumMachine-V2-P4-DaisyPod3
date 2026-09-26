@@ -39,6 +39,7 @@
  *    float s = acid.Process();
  * ═══════════════════════════════════════════════════════════════════ */
 #pragma once
+#include "../../shared/note_transition.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -380,6 +381,7 @@ public:
      *  Init — debe llamarse antes de cualquier uso
      * ───────────────────────────────────────────── */
     void Init(float sampleRate) {
+        transition_={};
         sr_  = sampleRate;
         dt_  = 1.0f / sr_;
 
@@ -409,6 +411,7 @@ public:
      *  NoteOn (frecuencia en Hz)
      * ───────────────────────────────────────────── */
     void NoteOn(float freqHz, bool accent = false, bool slide = false) {
+        transition_.restart(active_ && !slide);
         targetFreq_ = Clamp(freqHz, 20.0f, 5000.0f);
         accent_     = accent;
 
@@ -544,7 +547,7 @@ public:
         }
 
         /* ── 6. FILTRO LADDER ── */
-        if (accent_) accentChirpEnv_ *= accentChirpCoef_;  /* 25ms decay chirp */
+        accentChirpEnv_ *= accentChirpCoef_;  /* also decay after a non-accented retrigger */
         float envAmount = params.envMod * 12000.0f * fEnv;
         float fc = Clamp(params.cutoff + envAmount + accentChirpEnv_, 20.0f, sr_ * 0.48f);
 
@@ -563,7 +566,7 @@ public:
         /* ── 9. DC BLOCKER ── */
         output = dcBlock_.Process(output);
 
-        return output;
+        return transition_.process(output);
     }
 
     /* ── Estado ── */
@@ -620,6 +623,7 @@ private:
     }
 
     /* ── Motor DSP ── */
+    audio::NoteTransition transition_;
     float sr_  = 48000.0f;
     float dt_  = 1.0f / 48000.0f;
 

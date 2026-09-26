@@ -46,6 +46,7 @@
  *  48 kHz  float32  C++14  header-only  sin dependencias externas
  * ═══════════════════════════════════════════════════════════════════ */
 #pragma once
+#include "../../shared/note_transition.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -128,7 +129,7 @@ class Adsr {
 public:
     enum Stage { IDLE=0, ATTACK, DECAY, SUSTAIN, RELEASE };
 
-    void Init(float sr) { sr_ = sr; stage_ = IDLE; val_ = 0.0f; }
+    void Init(float sr) { sr_ = sr; stage_ = IDLE; val_ = 0.0f; cachedDec_=cachedRel_=-1.f; }
 
     void Gate(bool on) {
         if (on) {
@@ -142,6 +143,8 @@ public:
 
     /* Curva RC exponencial en decay/release (caracter analogico) */
     float Process(float atk_s, float dec_s, float sustain, float rel_s) {
+        if(dec_s!=cachedDec_) { cachedDec_=dec_s; decayCoef_=expf(-1.f/Clamp(dec_s*sr_,1.f,sr_*20.f)); }
+        if(rel_s!=cachedRel_) { cachedRel_=rel_s; releaseCoef_=expf(-1.f/Clamp(rel_s*sr_,1.f,sr_*20.f)); }
         switch (stage_) {
             case ATTACK:
                 val_ += 1.0f / Clamp(atk_s * sr_, 1.0f, sr_ * 10.0f);
@@ -149,7 +152,7 @@ public:
                 break;
             case DECAY: {
                 float tgt = Clamp(sustain, 0.0f, 1.0f);
-                float coef = expf(-1.0f / Clamp(dec_s * sr_, 1.0f, sr_ * 20.0f));
+                const float coef=decayCoef_;
                 val_ = tgt + (val_ - tgt) * coef;   /* RC exponencial A1 */
                 if (fabsf(val_ - tgt) < 0.0005f) { val_ = tgt; stage_ = SUSTAIN; }
                 break;
@@ -158,7 +161,7 @@ public:
                 val_ = Clamp(sustain, 0.0f, 1.0f);
                 break;
             case RELEASE: {
-                float coef = expf(-1.0f / Clamp(rel_s * sr_, 1.0f, sr_ * 20.0f));
+                const float coef=releaseCoef_;
                 val_ *= coef;   /* RC exponencial A1 */
                 if (val_ < 0.0001f) { val_ = 0.0f; stage_ = IDLE; }
                 break;
@@ -176,6 +179,7 @@ public:
 private:
     float   sr_    = 48000.0f;
     float   val_   = 0.0f;
+    float cachedDec_=-1.f,cachedRel_=-1.f,decayCoef_=0.f,releaseCoef_=0.f;
     Stage   stage_ = IDLE;
 };
 
@@ -279,6 +283,7 @@ public:
     Params params;
 
     void Init(float sr) {
+        transition_={}; cachedPorta_=-1.f; filterCounter_=0;
         sr_       = sr;
         dt_       = 1.0f / sr;
         active_   = false;
@@ -299,6 +304,7 @@ public:
     }
 
     void NoteOn(uint8_t midiNote, float velocity = 1.0f) {
+        transition_.restart(active_);
         float newFreq = MidiToHz(midiNote);
         if (!active_) {
             /* Primera nota — iniciar desde cero */
@@ -336,9 +342,11 @@ public:
 
         /* ── Portamento ── */
         if (params.portamento > 0.01f) {
-            float portaTime = powf(params.portamento, 2.0f) * 2.0f + 0.001f;
-            float portaK    = expf(-dt_ / portaTime);
-            currentFreq_    = targetFreq_ + (currentFreq_ - targetFreq_) * portaK;
+            if(params.portamento!=cachedPorta_) {
+                cachedPorta_=params.portamento;
+                portaK_=expf(-dt_/(cachedPorta_*cachedPorta_*2.f+.001f));
+            }
+            currentFreq_ = targetFreq_ + (currentFreq_ - targetFreq_) * portaK_;
         } else {
             currentFreq_ = targetFreq_;
         }
@@ -430,7 +438,8 @@ public:
         cutoffEff = Clamp(cutoffEff, 20.0f, sr_ * 0.47f);
 
         /* Actualizar filtro (solo si cambio significativo) */
-        filter_.SetParams(cutoffEff, params.resonance);
+        if(filterCounter_++==0) filter_.SetParams(cutoffEff, params.resonance);
+        filterCounter_ &= 7u;
 
         /* ── VCF ── */
         float filtered = filter_.Process(osc);
@@ -444,7 +453,7 @@ public:
             active_ = false;
         }
 
-        return filtered * vca * velocity_ * params.volume;
+        return transition_.process(filtered * vca * velocity_ * params.volume);
     }
 
     bool IsActive() const { return active_; }
@@ -488,6 +497,9 @@ private:
     uint8_t  currentNote_= 60;
     float    currentFreq_= 261.63f;
     float    targetFreq_ = 261.63f;
+    float cachedPorta_=-1.f,portaK_=0.f;
+    uint8_t filterCounter_=0;
+    audio::NoteTransition transition_;
 
     Adsr         vcaEnv_;
     Adsr         vcfEnv_;

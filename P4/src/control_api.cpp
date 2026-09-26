@@ -1,5 +1,6 @@
 #include "control_api.h"
 #include "../../shared/pattern_transfer.h"
+#include "../../shared/sequence_group_variations.h"
 
 #include "app_state.h"
 #include "daisy_usb_transport.h"
@@ -18,6 +19,8 @@
 #include <ctype.h>
 #include <math.h>
 #include <string.h>
+
+static void SendCompleteStep(int track, int step);
 
 namespace
 {
@@ -971,7 +974,7 @@ void control_send_tempo(float bpm)
     if(i2c_rotaries_owns_function(POD_FUNC_TEMPO)
        && !i2c_rotaries_is_applying())
         return;
-    bpm = Clamp(bpm, 40.0f, 240.0f);
+    bpm = Clamp(bpm, 40.0f, 300.0f);
     SequencerInstance().setTempo(bpm);
     p4.bpm_int = static_cast<int>(bpm);
     p4.bpm_frac = static_cast<int>((bpm - p4.bpm_int) * 10.0f + 0.5f);
@@ -1461,6 +1464,7 @@ uint8_t songStyle = RND_STYLE_TECHNO;
 bool songCurated = false;      // RANDOM SONG: written scene order vs weighted random
 bool autoToastEnabled = true;  // SONG/VARIATIONS/FX/MIX auto-tick toasts, one switch
 uint8_t evolveAmount = 40;   // 0-100, dial default
+uint8_t evolveMode=0,evolveScope=0;
 
 // Per-track base "freedom" (0-100): how much a track's step probabilities
 // are allowed to drift on each EVOLVE pass. Mirrors the musician's own
@@ -1473,7 +1477,7 @@ const uint8_t kEvolveTrackWeight[16] = {
 };
 // Only tracks at/above this freedom weight are eligible for EVOLVE to wake
 // up a ghost hit on a currently-inactive step — kick/snare's structure
-// never changes no matter the amount, only hats/cymbals/toms/percs do.
+// stays fixed in TODOS; an explicit group selection permits ghost hits.
 const uint8_t kEvolveGhostThreshold = 55;
 
 // Bit s set = EVOLVE itself turned track/step s on (not the user) — so a
@@ -1779,19 +1783,35 @@ bool VariationApply()
     return true;
 }
 
-// One EVOLVE pass. Kick/snare's structure never changes no matter the
-// amount; for the rest, this nudges the probability of steps that are
-// ALREADY active, occasionally wakes a soft "ghost" hit on an inactive
-// step of a high-freedom track (hats/cymbals/toms/percs — never kick/
-// snare) and lets that ghost fade back out on a later pass, and refreshes
-// the pattern's global humanize amount. All scaled by evolveAmount x each
-// track's fixed freedom weight. A 40-100 floor on probability keeps EVOLVE
-// from ever silencing a track entirely on its own — that stays manual.
+// One EVOLVE pass. TODOS protects the kick/snare structure and scales each
+// track by its freedom weight. An explicit note group gets full freedom.
+// Depending on the mode, nudge probabilities, add/retire soft ghost hits,
+// and refresh global humanization. The probability floor is at least 40.
+int evolveHumanizePattern=-1;
+uint8_t evolveHumanizeBefore[2]={}, evolveHumanizeLast[2]={};
+void EvolveRestoreHumanize()
+{
+    auto& seq=SequencerInstance();
+    if(evolveHumanizePattern==p4.current_pattern &&
+       seq.getHumanizeTimingMs()==evolveHumanizeLast[0] &&
+       seq.getHumanizeVelocityAmount()==evolveHumanizeLast[1]) {
+        seq.setHumanize(evolveHumanizeBefore[0],evolveHumanizeBefore[1]);
+        SendWithRetry(CMD_DSQ_SET_HUMANIZE,evolveHumanizeBefore,2);
+    }
+    evolveHumanizePattern=-1;
+}
 void EvolveApply()
 {
     if(evolveAmount == 0) return;
     Sequencer& sequencer = SequencerInstance();
     const int pattern = Clamp(p4.current_pattern, 0, MAX_PATTERNS - 1);
+    if(evolveHumanizePattern!=pattern ||
+       sequencer.getHumanizeTimingMs()!=evolveHumanizeLast[0] ||
+       sequencer.getHumanizeVelocityAmount()!=evolveHumanizeLast[1]) {
+        evolveHumanizePattern=pattern;
+        evolveHumanizeBefore[0]=sequencer.getHumanizeTimingMs();
+        evolveHumanizeBefore[1]=sequencer.getHumanizeVelocityAmount();
+    }
     if(pattern != evolveGhostPattern)
     {
         memset(evolveGhostMask, 0, sizeof(evolveGhostMask));
@@ -1802,8 +1822,11 @@ void EvolveApply()
     // bar-gated, once set. DaisyPod3 already anchors kick/snare timing
     // (quarters their max jitter) so this alone gives "velocity/microtiming
     // fluctuan suavemente" without any extra per-track logic here.
-    const uint8_t timingMs = (uint8_t)((evolveAmount * 15) / 100);
-    const uint8_t velAmount = (uint8_t)((evolveAmount * 35) / 100);
+    const bool mixed=evolveMode==0 || evolveMode==7;
+    const int strength=evolveMode==7 ? evolveAmount/2 : evolveAmount;
+    const uint8_t timingMs = mixed || evolveMode==2 ? uint8_t(strength*15/100) : evolveHumanizeBefore[0];
+    const uint8_t velAmount = mixed || evolveMode==3 ? uint8_t(strength*35/100) : evolveHumanizeBefore[1];
+    evolveHumanizeLast[0]=timingMs; evolveHumanizeLast[1]=velAmount;
     sequencer.setHumanize(timingMs, velAmount);
     const uint8_t humanizePayload[2] = {timingMs, velAmount};
     SendWithRetry(CMD_DSQ_SET_HUMANIZE, humanizePayload, sizeof(humanizePayload));
@@ -1811,7 +1834,9 @@ void EvolveApply()
     bool anyChanged = false;
     for(int track = 0; track < 16; ++track)
     {
-        const int weight = (evolveAmount * kEvolveTrackWeight[track]) / 100;
+        if(evolveMode==2 || evolveMode==3) continue;
+        if(evolveScope && !(seqgroups::masks[evolveScope-1] & (1u<<track))) continue;
+        const int weight = (strength * (evolveScope ? 100 : kEvolveTrackWeight[track])) / 100;
         if(weight <= 0) continue;
         for(int step = 0; step < 16; ++step)
         {
@@ -1826,31 +1851,38 @@ void EvolveApply()
                     // and go instead of piling up permanently.
                     if(randomRange(0, 99) < weight / 2)
                     {
-                        control_send_set_step(track, step, false);
-                        control_send_set_step_probability(track, step, 100);
+                        sequencer.setStep(pattern,track,step,false,sequencer.getStepVelocity(pattern,track,step));
+                        sequencer.setStepProbability(pattern,track,step,100);
+                        p4.steps[track][step]=false;
+                        SendCompleteStep(track,step);
                         evolveGhostMask[track] &= (uint16_t)~(1u << step);
                         anyChanged = true;
                     }
                     continue;
                 }
                 // Existing, user-programmed hit: nudge its probability.
+                if(evolveMode==4 || evolveMode==6) continue;
                 if(randomRange(0, 99) >= weight) continue;
                 const uint8_t current = sequencer.getStepProbability(pattern, track, step);
-                const int next = Clamp((int)current + (int)randomRange(-25, 25), 40, 100);
+                const int next = Clamp((int)current + (int)randomRange(-25, evolveMode==5 ? -1 : 25), 40, 100);
                 if(next == (int)current) continue;
                 control_send_set_step_probability(track, step, next);
                 anyChanged = true;
             }
-            else if(kEvolveTrackWeight[track] >= kEvolveGhostThreshold)
+            else if(evolveMode!=1 && evolveMode!=5 && (evolveScope || kEvolveTrackWeight[track] >= kEvolveGhostThreshold))
             {
                 // Ghost note: wake a soft, syncopated hit on an inactive
                 // step — rarer than a probability nudge, and only ever on
                 // the freest tracks.
-                const int ghostChance = weight / 4;
+                const int ghostChance = weight / (evolveMode==6 ? 2 : 4);
                 if(ghostChance <= 0 || randomRange(0, 99) >= ghostChance) continue;
-                control_send_set_step(track, step, true);
-                control_send_set_step_velocity(track, step, (int)randomRange(45, 85));
-                control_send_set_step_probability(track, step, (int)randomRange(50, 80));
+                // Publish the complete soft hit once. Sending active first
+                // exposed the old loud velocity/ratchet to the audio ISR.
+                sequencer.setStep(pattern,track,step,true,(uint8_t)randomRange(45,85));
+                sequencer.setStepProbability(pattern,track,step,(uint8_t)randomRange(50,80));
+                sequencer.setStepRatchet(pattern,track,step,1);
+                p4.steps[track][step]=true;
+                SendCompleteStep(track,step);
                 evolveGhostMask[track] |= (uint16_t)(1u << step);
                 anyChanged = true;
             }
@@ -1910,18 +1942,24 @@ void control_random_evolve_set_active(bool active)
 {
     evolveClock.active = active;
     evolveClock.windowOpen = false;
+    if(!active) EvolveRestoreHumanize();
 }
 bool control_random_evolve_active() { return evolveClock.active; }
 void control_random_evolve_set_bars(uint8_t bars)
 {
-    evolveClock.bars = bars < 1 ? 1 : (bars > 8 ? 8 : bars);
+    evolveClock.bars = bars < 1 ? 1 : (bars > 16 ? 16 : bars);
 }
 uint8_t control_random_evolve_bars() { return evolveClock.bars; }
 void control_random_evolve_set_amount(uint8_t amount)
 {
     evolveAmount = amount > 100 ? 100 : amount;
+    if(evolveAmount==0) EvolveRestoreHumanize();
 }
 uint8_t control_random_evolve_amount() { return evolveAmount; }
+void control_random_evolve_set_mode(uint8_t mode) { EvolveRestoreHumanize(); evolveMode=mode>7 ? 7 : mode; }
+uint8_t control_random_evolve_mode() { return evolveMode; }
+void control_random_evolve_set_scope(uint8_t scope) { evolveScope=scope>4 ? 4 : scope; }
+uint8_t control_random_evolve_scope() { return evolveScope; }
 void control_random_evolve_apply_now() { EvolveApply(); }
 
 void control_random_variation_set_active(bool active)
@@ -1971,6 +2009,10 @@ bool control_matrix_get_entry(uint8_t idx, MatrixStepEntry* out)
 // what "random" means for each.
 void control_random_auto_tick()
 {
+    // Do not mutate either scene while its transfer/selection is in flight.
+    if(patternSyncState.load()==1 || pendingSelectUpload.load()>=0 ||
+       pendingQueueUpload.load()>=0 || queuedLogicalPattern>=0 ||
+       expectedDaisyPattern!=0xFF) return;
     if(barClockTick(songClock)) triggerRandomSongJump();
     // FX/MIX re-randomization manipulates LVGL widgets and animations, so
     // it must run on the LVGL task — request it instead of calling it here.
@@ -2003,6 +2045,8 @@ void control_variation_snapshot_current()
         }
     }
 }
+
+#include "control_group_variations.inc"
 
 bool control_variation_can_undo()
 {

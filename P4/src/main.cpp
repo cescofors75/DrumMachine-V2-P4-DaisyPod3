@@ -19,6 +19,7 @@
 #include "settings_store.h"
 
 #include "usb_cdc_handler.h"
+#include "midi_din.h"
 
 void setup() {
     // 1. Debug serial (only waits if debug logging is enabled)
@@ -93,6 +94,7 @@ void setup() {
     P4_LOG_PRINTLN("[INIT] USB-C Host for DaisyPod3...");
     p4boot.usb_host_ready = usb_cdc_init();
     control_init();
+    midi_din_begin();
     p4boot.factory_patterns_found = control_factory_patterns_found();
     p4boot.factory_patterns_expected = control_factory_patterns_expected();
     p4boot.patterns_ready = control_patterns_ready();
@@ -118,6 +120,7 @@ void loop() {
     // Enumerate USB first, then exchange the binary P4/Daisy command stream.
     usb_cdc_process();
     control_process();
+    midi_din_process();
 
     // Apply the latest absolute SEN0502 values. External I2C is acquired by
     // its dedicated Wire1 task and never touches the GT911 bus.

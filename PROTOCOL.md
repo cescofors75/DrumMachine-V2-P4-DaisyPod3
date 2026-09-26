@@ -90,3 +90,13 @@ canónico está en `shared/pattern_transfer.h`; números multibyte little-endian
 Los comandos de edición puntual siguen disponibles. División ocupa los cuatro
 bits bajos y ratchet-1 los bits 4..5; editar velocidad/probabilidad debe conservar
 el resto de atributos. El swing por pista 0 hereda el global; 1..100 lo sustituye.
+
+
+### Extensión GET_STATUS: diagnóstico de carga de audio (SEQUENCER_REVIEW)
+
+El payload conserva los bytes 0–86 y pasa a 92 bytes. En 87–90 se añade un
+uint32 little-endian con el contador acumulado de bloques cortados por el
+presupuesto de audio desde arranque; byte 91 indica protección de FX por carga
+(0 normal, 1 reducidos). El receptor debe comprobar longitud >= 92. No indica
+por sí mismo clipping ni cuenta voces de síntesis. P4 muestra N/D para la
+protección si el firmware remoto no incluye esta extensión.

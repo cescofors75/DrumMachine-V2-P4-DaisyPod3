@@ -24,11 +24,18 @@
 #include "mpd218_mapping.h"
 #include "../shared/pattern_transfer.h"
 #include "../shared/step_timing.h"
+#include "../shared/sampler_retrigger.h"
+#include "../shared/audio_deadline.h"
+#include "../shared/midi_input.h"
 #include <string.h>
 #include <math.h>
 #include <new>
 #include <stdio.h>
 #include <strings.h>
+extern "C" {
+#include "usbd_def.h"
+extern USBD_HandleTypeDef hUsbDeviceFS;
+}
 
 #ifndef RED808_DSP_BLOCK_PROFILE
 #define RED808_DSP_BLOCK_PROFILE 0
@@ -75,12 +82,18 @@ static inline float __fast_expf(float x) {
 using namespace daisy;
 using namespace daisysp;
 
+#ifndef DAISY_LEGACY_MIDI_UART
+#define DAISY_LEGACY_MIDI_UART 1
+#endif
+
+#if DAISY_LEGACY_MIDI_UART
 /* libDaisy's MIDI handler owns a 256-event FIFO (~38 KiB). Keep that FIFO in
  * the otherwise-unused D2 RAM instead of consuming nearly all of DTCMRAM.
  * It is constructed after hardware init because this section is NOLOAD. */
 alignas(MidiUartHandler)
 static uint8_t mpdMidiStorage[sizeof(MidiUartHandler)]
     __attribute__((section(".heap")));
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  *  1. HARDWARE
@@ -119,12 +132,14 @@ struct DaisyPod3Hardware
         knob1.Init(seed.adc.GetPtr(0), seed.AudioCallbackRate());
         knob2.Init(seed.adc.GetPtr(1), seed.AudioCallbackRate());
 
+#if DAISY_LEGACY_MIDI_UART
         /* TRS MIDI IN Type A: RX=D14/PB7. TX is deliberately disabled because
          * D13/PB6 is already the encoder push switch on this custom Pod. */
         midi = new (mpdMidiStorage) MidiUartHandler();
         MidiUartHandler::Config midiConfig;
         midiConfig.transport_config.tx = Pin();
         midi->Init(midiConfig);
+#endif
     }
 
     void SetAudioBlockSize(size_t size)
@@ -143,7 +158,11 @@ struct DaisyPod3Hardware
 
     void StartAudio(AudioHandle::AudioCallback callback) { seed.StartAudio(callback); }
     void StartAdc() { seed.adc.Start(); }
-    void StartMidi() { midi->StartReceive(); }
+    void StartMidi() {
+#if DAISY_LEGACY_MIDI_UART
+        midi->StartReceive();
+#endif
+    }
 
     void ProcessAllControls()
     {
@@ -925,6 +944,9 @@ struct Voice {
     uint32_t fadeInLen;  /* samples; 0 = no fade-in ramp */
     uint32_t fadeOutLen; /* samples; 0 = no fade-out ramp */
     bool     liveSource; /* true when triggered by CMD_TRIGGER_LIVE */
+    bool     sequenced;
+    bool     releasing;
+    float    replacementWeight;
     /* Last routed sample and click-free residual used by voice stealing. */
     float    lastOutL;
     float    lastOutR;
@@ -1213,8 +1235,10 @@ static bool PodFunctionsConflict(uint8_t left, uint8_t right)
 
 static bool PodOwnsFunction(uint8_t function)
 {
-    return podConfig.knob1Function == function
-        || podConfig.knob2Function == function;
+    // Assignments route physical knobs; they must not lock out USB/MIDI.
+    // Physical pots publish only when moved, so the last writer wins.
+    (void)function;
+    return false;
 }
 
 static bool PodOwnsBitDepth()
@@ -1309,98 +1333,7 @@ static volatile float masterPeak = 0.0f;
 /* ═══════════════════════════════════════════════════════════════════
  *  10. BiquadEQ  (Audio EQ Cookbook – LP/HP/BP/Notch/Peak/Shelf)
  * ═══════════════════════════════════════════════════════════════════ */
-struct BiquadEQ {
-    float b0=1,b1=0,b2=0,a1=0,a2=0;
-    float z1=0,z2=0;
-
-    float Process(float in){
-        float out = b0*in + z1;
-        z1 = b1*in - a1*out + z2;
-        z2 = b2*in - a2*out;
-        return out;
-    }
-    void Reset(){ z1=z2=0; }
-
-    void SetType(uint8_t t, float freq, float q, float sr, float gainDb=0.f){
-        if(freq<20.f) freq=20.f;
-        if(freq>sr*0.45f) freq=sr*0.45f;
-        if(q<0.3f) q=0.3f;
-        float w = 2.f*(float)M_PI*freq/sr;
-        float s_ = sinf(w), c_ = cosf(w);
-        float a  = s_/(2.f*q);
-        float a0i;
-        switch(t){
-            case FTYPE_LOWPASS:
-                a0i = 1.f/(1.f+a);
-                b0 = ((1.f-c_)*0.5f)*a0i;
-                b1 = (1.f-c_)*a0i;
-                b2 = b0; a1=(-2.f*c_)*a0i; a2=(1.f-a)*a0i;
-                break;
-            case FTYPE_HIGHPASS:
-                a0i = 1.f/(1.f+a);
-                b0 = ((1.f+c_)*0.5f)*a0i;
-                b1 = -(1.f+c_)*a0i;
-                b2 = b0; a1=(-2.f*c_)*a0i; a2=(1.f-a)*a0i;
-                break;
-            case FTYPE_BANDPASS:
-                a0i = 1.f/(1.f+a);
-                b0 = a*a0i; b1=0; b2=-b0;
-                a1=(-2.f*c_)*a0i; a2=(1.f-a)*a0i;
-                break;
-            case FTYPE_NOTCH:
-                a0i = 1.f/(1.f+a);
-                b0 = a0i; b1=(-2.f*c_)*a0i; b2=a0i;
-                a1=b1; a2=(1.f-a)*a0i;
-                break;
-            case FTYPE_PEAKING: {
-                float A = pow10f(gainDb / 40.f);
-                a0i = 1.f/(1.f + a/A);
-                b0 = (1.f + a*A)*a0i;
-                b1 = (-2.f*c_)*a0i;
-                b2 = (1.f - a*A)*a0i;
-                a1 = b1; a2 = (1.f - a/A)*a0i;
-                break;
-            }
-            case FTYPE_LOWSHELF: {
-                float A = pow10f(gainDb / 40.f);
-                float sq = 2.f*sqrtf(A)*a;
-                a0i = 1.f/((A+1.f)+(A-1.f)*c_+sq);
-                b0 = A*((A+1.f)-(A-1.f)*c_+sq)*a0i;
-                b1 = 2.f*A*((A-1.f)-(A+1.f)*c_)*a0i;
-                b2 = A*((A+1.f)-(A-1.f)*c_-sq)*a0i;
-                a1 = -2.f*((A-1.f)+(A+1.f)*c_)*a0i;
-                a2 = ((A+1.f)+(A-1.f)*c_-sq)*a0i;
-                break;
-            }
-            case FTYPE_HIGHSHELF: {
-                float A = pow10f(gainDb / 40.f);
-                float sq = 2.f*sqrtf(A)*a;
-                a0i = 1.f/((A+1.f)-(A-1.f)*c_+sq);
-                b0 = A*((A+1.f)+(A-1.f)*c_+sq)*a0i;
-                b1 = -2.f*A*((A-1.f)+(A+1.f)*c_)*a0i;
-                b2 = A*((A+1.f)+(A-1.f)*c_-sq)*a0i;
-                a1 = 2.f*((A-1.f)-(A+1.f)*c_)*a0i;
-                a2 = ((A+1.f)-(A-1.f)*c_+sq)*a0i;
-                break;
-            }
-            case FTYPE_ALLPASS:
-                /* Audio EQ Cookbook — all-pass 2nd order */
-                a0i = 1.f/(1.f+a);
-                b0 = (1.f-a)*a0i; b1=(-2.f*c_)*a0i; b2=1.f;
-                a1 = b1; a2 = (1.f-a)*a0i;
-                break;
-            case FTYPE_RESONANT:
-                /* Resonant LP — same pole pair as LOWPASS; second BiquadEQ stage
-                 * is applied externally for 24 dB/oct + soft saturation.       */
-                a0i = 1.f/(1.f+a);
-                b0 = ((1.f-c_)*0.5f)*a0i;
-                b1 = (1.f-c_)*a0i;
-                b2 = b0; a1=(-2.f*c_)*a0i; a2=(1.f-a)*a0i;
-                break;
-            default: b0=1;b1=b2=a1=a2=0; break;
-        }
-    }
-};
+#include "biquad_eq.h"
 
 static inline float GlobalEqGainDb(uint8_t type)
 {
@@ -2353,14 +2286,14 @@ static constexpr float kDrumBusHeadroom = 0.70f;  // evita clipping al mezclar 8
 // the same engine (in particular PCM pointer/length and filter coefficients).
 static volatile uint16_t synthPresetBusyMask = 0;
 struct SynthPresetUpdate {
-    uint16_t bit;
-    explicit SynthPresetUpdate(uint8_t engine) : bit(uint16_t(1u << engine)) {
-        synthPresetBusyMask |= bit;
+    uint16_t previous;
+    explicit SynthPresetUpdate(uint8_t engine) : previous(synthPresetBusyMask) {
+        synthPresetBusyMask = previous | uint16_t(1u << engine);
         __DMB();
     }
     ~SynthPresetUpdate() {
         __DMB();
-        synthPresetBusyMask &= ~bit;
+        synthPresetBusyMask = previous;
     }
 };
 static uint16_t synthActiveMask = 0x01FF;  /* all 9 engines active */
@@ -2394,6 +2327,11 @@ static constexpr bool kEnableAudioStart = true; /* iniciar audio normal */
 /* El CDC interno transporta paquetes binarios RED808. Los logs de texto se
  * desactivan para que nunca puedan intercalarse con una respuesta al P4. */
 static constexpr bool kEnableStartLog = false;
+// Production CDC carries framed protocol data only. libDaisy's logger uses
+// the same endpoint and becomes blocking after its first successful sends.
+template<class... Args> static void ProtocolDebugLog(const char* format,Args... args) {
+    if(kEnableStartLog) hw.PrintLine(format,args...);
+}
 static constexpr bool kEnableSynthCmdLog = true; /* diagnóstico temporal: preset/note routing */
 static constexpr bool kEnableInitFx = (RED808_ENABLE_INIT_FX != 0);    /* diagnóstico: reactivar InitFX para aislar causa */
 #ifndef RED808_STARTUP_TONE_TEST
@@ -2443,6 +2381,8 @@ static uint8_t perfStressProfile = 0;
 static uint32_t perfStressNextMs = 0;
 static uint8_t perfStressStep = 0;
 static bool audioFxShed = false;
+static uint16_t audioRecoveryBlocks=0;
+static volatile uint32_t audioDeadlineTrips=0;
 static bool startupStressReportActive = false;
 static bool startupStressReportDone = false;
 static uint32_t startupStressStartMs = 0;
@@ -2508,7 +2448,7 @@ static void QueueStartupSectionTag(StartupSectionTag sec)
     startupAnnounceActive = true;
 
     /* Etiqueta textual de sección (si el log USB está activo) */
-    hw.PrintLine(">>> %s <<<", kWords[idx]);
+    ProtocolDebugLog(">>> %s <<<", kWords[idx]);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2811,7 +2751,7 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
                        uint32_t maxSamples,
                        float sourceVolume = 1.0f,
                        float sourcePitch = 1.0f,
-                       bool liveSource = false);
+                       bool liveSource = false, bool sequenced = false);
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Startup self-test en fases
@@ -4285,7 +4225,7 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
                        uint32_t maxSamples,
                        float sourceVolume,
                        float sourcePitch,
-                       bool liveSource)
+                       bool liveSource, bool sequenced)
 {
     if(pad >= MAX_PADS || !sampleLoaded[pad] || padLoading[pad]) return;
 
@@ -4296,17 +4236,20 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
             if(cp == pad) continue;
             if(chokeGroup[cp] == grp){
                 for(int v = 0; v < MAX_VOICES; v++)
-                    if(voices[v].active && voices[v].pad == (uint8_t)cp)
-                        voices[v].active = false;
+                    if(voices[v].active && !voices[v].releasing && voices[v].pad == (uint8_t)cp) {
+                        voices[v].releasing=true;
+                        voices[v].stealTailL=voices[v].lastOutL;
+                        voices[v].stealTailR=voices[v].lastOutR;
+                    }
             }
         }
     }
 
     /* Find a free slot or steal by priority+age. */
-    int slot = -1;
+    int slot = sequenced ? sampler::sequencedSlot(voices,MAX_VOICES,pad) : -1;
 
     /* 1. Free slot */
-    for(int i = 0; i < MAX_VOICES; i++)
+    for(int i = 0; slot < 0 && i < MAX_VOICES; i++)
         if(!voices[i].active){ slot = i; break; }
 
     /* Priority-aware stealing: prefer same-pad, then lowest priority + oldest. */
@@ -4331,6 +4274,7 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
      * The replacement starts now, so timing remains sample-accurate. */
     float stealTailL = voices[slot].active ? voices[slot].lastOutL : 0.0f;
     float stealTailR = voices[slot].active ? voices[slot].lastOutR : 0.0f;
+    voices[slot].replacementWeight = voices[slot].active ? 1.f : 0.f;
 
     /* Non-destructive trim window (see padTrimStartPct comment). start>=end
      * means "no trim set" (covers both the zero-init and any malformed
@@ -4350,6 +4294,8 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
                                           * 0.001f * (float)SAMPLE_RATE);
     voices[slot].fadeOutLen = (uint32_t)(clampF(padFadeOutMs[pad], 0.0f, 255.0f)
                                           * 0.001f * (float)SAMPLE_RATE);
+    // A shortened gate can end inside a nonzero waveform.
+    if(maxSamples && voices[slot].fadeOutLen < 32) voices[slot].fadeOutLen=32;
 
     float gain = (velocity / 127.0f)
                * VolumeByteToGain(trkVol)
@@ -4362,12 +4308,14 @@ static void TriggerPad(uint8_t pad, uint8_t velocity,
 
     voices[slot].active       = true;
     voices[slot].pad          = pad;
-    voices[slot].pos          = padReverse[pad] ? (float)(trimEnd - 1) : (float)trimStart;
+    voices[slot].pos          = padReverse[pad] ? (float)(len - 1) : (float)trimStart;
     voices[slot].speed        = PadPlaybackSpeed(pad, sourcePitch);
     voices[slot].baseGain     = gain;  // gain pre-pan — para LFO vol/pan live update
     voices[slot].gainL        = gL;
     voices[slot].gainR        = gR;
     voices[slot].liveSource   = liveSource;
+    voices[slot].sequenced    = sequenced;
+    voices[slot].releasing    = false;
     voices[slot].lastOutL     = 0.0f;
     voices[slot].lastOutR     = 0.0f;
     voices[slot].stealTailL   = stealTailL;
@@ -4447,6 +4395,7 @@ enum AudioCmdType : uint8_t
     AUDIO_CMD_SYNTH_NOTE_ON,  /* 303/WTOSC/SH101/FM2OP melodic note-on */
     AUDIO_CMD_SYNTH_NOTE_OFF, /* matching note-off / panic-all (engine=0xFF) */
     AUDIO_CMD_PHYS_NOISE,     /* PHYS/NOISE: SetFreq+SetAccent/SetDensity+[Trig]+Active */
+    AUDIO_CMD_TRACK_ENGINE,
 };
 
 struct AudioCmd
@@ -4619,6 +4568,7 @@ static void AudioCmdApplyPhysNoise(const AudioCmd& c)
 
 /* Consumer: AudioCallback only, called once at the top of every block —
  * never from anywhere else (single-consumer ring). */
+static void AudioApplyTrackEngine(uint8_t track, uint8_t engine);
 static void AudioCmdDrainAndApply()
 {
     while(audioCmdTail != audioCmdHead)
@@ -4635,6 +4585,7 @@ static void AudioCmdDrainAndApply()
             case AUDIO_CMD_SYNTH_NOTE_ON:  AudioCmdApplyNoteOn(cmd);       break;
             case AUDIO_CMD_SYNTH_NOTE_OFF: AudioCmdApplyNoteOff(cmd);      break;
             case AUDIO_CMD_PHYS_NOISE:     AudioCmdApplyPhysNoise(cmd);    break;
+            case AUDIO_CMD_TRACK_ENGINE:  AudioApplyTrackEngine(cmd.track,cmd.engine); break;
             default: break;
         }
     }
@@ -4795,7 +4746,7 @@ static void PrintStartupStressReport(uint32_t elapsedMs, const char* phase)
     uint16_t cpuAvg10 = (uint16_t)(AudioCpuAvgPercent() * 10.0f + 0.5f);
     uint16_t cpuPeak10 = (uint16_t)(AudioCpuPeakPercent() * 10.0f + 0.5f);
     uint16_t masterPeak1000 = (uint16_t)(clampF(masterPeak, 0.0f, 4.0f) * 1000.0f + 0.5f);
-    hw.PrintLine("STRESS_REPORT ms=%lu phase=%s cpu_avg=%u.%u cpu_peak=%u.%u voices=%u master_peak=%u.%03u clip=%u spi_err=%u spi_drop=%u loaded=%u",
+    ProtocolDebugLog("STRESS_REPORT ms=%lu phase=%s cpu_avg=%u.%u cpu_peak=%u.%u voices=%u master_peak=%u.%03u clip=%u spi_err=%u spi_drop=%u loaded=%u",
                  (unsigned long)elapsedMs,
                  phase,
                  (unsigned)(cpuAvg10 / 10u),
@@ -4832,7 +4783,7 @@ static void PrintDspProfileReport(uint32_t elapsedMs, const char* phase)
         uint32_t pct10 = (uint32_t)(pct * 10.0f + 0.5f);
         uint32_t avg = (uint32_t)(avgCycles + 0.5f);
         uint32_t peak = snap[i].maxCycles;
-        hw.PrintLine("DSP_PROFILE ms=%lu phase=%s block=%s pct=%lu.%lu avg_cycles=%lu peak_cycles=%lu calls=%lu audio_blocks=%lu",
+        ProtocolDebugLog("DSP_PROFILE ms=%lu phase=%s block=%s pct=%lu.%lu avg_cycles=%lu peak_cycles=%lu calls=%lu audio_blocks=%lu",
                      (unsigned long)elapsedMs,
                      phase,
                      DspProfName(i),
@@ -4866,7 +4817,7 @@ static void BeginStartupStressReport(uint32_t nowMs)
     startupStressLastReportMs = 0;
     startupStressPhase = 255;
     if(kEnableStartLog)
-        hw.PrintLine("STRESS_REPORT_BEGIN seconds=%lu profiles=baseline,synth,full,cooldown audio_out=not_required",
+        ProtocolDebugLog("STRESS_REPORT_BEGIN seconds=%lu profiles=baseline,synth,full,cooldown audio_out=not_required",
                      (unsigned long)kStartupStressSeconds);
 }
 
@@ -4905,7 +4856,7 @@ static void RunStartupStressReport(uint32_t nowMs)
             uint16_t cpuAvg10 = (uint16_t)(AudioCpuAvgPercent() * 10.0f + 0.5f);
             uint16_t cpuPeak10 = (uint16_t)(AudioCpuPeakPercent() * 10.0f + 0.5f);
             uint16_t masterPeak1000 = (uint16_t)(clampF(masterPeak, 0.0f, 4.0f) * 1000.0f + 0.5f);
-            hw.PrintLine("STRESS_REPORT_END cpu_avg=%u.%u cpu_peak=%u.%u voices=%u master_peak=%u.%03u spi_err=%u spi_drop=%u",
+            ProtocolDebugLog("STRESS_REPORT_END cpu_avg=%u.%u cpu_peak=%u.%u voices=%u master_peak=%u.%03u spi_err=%u spi_drop=%u",
                          (unsigned)(cpuAvg10 / 10u),
                          (unsigned)(cpuAvg10 % 10u),
                          (unsigned)(cpuPeak10 / 10u),
@@ -4925,7 +4876,7 @@ static void RunStartupStressReport(uint32_t nowMs)
         startupStressPhase = phase;
         SetPerformanceStressProfile(profile);
         if(kEnableStartLog)
-            hw.PrintLine("STRESS_PHASE ms=%lu phase=%s profile=%u",
+            ProtocolDebugLog("STRESS_PHASE ms=%lu phase=%s profile=%u",
                          (unsigned long)elapsed,
                          StartupStressPhaseName(phase),
                          (unsigned)profile);
@@ -5028,6 +4979,7 @@ static void DsqReleaseHeldNotes(uint8_t track)
 {
     if(track >= DSQ_TRACKS || !dsqHeldNotes[track].active) return;
     DsqHeldNotes& held = dsqHeldNotes[track];
+    if(held.engine<SYNTH_ENGINE_COUNT && (synthPresetBusyMask & (1u<<held.engine))) return;
     if(held.engine >= 3 && held.engine < SYNTH_ENGINE_COUNT
        && melodicOwner[held.engine] >= 0 && melodicOwner[held.engine] != track) {
         memset(&held, 0, sizeof(held));
@@ -5046,6 +4998,23 @@ static void DsqReleaseHeldNotes(uint8_t track)
         default: break;
     }
     memset(&held, 0, sizeof(held));
+}
+
+static void AudioApplyTrackEngine(uint8_t track, uint8_t engine)
+{
+    if(track>=DSQ_TRACKS) return;
+    int8_t next=int8_t(engine);
+    if(next < -1 || next >= SYNTH_ENGINE_COUNT) return;
+    if(next==-1 && !sampleLoaded[track]) next=DsqFallbackEngine(track);
+    const int8_t old=dsqTrackEngine[track];
+    if(old!=next) {
+        pendingTriggers[0][track].active=pendingTriggers[1][track].active=false;
+        DsqReleaseHeldNotes(track);
+        StopPadVoices(track);
+        ReleaseTrackEngine(track,old);
+        padLoop[track]=false;
+    }
+    dsqTrackEngine[track]=next;
 }
 
 /* Dedicated presentation program. It lives in the audio sequencer instead of
@@ -5382,7 +5351,7 @@ static void DsqTriggerTrackNow(uint8_t track, DsqStepFull& s, uint8_t velocity, 
     const float vel = velocity / 127.0f;
     if(!isSynth){
         uint32_t maxS = (div > 1) ? (duration / div) : 0;
-        TriggerPad(track, velocity, 100, 0, maxS, seqVolume);
+        TriggerPad(track, velocity, 100, 0, maxS, seqVolume, 1.f, false, true);
         return;
     }
     if(eng < 3) {
@@ -5542,6 +5511,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                    size_t                    size)
 {
     audioLoadMeter.OnBlockStart();
+    const uint32_t deadlineStart=System::GetTick();
+    const uint32_t deadlineBudget=uint32_t(uint64_t(System::GetTickFreq())*size*9u/(uint64_t(SAMPLE_RATE)*10u));
     DSP_PROF_SCOPE(CALLBACK);
 
     /* Enforce FZ+DN in ISR context (belt-and-suspenders for FPDSCR) */
@@ -5556,8 +5527,9 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
      * never starved while one of those states is active. */
     if(patternCommitState == 1) {
         __DMB();
-        if(patternTransfer.slot == dseq.currentPattern)
-            DsqReleaseAllHeldNotes();
+        // Editing the current pattern must not cancel the pair of steps
+        // already scheduled or release melodic gates midway through a note.
+        // Pending triggers own snapshots; the next pair reads the new buffer.
         auto* old = dsqSteps[patternTransfer.slot];
         dsqSteps[patternTransfer.slot] = dsqStaging;
         dsqStaging = old;
@@ -5620,7 +5592,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
     float mixPeak = 0.0f;
 
     float blockCpuAvg = AudioCpuAvgPercent();
-    if(blockCpuAvg > 86.0f)
+    if(audioRecoveryBlocks) { --audioRecoveryBlocks; audioFxShed=true; }
+    else if(blockCpuAvg > 80.0f)
         audioFxShed = true;
     else if(blockCpuAvg < 68.0f)
         audioFxShed = false;
@@ -5636,8 +5609,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             engTrk[_e] = (int8_t)_t;
     }
 
-    const bool revEng = IsReverbEngaged();
-    const bool delEng = IsDelayEngaged();
+    const bool revEng = !fxShed && IsReverbEngaged();
+    const bool delEng = !fxShed && IsDelayEngaged();
     const bool choEng = !fxShed && IsChorusEngaged();
     bool anyTrackLfo = false;
     for(int _t = 0; _t < MAX_PADS; _t++){
@@ -5655,10 +5628,24 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
     UpdateTrackFilterSmoothing();
     UpdateGlobalFilterSmoothing();
 
-    float lfoVal[MAX_PADS];
-    uint8_t trkFilterLfoSet[MAX_PADS];
+    float lfoVal[MAX_PADS] = {};
 
     for(size_t i = 0; i < size; i++){
+        // Emergency yield before repeated audio IRQs can starve USB/main.
+        // Normal blocks keep their exact DSP path. Overload fades only the
+        // unfinished remainder, then sheds optional FX for about one second.
+        if(audio::deadlineReached(deadlineStart,System::GetTick(),deadlineBudget)) {
+            const float lastL=i ? out[0][i-1] : 0.f, lastR=i ? out[1][i-1] : 0.f;
+            const uint32_t remaining=uint32_t(size-i);
+            for(uint32_t j=0;j<remaining;++j) {
+                const float gain=audio::remainingFade(j,remaining);
+                out[0][i+j]=lastL*gain; out[1][i+j]=lastR*gain;
+            }
+            ++audioDeadlineTrips;
+            audioRecoveryBlocks=uint16_t(SAMPLE_RATE/size);
+            audioFxShed=true;
+            break;
+        }
         /* ── Daisy Sequencer tick (sample-accurate BPM clock) ─────────────
          *  samplesElapsed==0 → new step boundary: advance and fire.
          *  Called BEFORE voice rendering so new voices are active this sample. */
@@ -5759,7 +5746,6 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         if(anyTrackLfo){
             for(int t = 0; t < MAX_PADS; t++){
                 lfoVal[t] = 0.0f;
-                trkFilterLfoSet[t] = 0;
                 if(!trkLfoActive[t] || trkLfoDepth[t] <= 0.0001f) continue;
 
                 trkLfoPhase[t] += trkLfoRate[t] / (float)SAMPLE_RATE;
@@ -5778,6 +5764,15 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                     v = __fast_sinf(2.0f * (float)M_PI * trkLfoPhase[t]);
 
                 lfoVal[t] = v * trkLfoDepth[t];
+                // Coefficients at 6 kHz control rate, shared by sampler/synth.
+                // Oscillator phase and sample filtering still run at 48 kHz.
+                if((i & 7u)==0 && trkLfoTarget[t]==LFO_TGT_FILTER && trkFilterType[t]
+                   && !trackMute[t] && (!anySolo || trackSolo[t])) {
+                    const float cut=clampF(EffectiveCutoff(t)*(1.f+.9f*lfoVal[t]),20.f,20000.f);
+                    trkFilter[t].SetType(trkFilterType[t],cut,trkFilterQ[t],(float)SAMPLE_RATE);
+                    if(trkFilterType[t]==FTYPE_RESONANT)
+                        trkFilter2[t].SetType(FTYPE_RESONANT,cut,trkFilterQ[t],(float)SAMPLE_RATE);
+                }
             }
         }
         DSP_PROF_END(LFO);
@@ -5808,6 +5803,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             Voice& vx = voices[v];
             if(!vx.active) continue;
             uint8_t p = vx.pad;
+            const float residualL=vx.stealTailL, residualR=vx.stealTailR;
 
             /* Click-free voice stealing: the previous routed value decays on
              * the dry bus while the replacement voice starts immediately. */
@@ -5820,6 +5816,14 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             } else {
                 vx.stealTailL = 0.0f;
                 vx.stealTailR = 0.0f;
+            }
+
+            // Choke groups retire their residual instead of jumping to zero.
+            // No sample reads or shared track DSP during this short release.
+            if(vx.releasing) {
+                vx.lastOutL=residualL; vx.lastOutR=residualR;
+                if(vx.stealTailL==0.f && vx.stealTailR==0.f) vx.active=false;
+                continue;
             }
 
             /* Position / bounds */
@@ -5906,6 +5910,11 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
 
             vx.pos += padReverse[p] ? -adv : adv;
 
+            // Keep playback/envelope time advancing, skip inaudible track DSP.
+            if(trackMute[p] || (anySolo && !trackSolo[p])) {
+                vx.lastOutL=vx.lastOutR=0.f;
+                continue;
+            }
             /* ── Pad filter ── */
             if(padFilterType[p]){
                 s = sanitizeF(padFilter[p].Process(s));
@@ -5920,14 +5929,6 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
 
             /* ── Per-track filter ── */
             if(trkFilterType[p]){
-                if(trkLfoActive[p] && trkLfoTarget[p] == LFO_TGT_FILTER && !trkFilterLfoSet[p]){
-                    float modCut = EffectiveCutoff(p) * (1.0f + 0.9f * lfoVal[p]);
-                    modCut = clampF(modCut, 20.f, 20000.f);
-                    trkFilter[p].SetType(trkFilterType[p], modCut, trkFilterQ[p], (float)SAMPLE_RATE);
-                    if(trkFilterType[p] == FTYPE_RESONANT)
-                        trkFilter2[p].SetType(FTYPE_RESONANT, modCut, trkFilterQ[p], (float)SAMPLE_RATE);
-                    trkFilterLfoSet[p] = 1;
-                }
                 s = sanitizeF(trkFilter[p].Process(s));
                 if(trkFilterType[p] == FTYPE_RESONANT){
                     s = sanitizeF(trkFilter2[p].Process(s));
@@ -6011,8 +6012,9 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
                 lfoGain = clampF(1.0f + 0.8f * lfoVal[p], 0.0f, 2.0f);
 
             /* ── Apply voice gain → mix ── */
-            float outL = s * vx.gainL * lfoGain;
-            float outR = s * vx.gainR * lfoGain;
+            const float replacementGain=sampler::replacementGain(vx.replacementWeight);
+            float outL = s * vx.gainL * lfoGain * replacementGain;
+            float outR = s * vx.gainR * lfoGain * replacementGain;
 
             /* ── Pan ── */
             float panTrack = trackPanF[p];
@@ -6024,8 +6026,8 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
             float routedR = outR * panR;
             busL += routedL;
             busR += routedR;
-            vx.lastOutL = routedL;
-            vx.lastOutR = routedR;
+            vx.lastOutL = routedL + residualL;
+            vx.lastOutR = routedR + residualR;
 
             /* ── Send buses (stereo) — only accumulate if master FX engaged ── */
             if(revEng){
@@ -6064,6 +6066,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         /* al sample s y lo suma a busL/busR. Si t<0 -> bus directo sin FX.     */
         auto synthTobus = [&](float s, int8_t t){
             if(t < 0 || t >= MAX_PADS){ busL += s; busR += s; return; }
+            if(trackMute[t] || (anySolo && !trackSolo[t])) return;
             if(trkFxRouted[t]){
             /* filtro */
             if(trkFilterType[t]){
@@ -6346,7 +6349,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
         }
 
         /* ── Delay (mono or ping-pong stereo) ── */
-        if(IsDelayEngaged()){
+        if(delEng){
             float delaySendMono = (delayBusL + delayBusR) * 0.5f;
             if(delayPingPong){
                 float wetL = masterDelay.Read();
@@ -6430,7 +6433,7 @@ void AudioCallback(AudioHandle::InputBuffer  /*in*/,
 
         /* ── Reverb (with send bus input) ── */
         float revL = 0, revR = 0;
-        if(IsReverbEngaged()){
+        if(revEng){
             masterReverb.Process(L + reverbBusL, R + reverbBusR,
                                 &revL, &revR);
             revL = sanitizeF(revL);
@@ -6700,6 +6703,9 @@ static void ValidatePodConfig(PodConfigPayload& config)
 /* ═══════════════════════════════════════════════════════════════════
  *  23. PROCESS COMMAND  (ALL RED808 commands)
  * ═══════════════════════════════════════════════════════════════════ */
+static void HandleMpdMidiEvent(const MidiEvent& event);
+static void ProcessP4MidiInput(const uint8_t* data, uint16_t length);
+
 static void ProcessCommand()
 {
     SPIPacketHeader* hdr = (SPIPacketHeader*)rxBuf;
@@ -6736,7 +6742,8 @@ static void ProcessCommand()
         pong.protocolVersion = RED808_PROTOCOL_VERSION;
         pong.capabilityFlags = RED808_CAP_EXTENDED_PONG
                              | RED808_CAP_USB_RX_DIAGNOSTICS
-                             | RED808_CAP_MIDI_MONITOR;
+                             | RED808_CAP_MIDI_MONITOR
+                             | RED808_CAP_MIDI_INPUT;
         pong.rxDrops = usbRxDrops;
         pong.protocolErrors = spiErrCnt;
         BuildResponse(CMD_PING, hdr->sequence,
@@ -7011,6 +7018,7 @@ static void ProcessCommand()
     case CMD_TEMPO:
         if(len >= 4 && (podApplyingCommand || !PodOwnsFunction(POD_FUNC_TEMPO))){
             float bpm; memcpy(&bpm, p, 4);
+            if(!isfinite(bpm)) break;
             transportBpm = clampF(bpm, 40.0f, 300.0f);
             dseq.tempo = transportBpm;   /* sync DSQ clock */
             podCurrentBpmX10 = static_cast<uint16_t>(transportBpm * 10.0f + 0.5f);
@@ -8150,15 +8158,15 @@ static void ProcessCommand()
                 if(JoinPath(rootPath, sizeof(rootPath), "/", lk.kitName)){
                     FRESULT rootRes = f_opendir(&dir, rootPath);
                     if(rootRes == FR_OK){
-                        hw.PrintLine("SD: Kit '%s' using root fallback %s", lk.kitName, rootPath);
+                        ProtocolDebugLog("SD: Kit '%s' using root fallback %s", lk.kitName, rootPath);
                         CopyFixedString(path, sizeof(path), rootPath);
                         openRes = FR_OK;
                     } else {
-                        hw.PrintLine("SD: Kit '%s' not found (%s res=%d, %s res=%d)",
+                        ProtocolDebugLog("SD: Kit '%s' not found (%s res=%d, %s res=%d)",
                                      lk.kitName, path, (int)openRes, rootPath, (int)rootRes);
                     }
                 } else {
-                    hw.PrintLine("SD: Kit '%s' path too long", lk.kitName);
+                    ProtocolDebugLog("SD: Kit '%s' path too long", lk.kitName);
                 }
             }
 
@@ -8195,7 +8203,7 @@ static void ProcessCommand()
                 }
 
                 CopyFixedString(currentKitName, sizeof(currentKitName), lk.kitName);
-                hw.PrintLine("SD: Kit '%s' loaded pads %d-%d",
+                ProtocolDebugLog("SD: Kit '%s' loaded pads %d-%d",
                                lk.kitName, lk.startPad, padIdx-1);
                 /* Notify Master */
                 uint32_t mask = 0;
@@ -8205,11 +8213,11 @@ static void ProcessCommand()
                 for(int i = lk.startPad; i < maxIdx; i++)
                     if(sampleLoaded[i]) loadedCount++;
                 if(loadedCount == 0)
-                    hw.PrintLine("SD: WARN kit '%s' loaded 0 pads from %s", lk.kitName, path);
+                    ProtocolDebugLog("SD: WARN kit '%s' loaded 0 pads from %s", lk.kitName, path);
                 PushEvent(EVT_SD_KIT_LOADED, loadedCount,
                           mask, lk.kitName);
             } else if(!sdPresent) {
-                hw.PrintLine("SD: load kit '%s' ignored, SD not present", lk.kitName);
+                ProtocolDebugLog("SD: load kit '%s' ignored, SD not present", lk.kitName);
             }
 
             /* ── Clear padLoading for range and unmute audio ── */
@@ -8366,7 +8374,7 @@ static void ProcessCommand()
                      SD_DATA_ROOT, pl.folder, pl.filename);
             if(pl.padIdx < MAX_PADS){
                 bool ok = LoadWavToPad(path, pl.padIdx);
-                hw.PrintLine("SD: Load '%s' → pad %d: %s",
+                ProtocolDebugLog("SD: Load '%s' → pad %d: %s",
                                pl.filename, pl.padIdx, ok?"OK":"FAIL");
                 if(ok){
                     PushEvent(EVT_SD_SAMPLE_LOADED, 1,
@@ -8400,7 +8408,7 @@ static void ProcessCommand()
 
     case CMD_GET_STATUS: {
         /* Expanded status, including FatFs and raw SD-SPI diagnostics. */
-        uint8_t resp[87]; memset(resp, 0, sizeof(resp));
+        uint8_t resp[92]; memset(resp, 0, sizeof(resp));
         resp[0] = ActiveVoices();
         resp[1] = AudioCpuPercent();
         /* resp[2-3]: loaded bitmask pads 0-15 */
@@ -8462,6 +8470,9 @@ static void ProcessCommand()
         resp[83] = sdLastResponse;
         resp[84] = sdLastDataToken;
         memcpy(resp + 85, &sdSpiErrors, 2);
+        const uint32_t deadlineTrips=audioDeadlineTrips;
+        memcpy(resp + 87, &deadlineTrips, 4);
+        resp[91]=audioFxShed ? 1u : 0u;
         BuildResponse(CMD_GET_STATUS, hdr->sequence, resp, sizeof(resp));
         return;
     }
@@ -8492,6 +8503,10 @@ static void ProcessCommand()
                       reinterpret_cast<const uint8_t*>(&state), sizeof(state));
         return;
     }
+
+    case CMD_MIDI_INPUT:
+        ProcessP4MidiInput(p, len);
+        break;
 
     case CMD_MIDI_GET_EVENTS: {
         /* Drain the MPD218 monitor ring → up to 32 raw events per poll.
@@ -8765,6 +8780,8 @@ static void ProcessCommand()
             uint8_t instrument = p[1];
             uint8_t paramId = p[2];
             float val; memcpy(&val, p + 3, 4);
+            if(engine>=SYNTH_ENGINE_COUNT || !isfinite(val)) break;
+            SynthPresetUpdate update(engine);
             /* paramId: 0=decay, 1=pitch, 2=tone, 3=volume, 4=snappy */
             switch(engine){
                 /* El byte 'instrument' de CMD_SYNTH_PARAM YA llega como id nativo
@@ -8890,7 +8907,7 @@ static void ProcessCommand()
             uint8_t track  = p[1];
             uint8_t note   = (len >= 3) ? p[2] : 0xFF;
             if(kEnableSynthCmdLog && track == 0xFF)
-                hw.PrintLine("SYNTH_NOTE_OFF_ALL engine=%u", engine);
+                ProtocolDebugLog("SYNTH_NOTE_OFF_ALL engine=%u", engine);
             switch(engine){
                 case SYNTH_ENGINE_303:
                 case SYNTH_ENGINE_WTOSC:
@@ -8979,18 +8996,19 @@ static void ProcessCommand()
             uint8_t preset = p[1];
             if(engine < SYNTH_ENGINE_COUNT)
             {
+                SynthPresetUpdate update(engine);
                 if(IsPianoMelodicEngine(engine))
                 {
-                    ReleaseAllSynthEngines();
+                    ReleaseSynthEngineState(engine);
                     pianoSelectedEngine = engine;
                     if(kEnableSynthCmdLog)
-                        hw.PrintLine("SYNTH_PRESET piano engine=%u preset=%u mask=%u", engine, preset, synthActiveMask);
+                        ProtocolDebugLog("SYNTH_PRESET piano engine=%u preset=%u mask=%u", engine, preset, synthActiveMask);
                 }
                 else
                 {
                     ReleaseSynthEngineState(engine);
                     if(kEnableSynthCmdLog)
-                        hw.PrintLine("SYNTH_PRESET engine=%u preset=%u mask=%u", engine, preset, synthActiveMask);
+                        ProtocolDebugLog("SYNTH_PRESET engine=%u preset=%u mask=%u", engine, preset, synthActiveMask);
                 }
                 ApplySynthPreset(engine, preset);
             }
@@ -9018,7 +9036,7 @@ static void ProcessCommand()
              * diagnostic log — the actual gate runs once, at apply time. */
             if(kEnableSynthCmdLog && IsPianoMelodicEngine(engine)
                && engine != pianoSelectedEngine)
-                hw.PrintLine("PIANO_SELECT via=note_on engine=%u", engine);
+                ProtocolDebugLog("PIANO_SELECT via=note_on engine=%u", engine);
             switch(engine){
                 case SYNTH_ENGINE_303: {
                     AudioCmd cmd{};
@@ -9296,12 +9314,14 @@ static void ProcessCommand()
             uint8_t step = p[2];
             if(step < DSQ_MAX_STEPS){
                 DsqStepFull& s = dsqSteps[pat][trk][step];
+                const uint32_t irq=__get_PRIMASK(); __disable_irq();
                 s.active       = p[3] ? 1 : 0;
                 s.velocity     = p[4] ? p[4] : 100;
                 s.noteLenDiv   = p[5] & 0x0F;
                 if(s.noteLenDiv == 0) s.noteLenDiv = 1;
                 s.ratchet      = ((p[5] >> 4) & 0x03) + 1;
                 s.probability  = p[6];
+                __set_PRIMASK(irq);
                 dsqLoadedPatternMask |= (1u << pat);
             }
         }
@@ -9406,21 +9426,10 @@ static void ProcessCommand()
         /* [track(1), engine(1)]  engine: 0xFF/-1=sampler, 0..8=synth engines */
         if(len >= 2 && p[0] < DSQ_TRACKS)
         {
-            uint8_t track = p[0];
-            int8_t oldEngine = dsqTrackEngine[track];
-            int8_t newEngine = (int8_t)p[1]; /* 0xFF → -1 via cast */
-            /* A sampler track without a sample must never make PLAY silent. */
-            if(newEngine == -1 && !sampleLoaded[track])
-                newEngine = DsqFallbackEngine(track);
-            if(oldEngine != newEngine)
-            {
-                pendingTriggers[0][track].active = pendingTriggers[1][track].active = false;
-                DsqReleaseHeldNotes(track);
-                StopPadVoices(track);
-                ReleaseTrackEngine(track, oldEngine);
-                padLoop[track] = false;
-            }
-            dsqTrackEngine[track] = newEngine;
+            AudioCmd cmd{};
+            cmd.type=AUDIO_CMD_TRACK_ENGINE;
+            cmd.track=p[0]; cmd.engine=p[1];
+            AudioCmdPush(cmd);
         }
         break;
 
@@ -10443,13 +10452,8 @@ static void MpdHandleClock(uint32_t now)
     }
 }
 
-static void ProcessMpdMidi()
+static void HandleMpdMidiEvent(const MidiEvent& event)
 {
-    pod.midi->Listen();
-    uint8_t budget = 192;
-    while(pod.midi->HasEvents() && budget-- > 0u)
-    {
-        MidiEvent event = pod.midi->PopEvent();
         uint8_t device = 0, bank = 0, layer = 0, index = 0;
         const uint32_t now = hw.system.GetNow();
 
@@ -10555,7 +10559,52 @@ static void ProcessMpdMidi()
             default:
                 break;
         }
+}
+
+static void ProcessP4MidiInput(const uint8_t* data, uint16_t length)
+{
+    if(!length || length % 3u || length > 192u) return;
+    // Validate the entire packet before applying any action.
+    for(uint16_t i = 0; i < length; i += 3u)
+        if(!midiInputMessageValid({data[i], data[i + 1], data[i + 2]})) return;
+    // MpdApply* can recurse through ApplyPodCommand, which reuses spiRxBuf.
+    // Preserve the full batch before executing the first mapped action.
+    uint8_t messages[192];
+    memcpy(messages, data, length);
+    data = messages;
+    for(uint16_t i = 0; i < length; i += 3u)
+    {
+        const uint8_t status = data[i];
+        MidiEvent event = {};
+        event.channel = status & 0x0Fu;
+        event.data[0] = data[i + 1];
+        event.data[1] = data[i + 2];
+        if(status >= 0xF8u)
+        {
+            event.type = SystemRealTime;
+            event.srt_type = static_cast<SystemRealTimeType>(status & 7u);
+        }
+        else
+        {
+            event.type = static_cast<MidiMessageType>((status >> 4) - 8u);
+            if(event.type == ControlChange && event.data[0] >= 120u)
+            {
+                event.type = ChannelMode;
+                event.cm_type = static_cast<ChannelModeType>(event.data[0] - 120u);
+            }
+        }
+        HandleMpdMidiEvent(event);
     }
+}
+
+static void ProcessMpdMidi()
+{
+#if DAISY_LEGACY_MIDI_UART
+    pod.midi->Listen();
+    uint8_t budget = 192;
+    while(pod.midi->HasEvents() && budget-- > 0u)
+        HandleMpdMidiEvent(pod.midi->PopEvent());
+#endif
 }
 
 static bool PodLedIsActive(uint8_t function, uint32_t now)
@@ -10657,8 +10706,14 @@ static void ProcessDaisyUsb()
 
     if(pendingResponse && pendingTxLen > 0)
     {
-        if(hw.usb_handle.TransmitInternal(txBuf, pendingTxLen)
-           == UsbHandle::Result::OK)
+        // libDaisy CDC_Transmit_FS dereferences pClassData without checking
+        // disconnect/reset. Keep the short readiness check + submit atomic
+        // against the USB IRQ; no waiting for an IN completion here.
+        const uint32_t irq=__get_PRIMASK(); __disable_irq();
+        const bool ready=hUsbDeviceFS.dev_state==USBD_STATE_CONFIGURED && hUsbDeviceFS.pClassData;
+        const bool sent=ready && hw.usb_handle.TransmitInternal(txBuf,pendingTxLen)==UsbHandle::Result::OK;
+        __set_PRIMASK(irq);
+        if(sent)
         {
             // USB retains the submitted buffer until the IN transfer completes.
             txBuf = txBuf == usbTxBuffers[0] ? usbTxBuffers[1] : usbTxBuffers[0];
@@ -11206,13 +11261,13 @@ static void AutoLoadFromSD()
             if(!padUsed[i]) missing++;
         }
         if(missing > 0){
-            hw.PrintLine("SD: Kit '%s' missing %d canonical pads",
+            ProtocolDebugLog("SD: Kit '%s' missing %d canonical pads",
                          defaultKitNames[k], missing);
         }
 
         if(loaded > 0){
             CopyFixedString(currentKitName, sizeof(currentKitName), defaultKitNames[k]);
-            hw.PrintLine("SD: Loaded %d LIVE PADS from '%s'",
+            ProtocolDebugLog("SD: Loaded %d LIVE PADS from '%s'",
                            loaded, defaultKitNames[k]);
             /* Build pad mask for event */
             uint32_t bootMask = 0;
@@ -11250,7 +11305,7 @@ static void AutoLoadFromSD()
                 }
                 if(padIdx > 0){
                     CopyFixedString(currentKitName, sizeof(currentKitName), fno.fname);
-                    hw.PrintLine("SD: Fallback loaded %d LIVE PADS from '%s'",
+                    ProtocolDebugLog("SD: Fallback loaded %d LIVE PADS from '%s'",
                                    padIdx, fno.fname);
                     uint32_t fbMask = 0;
                     for(int i = 0; i < padIdx; i++)
@@ -11267,7 +11322,7 @@ static void AutoLoadFromSD()
     {
         uint8_t recovered = FillMissingCanonicalPadsFromFamilies(0, 16);
         if(recovered > 0){
-            hw.PrintLine("SD: Recovered %d missing LIVE pads from /data families",
+            ProtocolDebugLog("SD: Recovered %d missing LIVE pads from /data families",
                          recovered);
         }
     }
@@ -11289,7 +11344,7 @@ static void AutoLoadFromSD()
             }
             f_closedir(&dir);
             if(xtraIdx > 16){
-                hw.PrintLine("SD: Loaded %d XTRA PADS from /data/xtra",
+                ProtocolDebugLog("SD: Loaded %d XTRA PADS from /data/xtra",
                                xtraIdx - 16);
                 uint32_t xtraMask = 0;
                 for(int i = 16; i < xtraIdx; i++)
@@ -11567,6 +11622,13 @@ static void FaultDelay(uint32_t ms)
 static void FaultSosLoop(void)
 {
     __disable_irq();
+    // DMA keeps repeating its last block after a CPU fault. Force digital
+    // zero at the SAI peripheral without HAL calls, locks or USB access.
+    if(__HAL_RCC_SAI1_IS_CLK_ENABLED()) {
+        SAI1_Block_A->CR2=(SAI1_Block_A->CR2 & ~SAI_xCR2_MUTEVAL) | SAI_xCR2_MUTE;
+        SAI1_Block_B->CR2=(SAI1_Block_B->CR2 & ~SAI_xCR2_MUTEVAL) | SAI_xCR2_MUTE;
+        __DSB();
+    }
     while(1)
     {
         for(int i = 0; i < 3; i++){ hw.SetLed(true); FaultDelay(120); hw.SetLed(false); FaultDelay(120); }
@@ -11639,7 +11701,7 @@ int main()
     auto Log = [&](const char* fmt, auto... args)
     {
         if(kEnableStartLog)
-            hw.PrintLine(fmt, args...);
+            ProtocolDebugLog(fmt, args...);
     };
 
     /* USB serial debug (false = no bloquear esperando terminal) */

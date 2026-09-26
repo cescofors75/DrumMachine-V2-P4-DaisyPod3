@@ -181,6 +181,8 @@
 #define CMD_GET_CPU_LOAD 0xE2
 #define CMD_GET_VOICES   0xE3
 #define CMD_GET_EVENTS   0xE4
+#define CMD_MIDI_INPUT   0xEA  // P4 -> Daisy: normalized {status,data0,data1} triples
+#define RED808_CAP_MIDI_INPUT 0x0008u
 #define CMD_PING         0xEE
 #define CMD_RESET        0xEF
 

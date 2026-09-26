@@ -42,6 +42,7 @@
  *  48 kHz  float32  C++14  header-only  sin dependencias externas
  * ═══════════════════════════════════════════════════════════════════ */
 #pragma once
+#include "../../shared/note_transition.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -170,6 +171,7 @@ public:
     Params params;
 
     void Init(float sr) {
+        transition_={};
         sr_        = sr;
         dt_        = 1.0f / sr;
         active_    = false;
@@ -184,12 +186,11 @@ public:
     }
 
     void NoteOn(uint8_t midiNote, float velocity = 1.0f) {
+        transition_.restart(active_);
         baseFreq_  = MidiToHz(midiNote);
         UpdateCachedFreqs();
         velocity_  = Clamp(velocity, 0.0f, 1.0f);
-        carPhase_  = 0.0f;
-        modPhase_  = 0.0f;
-        modFbBuf_  = 0.0f;
+        if(!active_) { carPhase_=0.f; modPhase_=0.f; modFbBuf_=0.f; }
         active_    = true;
         carEnv_.Gate(true);
         modEnv_.Gate(true);
@@ -249,10 +250,11 @@ public:
             active_ = false;
         }
 
-        return output;
+        return transition_.process(output);
     }
 
     bool IsActive() const { return active_; }
+    audio::NoteTransition transition_;
 
     /* ── SetParam (router desde CMD_SYNTH_PARAM) ── */
     void SetParam(uint8_t paramId, float val) {
